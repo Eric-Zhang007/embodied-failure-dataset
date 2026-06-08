@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "embodied-failure-dataset"
+version = "0.1.0"
+description = "Embodied agent cascading failure + counterfactual reasoning dataset"
+requires-python = ">=3.10"
+dependencies = [
+    "ai2thor==5.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]

@@ -1,0 +1,66 @@
+[
+  {
+    "failure_type": "immovable_object",
+    "category": "physical",
+    "description": "Target object is fixed in place and cannot be picked up.",
+    "injection": {"method": "set_object_property", "params": {"object_type": "<target>", "property": "is_static", "value": true}},
+    "applicable_tasks": ["pick_and_place", "clean", "heat", "cool", "examine", "pick_two"],
+    "severity": 0.25
+  },
+  {
+    "failure_type": "broken_appliance",
+    "category": "physical",
+    "description": "Appliance is broken and cannot be toggled on.",
+    "injection": {"method": "set_object_property", "params": {"object_type": "<appliance>", "property": "is_broken", "value": true}},
+    "applicable_tasks": ["heat", "cool", "clean", "examine"],
+    "severity": 0.55
+  },
+  {
+    "failure_type": "locked_container",
+    "category": "physical",
+    "description": "A container (cabinet, fridge, drawer) is closed.",
+    "injection": {"method": "close_container", "params": {"object_type": "<container>"}},
+    "applicable_tasks": ["pick_and_place", "clean", "heat", "cool", "pick_two"],
+    "severity": 0.45
+  },
+  {
+    "failure_type": "occluded_target",
+    "category": "perceptual",
+    "description": "Target object is blocked from view by another object.",
+    "injection": {"method": "occlude_object", "params": {"object_type": "<target>"}},
+    "applicable_tasks": ["pick_and_place", "examine", "pick_two"],
+    "severity": 0.35
+  },
+  {
+    "failure_type": "missing_object_light",
+    "category": "perceptual",
+    "description": "Light source needed for examine task is removed.",
+    "injection": {"method": "remove_object", "params": {"object_type": "<lamp>"}},
+    "applicable_tasks": ["examine"],
+    "severity": 0.70
+  },
+  {
+    "failure_type": "wrong_receptacle_closed",
+    "category": "semantic",
+    "description": "The intended receptacle (fridge, cabinet) is closed when agent tries to put object in.",
+    "injection": {"method": "set_object_property", "params": {"object_type": "<receptacle>", "property": "is_open", "value": false}},
+    "applicable_tasks": ["pick_and_place", "clean", "heat", "cool", "pick_two"],
+    "severity": 0.20
+  },
+  {
+    "failure_type": "appliance_off",
+    "category": "semantic",
+    "description": "Appliance that should be on (microwave, stove) is off and locked.",
+    "injection": {"method": "set_object_property", "params": {"object_type": "<appliance>", "property": "is_toggled", "value": false}},
+    "applicable_tasks": ["heat", "cool", "clean"],
+    "severity": 0.30
+  },
+  {
+    "failure_type": "removed_tool",
+    "category": "physical",
+    "description": "A required tool (knife, scrub brush) has been removed.",
+    "injection": {"method": "remove_object", "params": {"object_type": "<tool>"}},
+    "applicable_tasks": ["clean", "heat", "cool"],
+    "severity": 0.50
+  }
+]

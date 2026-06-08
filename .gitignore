@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Output and logs
+output*/
+logs/
+
+# AI2-THOR data (large)
+data/json_2.1.0/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Temp analysis files
+_*
+.deepseek/
