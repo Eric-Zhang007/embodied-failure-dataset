@@ -298,19 +298,61 @@ class EgocentricMemory:
             return criteria.split("inside ")[-1].strip()
         return ""
 
+    # Known AI2-THOR internal names → human-readable
+    _ENTITY_ALIASES: dict[str, str] = {
+        "standardwallsize": "a wall",
+        "wall": "a wall",
+    }
+
+    @staticmethod
+    def _normalize_entity(raw: str) -> str:
+        """Convert AI2-THOR internal entity name to human-readable label.
+        
+        Examples:
+            FP304:StandardWallSize.001 → a wall
+            Desk_9e51b54b            → a desk
+            DiningTable_524ab915     → a dining table
+            Chair_df9e062b           → a chair
+        """
+        # Strip FloorPlan prefix: FP304:StandardWallSize.001 → StandardWallSize.001
+        cleaned = raw
+        if ":" in cleaned and cleaned.split(":")[0].startswith("FP"):
+            cleaned = cleaned.split(":", 1)[1]
+        
+        # Strip instance suffix: Desk_9e51b54b → Desk, StandardWallSize.001 → StandardWallSize
+        import re
+        cleaned = re.sub(r"[._]\w+$", "", cleaned)
+        
+        # Check aliases
+        lower = cleaned.lower()
+        if lower in EgocentricMemory._ENTITY_ALIASES:
+            return EgocentricMemory._ENTITY_ALIASES[lower]
+        
+        # CamelCase → human-readable: DiningTable → dining table
+        words = re.findall(r"[A-Z][a-z]*|\d+", cleaned)
+        if words:
+            readable = " ".join(w.lower() for w in words)
+            # Add article
+            if readable[0] in "aeiou":
+                return f"an {readable}"
+            return f"a {readable}"
+        
+        return f"a {cleaned.lower()}"
+
     def _parse_blocker(self, error: str) -> str | None:
         """Extract blocker object name from AI2-THOR error message."""
         # Pattern: "ObjectName is blocking Agent 0 from moving..."
         if " is blocking " in error:
-            return error.split(" is blocking ")[0].strip()
+            raw = error.split(" is blocking ")[0].strip()
+            return self._normalize_entity(raw)
         # Pattern: "ObjectName is blocking..."
         if "blocking" in error.lower():
             parts = error.split(" blocking")
             if parts:
-                # Get the last word-like token before "blocking"
                 before = parts[0].strip().split()
                 if before:
-                    return before[-1].rstrip(".")
+                    raw = before[-1].rstrip(".")
+                    return self._normalize_entity(raw)
         return None
 
     def _compress_error(self, action: str, error: str) -> str:

@@ -102,6 +102,60 @@ class BranchRunner:
         nonexecuted_retry_count = 0
         max_nonexecuted_retries = 3
 
+        # ==========================================================
+        # Initial LookAround: 开局强制四向扫描
+        # ==========================================================
+        if step_index == 0:
+            state0 = env.get_state_snapshot()
+            image0 = state0["frame"]
+            metadata0 = state0["metadata"]
+            look_images = []
+            for d in ["ahead", "left", "behind", "right"]:
+                if d == "ahead":
+                    snap = image0
+                else:
+                    r = env.step("RotateLeft")
+                    if not r["success"]:
+                        raise RuntimeError(f"Init LookAround RotateLeft failed: {r['error']}")
+                    snap = r["frame"]
+                look_images.append((d, snap))
+            env.step("RotateLeft")
+            look_step = self._build_step_entry(
+                ep.episode_id, config.branch_id, 0, None,
+                "LookAround", {},
+                {"success": True, "error": None, "frame": image0, "metadata": metadata0},
+                "initial full-room scan", None,
+            )
+            img_dir = os.path.join(self.output_dir, ep.episode_id)
+            vps = []
+            for label, frame in look_images:
+                vp = os.path.join(img_dir, f"s0_look_{label}.png")
+                StepRecorder.save_frame(frame, vp)
+                vps.append({"label": label, "image_path": vp})
+            look_step["lookaround_views"] = vps
+            self._write_success_step_direct(ep, look_step)
+            eb_history.append(look_step)
+            tc0 = get_completion_criteria_text(
+                ep.data.get("alfred_task_type") or ep.data.get("task_type", ""),
+                ep.data.get("pddl_params", {}),
+            )
+            memory.update(metadata0, metadata0.get("objects", []), "LookAround", True, None, tc0)
+            step_index = 1
+            eb_phase1 = self.eb_agent.propose_action_lookaround(
+                task_goal=ep.data["task_goal"],
+                look_images=look_images,
+                visible_objects=metadata0.get("objects", []),
+                action_history=eb_history,
+                last_error=None,
+                failed_object_ids=set(),
+                inventory_objects=[],
+                task_criteria=tc0,
+                memory_text=memory.render(),
+            )
+            proposed_action = eb_phase1["action"]
+            proposed_params = eb_phase1.get("params", {})
+            eb_reasoning = eb_phase1.get("reasoning", "")
+
         while True:
             if step_index >= 200:
                 return self._make_result(config, "step_hard_limit", step_index, fork_tasks, fork_source_ids, ep)
@@ -132,22 +186,26 @@ class BranchRunner:
                                          fork_tasks, fork_source_ids, ep)
 
             agent_pose = metadata.get("agent", {})
-            eb_phase1 = self.eb_agent.propose_action(
-                task_goal=ep.data["task_goal"],
-                image=image,
-                visible_objects=metadata.get("objects", []),
-                action_history=eb_history,
-                last_error=last_error,
-                failed_object_ids=failed_object_ids,
-                agent_pos=agent_pose.get("position"),
-                agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
-                inventory_objects=inventory_objects,
-                task_criteria=task_criteria,
-                memory_text=memory.render(),
-            )
-            proposed_action = eb_phase1["action"]
-            proposed_params = eb_phase1.get("params", {})
-            eb_reasoning = eb_phase1.get("reasoning", "")
+            # Skip Phase 1 VLM if initial LookAround already decided
+            if step_index == 1 and proposed_action:
+                pass
+            else:
+                eb_phase1 = self.eb_agent.propose_action(
+                    task_goal=ep.data["task_goal"],
+                    image=image,
+                    visible_objects=metadata.get("objects", []),
+                    action_history=eb_history,
+                    last_error=last_error,
+                    failed_object_ids=failed_object_ids,
+                    agent_pos=agent_pose.get("position"),
+                    agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
+                    inventory_objects=inventory_objects,
+                    task_criteria=task_criteria,
+                    memory_text=memory.render(),
+                )
+                proposed_action = eb_phase1["action"]
+                proposed_params = eb_phase1.get("params", {})
+                eb_reasoning = eb_phase1.get("reasoning", "")
 
             if proposed_action not in _VALID_ACTIONS:
                 error_msg = self._invalid_action_message(proposed_action)

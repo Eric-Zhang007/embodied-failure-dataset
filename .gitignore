@@ -22,3 +22,4 @@ Thumbs.db
 # Temp analysis files
 _*
 .deepseek/
+*.html

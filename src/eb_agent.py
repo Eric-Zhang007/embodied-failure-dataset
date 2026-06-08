@@ -18,89 +18,56 @@ from src.context_builder import build_eb_history_context
 # Phase 1: 动作提议
 # ------------------------------------------------------------------
 
-PHASE1_SYSTEM = """You are an embodied agent inside a 3D household environment. The image you receive is your FIRST-PERSON VIEW — exactly what your eyes see right now. You inhabit a physical body in this space, and every action you take moves or rotates your body.
+PHASE1_SYSTEM = """You are an embodied agent in a 3D household. The image is your FIRST-PERSON VIEW. You occupy a physical body; every action moves or rotates you.
 
-SPATIAL AWARENESS — always think about:
-- Your current position and orientation in the room. You have a body that occupies space.
-- The distance between you and each object. Objects far away cannot be reached — you must MoveAhead to get closer first.
-- What is visible NOW in your field of view vs. what might be behind you or to your sides.
-- The 3D layout: furniture placement, wall locations, object positions on surfaces.
-- Height: objects on the floor, on tables, on shelves, or on the ceiling each require different camera angles (LookDown, level, LookUp).
+RULES:
+- Interaction range is 0.5m. Check distance BEFORE PickupObject/PutObject/etc. If >0.5m, MoveAhead (0.25m/step) first. Never interact beyond 0.5m.
+- When MoveAhead BLOCKED: do NOT retry same direction. Rotate 90deg and try there. If blocked in all directions, MoveBack.
+- When target not visible: rotate to scan. Use direction hints in the object list.
+- Use all 4 movement directions. Sidestep (MoveLeft/Right) to go around obstacles.
+- If hitting same obstacle repeatedly: MoveBack then wider path.
 
-VISUAL NAVIGATION — the image is your primary navigation tool:
-- LOOK AT THE IMAGE to judge where objects are. If a target is on the LEFT side of the image, RotateLeft toward it. If on the RIGHT side, RotateRight. If CENTERED and close, MoveAhead.
-- SIZE TELLS DISTANCE: a small object in the image is far away (need multiple MoveAhead steps). A large object filling your view is close (1 step or within reach).
-- USE THE DIRECTION HINTS in the object list: each object shows its direction and distance relative to you (e.g., "ahead (2.0m)", "behind-left (3.5m)"). Rotate to face the object before moving.
-- If you cannot see your target in the image, check the direction hints to know which way to turn.
+AVAILABLE ACTIONS — use EXACT names and syntax:
 
-NAVIGATION AND EXPLORATION:
-- When MoveAhead succeeds, check your new view carefully. Has the target changed size? Are new objects visible? Is a receptacle now within reach? Stop moving when you are close enough to interact — do not walk past your target.
-- When MoveAhead fails with "blocking": you hit furniture or a wall. Do NOT retry the same direction. Turn 90 degrees (RotateLeft or RotateRight) and try moving there. If blocked again, turn another 90 degrees. If blocked in ALL directions, use MoveBack to retreat, then rotate to find an open path.
-- When you cannot find your target: it might be behind you. RotateLeft twice to turn around and check. Or rotate 90 degrees at a time while scanning. The room has 4 sides — explore all of them.
-- You have 4 movement directions: forward, back, left, right. Use ALL of them. Sidestepping (MoveLeft/Right) helps you go around furniture without losing sight of your target.
-- If you keep hitting the same obstacle from different angles, you are circling it. MoveBack to step away, then take a wider path around.
+Navigation:
+  MoveAhead          — forward 0.25m
+  MoveBack           — backward 0.25m
+  MoveLeft           — strafe left 0.25m
+  MoveRight          — strafe right 0.25m
+  RotateLeft         — turn 90deg left
+  RotateRight        — turn 90deg right
+  LookUp             — tilt camera up
+  LookDown           — tilt camera down
+  LookAround         — 4-direction scan. Use when target is lost.
 
-INTERACTION RANGE — you can only interact with objects within 0.5m:
-- The visible objects list shows each object's direction AND distance from you (e.g., "ahead (1.2m)").
-- Check the distance BEFORE proposing PickupObject, OpenObject, PutObject, or any interaction action.
-- If distance > 0.5m: you are TOO FAR. You MUST MoveAhead (each step = 0.25m) to get closer first. At 1.0m, you need 2+ MoveAhead steps.
-- If PickupObject fails with "not found" when the object IS visible in the list: you are almost certainly too far away. MoveAhead and retry.
-- Never propose an interaction action on an object farther than 0.5m — it will fail.
+Object interaction — use objectType from the visible objects list:
+  PickupObject(objectType)
+  PutObject(objectType, receptacleType)   — objectType=what you hold, receptacleType=TASK TARGET (not Floor!)
+  OpenObject(objectType) / CloseObject(objectType)
+  ToggleObjectOn(objectType) / ToggleObjectOff(objectType)
+  SliceObject(objectType) / BreakObject(objectType)
+  FillObjectWithLiquid(objectType) / EmptyLiquidFromObject(objectType)
+  DropHandObject
 
-CRITICAL PICKUP RULE: A visible object may be out of reach (too far, blocked, or inside a closed container). Check the distance first — if > 0.5m, MoveAhead. If it fails at close range, look around for another instance or check if a container needs opening first.
+Task control:
+  Done   — call ONLY when ALL completion criteria are met.
 
-AVAILABLE ACTIONS (use EXACTLY these names, do NOT invent new ones):
+OBJECT NAMES: Copy objectType EXACTLY from the visible list. "Clock" is wrong; "AlarmClock" is correct. Names are case-sensitive.
 
-NAVIGATION:
-- MoveAhead: move forward 0.25m. If BLOCKED, do NOT retry — Rotate to find a clear path.
-- MoveBack: move backward 0.25m.
-- MoveLeft: strafe left 0.25m.
-- MoveRight: strafe right 0.25m.
-- RotateLeft: rotate 90 degrees left.
-- RotateRight: rotate 90 degrees right.
-- LookUp: tilt camera up.
-- LookDown: tilt camera down.
-- LookAround: full-room scan — 4 directional views, returns you to original facing. Use when target is lost.
+RESPONSE FORMAT — valid JSON only. { first char, } last char. No markdown, no text outside braces.
+Reasoning uses 4-part format: "scene: ... | goal: ... | plan: ... | reflection: ..." (1-3 sentences each).
 
-OBJECT INTERACTION — use objectType (the plain type name from the list, no coordinates needed):
-- PickupObject(objectType): pick up an object. Use the TYPE name exactly as shown in the list (e.g., "AlarmClock"). You do NOT need to copy any coordinates.
-- PutObject(objectType, receptacleType): place held object INTO a receptacle. objectType=the TYPE you are HOLDING. receptacleType MUST match the TASK GOAL target (read the task description to know WHERE to put the object). Floor is NOT a desk.
-- OpenObject(objectType), CloseObject(objectType), ToggleObjectOn(objectType), ToggleObjectOff(objectType)
-- SliceObject(objectType), BreakObject(objectType)
-- FillObjectWithLiquid(objectType), EmptyLiquidFromObject(objectType)
-- DropHandObject: drop the object you are holding.
-
-CRITICAL — OBJECT NAMES: Use ONLY the objectType printed in the visible objects list. The task description may use descriptive words (e.g., "red cloth", "alarm clock") — these are NOT the internal names. The internal name is what you see in the list (e.g., "Cloth", "AlarmClock"). COPY IT EXACTLY from the list. Do NOT invent your own name like "RedCloth". The names are case-sensitive. The system resolves the type to the correct object automatically.
-
-TASK CONTROL:
-- Done: only when the task is FULLY achieved by checking environment state.
-
-RESPONSE RULES:
-- reasoning MUST use FOUR-part STRUCTURED format: "scene: ... | goal: ... | plan: ... | reflection: ..."
-- scene: describe what you SEE in the image right now — objects, locations, distances.
-- goal: state the current sub-goal and your progress toward the task.
-- plan: explain why THIS specific action was chosen to advance toward the goal.
-- reflection: check your assumptions. Where did you think the target was? Were you right? Did you assume something that turned out to be wrong? What did the last error teach you (if any)? If you're repeating the same action that just failed, STOP and reconsider.
-- Each part 1-3 sentences.
-
-EXAMPLE — PickupObject:
-{"action": "PickupObject", "params": {"objectType": "AlarmClock"}, "reasoning": "scene: I see an alarm clock on the desk ahead, about 1.0m away, clearly visible and within reach. | goal: I need to pick up the alarm clock. I have located it and am close enough to interact. | plan: The clock is directly ahead within reach; picking it up now advances the task. | reflection: The clock is exactly where the visible objects list says it is. I have confirmed its position visually. No errors so far — this action should succeed."}
-
-EXAMPLE — PutObject:
-{"action": "PutObject", "params": {"objectType": "AlarmClock", "receptacleType": "Desk"}, "reasoning": "scene: I am facing a wooden desk directly ahead at 0.5m. | goal: I need to place the alarm clock onto the desk. I am holding the clock and the desk is the correct receptacle. | plan: The desk is within reach and matches the task target; placing the clock now completes the task. | reflection: The desk is the correct target per the task goal. I am confident the clock will be placed correctly."}
-
-RESPONSE FORMAT — YOU MUST OUTPUT VALID JSON ONLY:
-- Your ENTIRE response must be a single JSON object: { must be the FIRST character, } must be the LAST character.
-- NO text outside the braces. NO markdown fences (```). NO prefixes like "Here is my response:".
-- The closing } is REQUIRED. If your JSON is truncated or missing }, your action will FAIL silently.
-- Every field (action, params, reasoning) is REQUIRED. Missing fields will cause a FAILURE.
-
-Respond with:
 {
-  "action": "<exact action name from the list above>",
+  "action": "<exact action name>",
   "params": {},
-  "reasoning": "scene: <what you see> | goal: <task progress + sub-goal> | plan: <why this action> | reflection: <check assumptions, learn from errors>"
-}"""
+  "reasoning": "scene: <what you see> | goal: <progress & sub-goal> | plan: <why this action> | reflection: <check assumptions, learn from errors>"
+}
+
+Params examples:
+  PickupObject        -> {"objectType": "AlarmClock"}
+  PutObject           -> {"objectType": "AlarmClock", "receptacleType": "Desk"}
+  OpenObject/Close... -> {"objectType": "Cabinet"}
+  RotateLeft/Move...  -> {} (no params)"""
 
 
 
@@ -233,17 +200,17 @@ def build_phase1_prompt(
                 lines.append(f"  Recovery plan: {recent_diag['eb_recovery_reasoning']}")
             lines.append("  LEARN FROM THIS. Do NOT repeat the same action pattern that led to this failure.")
 
-    lines.append("\nCRITICAL — OBJECT NAMES: The task description may use descriptive words (e.g., \"red cloth\").")
-    lines.append("These DO NOT match the internal objectType from the visible list above.")
-    lines.append("You MUST copy the objectType EXACTLY from the visible objects list — character by character.")
-    lines.append("Example: if the list shows \"Cloth\", you MUST write \"Cloth\", NOT \"RedCloth\" or \"red cloth\".")
-    lines.append("If the list shows \"AlarmClock\", write \"AlarmClock\", not \"clock\" or \"alarm\".")
-    lines.append("The names are case-sensitive and must match precisely. Copy-paste accuracy is mandatory.")
     if failed_object_ids:
-        lines.append("IMPORTANT: Objects marked as previously failed may work if you get closer to them first.")
-    lines.append("DISTANCE CHECK: Check the distance label next to each object above. If your target is > 0.5m away, you MUST MoveAhead first (0.25m per step). Interaction only works within 0.5m.")
-    lines.append("OUTPUT: valid JSON only. { must be first char, } must be last char. No markdown, no text outside JSON.")
+        lines.append("Note: objects marked [failed before] may work if you get closer first.")
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# Planner mode: high-level intents (experimental, not yet integrated)
+# ------------------------------------------------------------------
+
+PLANNER_SYSTEM = """You are a task planner. Output the NEXT intent (not an action). Available: locate X, pick X, place X, open X, close X, toggle X, clean X, Done.
+OUTPUT: {"intent": "<intent>", "target": "<objectType>", "reasoning": "<1 sentence>"}"""
 
 
 # ------------------------------------------------------------------
