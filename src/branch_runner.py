@@ -243,6 +243,9 @@ class BranchRunner:
                     visible_objects=metadata.get("objects", []),
                     action_history=eb_history,
                     last_error=last_error,
+                    memory_text=memory.render(),
+                    agent_pos=agent_pose.get("position"),
+                    agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
                 )
 
                 if review.get("approved"):

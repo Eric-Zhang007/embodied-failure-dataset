@@ -477,6 +477,9 @@ class EBAgent:
         visible_objects: list[dict],
         action_history: list[dict],
         last_error: str | None = None,
+        memory_text: str = "",
+        agent_pos: dict = None,
+        agent_rot_y: float = 0.0,
     ) -> dict:
         """Review Executor's action sequence. If rejected, provide corrected actions."""
         lines = [f"Your intent was: {intent}"]
@@ -484,16 +487,37 @@ class EBAgent:
             lines.append(f"Target: {target}")
         lines.append("")
 
-        # Show recent history so Planner knows if agent is stuck
+        # Same context as Planner/Executor — spatial memory, objects in view, recent history, last error
+        if memory_text:
+            lines.append(memory_text)
+            lines.append("")
+
+        visible = [o for o in visible_objects if o.get("visibleBounds2D")]
+        if visible:
+            lines.append("Objects in view:")
+            for o in visible[:10]:
+                extra = []
+                if o.get("isPickedUp"): extra.append("held")
+                if o.get("receptacle"): extra.append("receptacle")
+                if o.get("openable"): extra.append("open")
+                tag = f" ({','.join(extra)})" if extra else ""
+                d = ""
+                if agent_pos and o.get("position"):
+                    d = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
+                lines.append(f"  {o['objectType']}{tag}{d}")
+        else:
+            lines.append("(No objects in view)")
+        lines.append("")
+
         recent = action_history[-5:] if len(action_history) > 5 else action_history
         if recent:
-            lines.append("Recent actions (check for repeated failures):")
+            lines.append("Recent actions:")
             lines.append(build_eb_history_context(recent))
             lines.append("")
 
         if last_error:
             lines.append(f"Last error: {last_error}")
-            lines.append("If the last 2+ actions all failed on the first step, the agent is STUCK. MoveBack IS correct.")
+            lines.append("If the last 2+ actions all failed on the first step, the agent is STUCK. MoveBack IS correct.\n")
 
         lines.append("Executor proposed these actions:")
         for i, a in enumerate(proposed_actions, 1):
@@ -504,17 +528,6 @@ class EBAgent:
             else:
                 lines.append(f"  {i}. {act}")
         lines.append(f"\nExecutor reasoning: {executor_reasoning}")
-
-        visible = [o for o in visible_objects if o.get("visibleBounds2D")]
-        if visible:
-            lines.append("\nObjects in view:")
-            for o in visible[:8]:
-                d = ""
-                if o.get("receptacle"):
-                    d = " (receptacle)"
-                if o.get("isPickedUp"):
-                    d += " (held)"
-                lines.append(f"  {o['objectType']}{d}")
 
         lines.append("\nReview. If rejected, provide corrected_actions. Output JSON only.")
         prompt = "\n".join(lines)
