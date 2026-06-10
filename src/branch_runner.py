@@ -207,6 +207,8 @@ class BranchRunner:
                     visible_objects=metadata.get("objects", []),
                     action_history=eb_history,
                     last_error=last_error,
+                    agent_pos=agent_pose.get("position"),
+                    agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
                     inventory_objects=inventory_objects,
                     hand_status=hand_status,
                     task_criteria=task_criteria,
@@ -221,9 +223,14 @@ class BranchRunner:
                     target=intent_target,
                     image=image,
                     visible_objects=metadata.get("objects", []),
+                    action_history=eb_history,
+                    last_error=last_error,
                     agent_pos=agent_pose.get("position"),
                     agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
                     hand_status=hand_status,
+                    task_criteria=task_criteria,
+                    memory_text=memory.render(),
+                    failed_object_ids=failed_object_ids,
                 )
 
                 # 3. Planner reviews — if rejected, Planner provides corrected actions
@@ -530,30 +537,79 @@ class BranchRunner:
                     image = seq_result["frame"]
                     metadata = seq_result["metadata"]
                     continue
-                elif seq_result.get("partial"):
-                    # Some steps succeeded — record what happened, let EB continue from there
-                    cascade_level = max(0, cascade_level - 1)  # partial success is still progress
-                    last_error = seq_msg
-                    step_entry = self._build_step_entry(
-                        ep.episode_id, config.branch_id, step_index, parent_id,
-                        "MoveSequence", proposed_params, seq_result, eb_reasoning, injection_decision,
-                    )
-                    step_entry["error_type"] = "move_sequence_partial"
-                    self._write_success_step_direct(ep, step_entry)
-                    eb_history.append(step_entry)
-                    step_index += 1
-                    nonexecuted_retry_count = 0
-                    image = seq_result["frame"]
-                    metadata = seq_result["metadata"]
-                    memory.update(metadata, metadata.get("objects", []),
-                                  "MoveSequence", False, seq_msg, task_criteria)
-                    continue
-                else:
-                    # Nothing executed at all
+                elif seq_result.get("partial") or not seq_result.get("all_succeeded"):
+                    # MoveSequence failed — build pending step, then Phase 3+4 below
                     cascade_level += 1
                     last_error = seq_msg
+                    image = seq_result.get("frame", image)
+                    metadata = seq_result.get("metadata", metadata)
+                    result = {"success": False, "error": seq_msg,
+                              "frame": image, "metadata": metadata}
                     step_index += 1
                     nonexecuted_retry_count = 0
+                    memory.update(metadata, metadata.get("objects", []),
+                                  "MoveSequence", False, seq_msg, task_criteria)
+                    pending_step = self._build_step_entry(
+                        ep.episode_id, config.branch_id, step_index - 1, parent_id,
+                        "MoveSequence", proposed_params, result, eb_reasoning, injection_decision,
+                    )
+                    pending_step["error_type"] = "environment_failure"
+                    diagnosis_history = eb_history + [pending_step]
+                    # Track failed objectIds from the sequence
+                    obj_id = proposed_params.get("steps", [{}])[-1].get("objectId") if proposed_params.get("steps") else None
+                    if obj_id:
+                        failed_object_ids.add(obj_id)
+                    # Phase 3: Planner diagnoses
+                    eb_phase3 = self.eb_agent.diagnose_failure(
+                        task_goal=ep.data["task_goal"],
+                        error_message=seq_msg,
+                        image=image,
+                        action_history=diagnosis_history,
+                        cascade_level=cascade_level,
+                        visible_objects=metadata.get("objects", []),
+                        agent_pos=agent_pose.get("position"),
+                        agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
+                        inventory_objects=inventory_objects,
+                        task_criteria=task_criteria,
+                        memory_text=memory.render(),
+                    )
+                    # Phase 4: Oracle evaluates
+                    oracle_phase4 = self.oracle_agent.evaluate_failure(
+                        task_goal=ep.data["task_goal"],
+                        error_message=seq_msg,
+                        image=image,
+                        action_history=diagnosis_history,
+                        eb_diagnosis=eb_phase3["diagnosis"],
+                        eb_recovery_reasoning=eb_phase3["recovery_reasoning"],
+                        eb_counterfactual=eb_phase3.get("counterfactual"),
+                        eb_proposed_recovery=eb_phase3.get("proposed_recovery_action", {}),
+                    )
+                    step_entry = pending_step
+                    step_entry["eb_diagnosis"] = eb_phase3.get("diagnosis")
+                    step_entry["eb_recovery_reasoning"] = eb_phase3.get("recovery_reasoning")
+                    step_entry["eb_counterfactual"] = eb_phase3.get("counterfactual")
+                    step_entry["eb_proposed_recovery_action"] = eb_phase3.get("proposed_recovery_action")
+                    step_entry["oracle_diagnosis_correct"] = oracle_phase4.get("diagnosis_correct")
+                    step_entry["oracle_ground_truth"] = oracle_phase4.get("ground_truth")
+                    step_entry["oracle_counterfactual_grade"] = oracle_phase4.get("counterfactual_grade")
+                    step_entry["oracle_counterfactual_gold"] = oracle_phase4.get("counterfactual_gold")
+                    step_entry["oracle_recovery_verdict"] = oracle_phase4.get("recovery_verdict")
+                    self._write_success_step_direct(ep, step_entry)
+                    eb_history.append(step_entry)
+                    # Dead loop / unrecoverable checks
+                    hard_unrec = check_unrecoverable(metadata, ep.data)
+                    if hard_unrec:
+                        result_br = BranchResult(branch_id=config.branch_id, termination_reason=f"unrecoverable_hard:{hard_unrec}", total_steps=step_index, fork_tasks=fork_tasks, fork_source_step_ids=fork_source_ids)
+                        self._finalize(ep, config, result_br, fork_source_ids)
+                        return result_br
+                    if detect_dead_loop(eb_history):
+                        result_br = BranchResult(branch_id=config.branch_id, termination_reason="dead_loop", total_steps=step_index, fork_tasks=fork_tasks, fork_source_step_ids=fork_source_ids)
+                        self._finalize(ep, config, result_br, fork_source_ids)
+                        return result_br
+                    if oracle_phase4.get("recovery_verdict") == "unrecoverable":
+                        result_br = BranchResult(branch_id=config.branch_id, termination_reason="unrecoverable", total_steps=step_index, fork_tasks=fork_tasks, fork_source_step_ids=fork_source_ids)
+                        self._finalize(ep, config, result_br, fork_source_ids)
+                        return result_br
                     continue
 
             # ==========================================================

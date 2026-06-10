@@ -412,6 +412,8 @@ class EBAgent:
         visible_objects: list[dict],
         action_history: list[dict],
         last_error: str | None,
+        agent_pos: dict = None,
+        agent_rot_y: float = 0.0,
         inventory_objects: list[dict] | None = None,
         hand_status: str = "",
         task_criteria: str = "",
@@ -429,7 +431,7 @@ class EBAgent:
 
         visible = [o for o in visible_objects if o.get("visibleBounds2D")]
         if visible:
-            lines.append("\nObjects in view:")
+            lines.append("\nObjects in view — direction relative to your facing:")
             for o in visible[:12]:
                 extra = []
                 if o.get("isPickedUp"): extra.append("held")
@@ -437,9 +439,12 @@ class EBAgent:
                 if o.get("openable"): extra.append("open")
                 if o.get("toggleable"): extra.append("on" if o.get("isToggled") else "off")
                 tag = f" ({','.join(extra)})" if extra else ""
-                lines.append(f"  {o['objectType']}{tag}")
+                d = ""
+                if agent_pos and o.get("position"):
+                    d = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
+                lines.append(f"  {o['objectType']}{tag}{d}")
         else:
-            lines.append("\n(No objects in view)")
+            lines.append("\n(No objects in view — you may be facing a wall. Rotate or MoveBack.)")
 
         if last_error:
             lines.append(f"\nLast error: {last_error}")
