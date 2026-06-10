@@ -13,116 +13,123 @@ export PATH="$HOME/.local/bin:$PATH"
 ```
 
 - **Python**: 3.10（通过 uv 管理）
-- **仿真**: AI2-THOR 5.0.0 无头模式（Xvfb 渲染），运行前自动检测 DISPLAY
+- **仿真**: AI2-THOR 5.0.0，WSLg 优先（`:0`），fallback Xvfb 无头渲染
 - **API**: 硅基流动 (api.siliconflow.cn)，OpenAI 兼容接口
 - **API Key**: sk-umtqhyponkhgyhlbwyykumcqebzqxpkcheexbhxgcybsgypa
-- **EB 模型**: Qwen/Qwen3-VL-32B-Instruct
+- **Planner (EB) 模型**: Qwen/Qwen3-VL-32B-Instruct
+- **Executor 模型**: Qwen/Qwen3-VL-8B-Instruct
 - **Oracle 模型**: Qwen/Qwen3-VL-32B-Instruct
+- **gridSize**: 0.125m（细粒度移动）
+- **visibilityDistance**: 100.0（全场景物体可见）
 
 ### 常用命令
 
 ```bash
-# 端到端测试（单条轨迹，不启用 fork）
-uv run python scripts/e2e_test.py --api-key sk-xxx
-uv run python scripts/e2e_test.py --api-key sk-xxx --task pick_and_place_simple
-uv run python scripts/e2e_test.py --api-key sk-xxx --no-traps
+# 单任务测试（随机 episode）
+uv run python scripts/e2e_test.py --api-key sk-xxx --task pick_and_place_simple --random --no-traps
+
+# 全任务并行测试（7 种任务类型）
+uv run python scripts/e2e_test.py --api-key sk-xxx --all --random --no-traps --parallel 3
+
+# 指定输出目录
+uv run python scripts/e2e_test.py --api-key sk-xxx --all --output my_test
 
 # 批量跑 pipeline
-uv run python scripts/run_pipeline.py --max 10 --api-key sk-xxx
-uv run python scripts/run_pipeline.py --task pick_and_place_simple --api-key sk-xxx
-uv run python scripts/run_pipeline.py --max 50 --no-fork --api-key sk-xxx
-
-# API 推理速度测试
-uv run python scripts/bench_api.py --api-key sk-xxx
-
-# 下载 ALFRED 数据
-uv run python scripts/download_alfred.py
+uv run python scripts/run_pipeline.py --max 10 --api-key sk-xxx --parallel 3
 ```
 
-## 架构：双 Agent 四阶段循环
+输出目录默认为 `output_e2e_YYYYMMDD_HHMMSS/`（时间戳命名）。
 
-每一步交互经历 Phase 1-4。所有 Agent 通过 `VLMClient` 调用 VLM（支持 ollama 和 openai 兼容后端，实际使用 siliconflow）。image 传 base64 编码的 numpy array。完整 API 请求写入 `logs/api_calls.jsonl`，摘要写入 `logs/api_calls.log`。
+## 架构：Planner(32B) + Executor(8B) + Oracle(32B) 四阶段循环
 
-### Phase 1 — EB Agent 提议动作（`eb_agent.py`）
+EB Agent 拆分为 Planner（高层意图）和 Executor（具体动作序列）。Oracle 不知道内部分工，看到统一的 EB 历史。
 
-输入：任务目标 + 当前截图 + 可见物体列表 + 完整 EB 可见历史 + 上次错误 + `HAND STATUS` + `TASK COMPLETION CRITERIA`。响应格式：`{"action": "...", "params": {}, "reasoning": "..."}`。prompt 中列出了完整可用动作集合，严禁模型幻觉出不存在的动作名。
+### Phase 1 — Planner → Executor → Review → Execute
 
-`LookAround` 是正常动作，但由 `branch_runner.py` 特殊执行：原地收集 ahead/left/behind/right 四张图，写成一个成功 step，再调用 EB 的多图 prompt 决定下一步。多图请求中每张图前都有单独方向标签：`VIEW 1: ahead`、`VIEW 2: left`、`VIEW 3: behind`、`VIEW 4: right`。如果模型看完后仍输出 `LookAround`，不会重复扫描；系统记录 `model_repeated_lookaround`，并把错误反馈给下一轮普通 Phase 1。
+1. **Planner 提议意图** (`eb_agent.py: plan_intent`)：输出高层意图如 `approach AlarmClock`、`pickup AlarmClock`
+2. **Executor 提议动作序列** (`executor.py: execute_intent`)：拿到意图 + 完整上下文 → 输出 1-5 个具体动作 + status/reasoning
+3. **Planner 审核** (`eb_agent.py: review_actions`)：同意则执行 Executor 的动作，拒绝则 Planner 直接给出 `corrected_actions`
+4. **Execute** (`branch_runner.py: _execute_move_sequence`)：顺序执行动作序列，首次失败即停。支持 movement + object interaction（经 action_adapter 解析）。失败时走 Phase 3+4
 
-### Phase 2 — Oracle 相机注入决策（`oracle_agent.py`）
+所有三个组件（Planner plan_intent、Executor execute_intent、Planner review）共享同一上下文：空间记忆 + 视野内物体（含方向标签）+ 最近 5 步历史 + last_error + 图像。
 
-`cascade_level == 0` 时正常执行；`cascade_level == 1` 时允许注入（宽松守卫，设计意图是避免恢复期间叠加注入）；`cascade_level >= 2` 时跳过注入。注入通过 `env_injector.py` 中的 `inject()` 立即修改环境，支持：set_object_property、lock_container、occlude_object、remove_object、swap_object。inject 失败会自动重试，最多 2 次。
+### Phase 2 — Oracle 注入决策（`oracle_agent.py`）
 
-### Phase 3 — EB 失败诊断（`eb_agent.py`）
+`cascade_level <= 1` 时允许注入；`cascade_level >= 2` 时跳过。注入通过 `env_injector.py` 中的 `inject()` 修改环境。inject 失败自动重试最多 2 次。
 
-诊断为何失败 + 提出恢复动作 + 可选 counterfactual（格式：`{"target_step": int, "alternative_action": {...}, "reasoning": "..."}`）。Phase 3 prompt 同样包含完整 EB 可见历史、`HAND STATUS` 和 `TASK COMPLETION CRITERIA`，并要求所有文本字段使用第一人称。
+### Phase 3 — 失败诊断（Planner）
+
+环境失败后：Planner 诊断（`eb_agent.py: diagnose_failure`），提出恢复动作 + counterfactual。字段归属：`eb_diagnosis`、`eb_counterfactual` 填 Planner 的输出（因为 Planner 有高层视角）。
 
 ### Phase 4 — Oracle 评估（`oracle_agent.py`）
 
-评估诊断正确性、counterfactual 等级（WA/PA/AC）、恢复判决（recovered/recoverable/unrecoverable）、是否创建 fork。Oracle prompt 使用完整 EB + Oracle 可见历史。`branch_runner.py` 还有代码层死循环检测，触发后直接结束为 `dead_loop_unrecoverable`。
+评估诊断正确性、counterfactual 等级（WA/PA/AC）、恢复判决、是否创建 fork。
 
 ## 核心文件职责
 
 | 文件 | 职责 |
 |------|------|
-| `src/branch_runner.py` | 单分支 Phase 1-4 循环 + 成功/失败步写入。`run_single_branch()` 是 scheduler 和 e2e_test 的共同入口 |
-| `src/scheduler.py` | 全局分支队列（main + fork），委托 `run_single_branch()` 执行 |
-| `src/vlm_client.py` | VLM 调用客户端，含 timeout、JSON 解析自动重试、完整 API JSONL 日志、多图方向标签 |
-| `src/env_controller.py` | AI2-THOR Controller 封装 + Xvfb 自动管理 |
-| `src/env_injector.py` | 5 种注入方法实现（set_object_property 等） |
-| `src/episode_manager.py` | Episode JSON 增量读写（每步立即 flush） |
-| `src/task_conditions.py` | ALFRED 任务完成条件检查 + prompt 中的完成标准文案 |
-| `src/context_builder.py` | EB / Oracle 历史上下文格式化，避免各 prompt 自己切片历史 |
-| `src/trap_planner.py` | 从 failure_type_library.json 选陷阱，支持 `exclude_types` 排除任务目标物体 |
-| `src/action_adapter.py` | objectType/receptacleType → objectId 解析 + AI2-THOR 2.1→5.0 废弃参数清理 |
-| `src/alfred_parser.py` | ALFRED traj_data.json 解析（api_action 支持 string 和 dict 两种格式） |
-| `src/fork_manager.py` | Fork 分岔点推理重写（让 Oracle 为替代动作生成自洽推理文本） |
-| `src/step_recorder.py` | 步骤标准化 + 截图保存 |
+| `src/branch_runner.py` | 主循环：Planner→Executor→Review→Execute + Phase 2-4 + MoveSequence。`run_single_branch()` 是统一入口 |
+| `src/eb_agent.py` | Planner：plan_intent（意图）、review_actions（审核）、diagnose_failure（Phase 3）。同时保留旧 propose_action 兼容初始 LookAround |
+| `src/executor.py` | Executor（8B）：意图 → 动作序列。共享 Planner 的上下文和身份 |
+| `src/oracle_agent.py` | Oracle：Phase 2 注入决策 + Phase 4 评估 |
+| `src/egocentric_memory.py` | 空间记忆：累积所有曾 `visibleBounds2D=True` 的物体，按 objectId 存储，同 type 不同 ID 编号（Desk1, Desk2） |
+| `src/vlm_client.py` | VLM 调用，timeout 300→400→500s，JSON 解析重试，Thinking 模型 CoT 兼容 |
+| `src/env_controller.py` | AI2-THOR Controller + `_fix_visible_bounds()`（修 AI2-THOR 5.0.0 visibleBounds2D bug）+ WSLg/Xvfb 管理 |
+| `src/scheduler.py` | 并行调度器：ThreadPoolExecutor 实现 max_parallel。Fork 串行。 |
+| `src/task_conditions.py` | 7 种 ALFRED 任务完成检查 + dead_loop/unrecoverable 检测 |
+| `src/action_adapter.py` | objectType→objectId 解析 + AI2-THOR 2.1→5.0 废弃参数清理 |
+| `src/env_injector.py` | 6 种注入方法（含 hide_object、swap_object） |
+| `src/trap_planner.py` | 陷阱选择，支持 exclude_types、breakable 过滤、Blinds blocklist |
+| `src/alfred_scene.py` | ALFRED 场景恢复，gridSize=0.125，renderObjectImage=True，visibilityDistance=100 |
+| `src/episode_manager.py` | Episode JSON 增量读写 |
+| `src/context_builder.py` | EB/Oracle 历史 JSONL 格式化，按权限过滤字段 |
+| `src/alfred_parser.py` | ALFRED traj_data.json 解析 |
+| `src/fork_manager.py` | Fork 推理重写 |
+| `src/step_recorder.py` | 步骤标准化 + 截图 |
 
 ## 数据流
 
 ```
-ALFRED JSON → alfred_parser → init_action(TeleportFull) → TrapPlanner 选陷阱
+ALFRED JSON → alfred_parser → TeleportFull → TrapPlanner
 → Phase 1-4 循环 (branch_runner)
-  ├── 成功步 → episode_manager.add_step() → 写 JSON
-  ├── LookAround → 原地四向截图 → 写成功 step → EB 多图决策
-  ├── Done → task_conditions.check_task_complete() → 成功结束或写 done_rejected
-  ├── 无效动作 → failure log (JSONL)
-  └── 环境失败 → Phase 3 诊断 + Phase 4 评估 → 写 JSON（含完整诊断字段）
-       └── counterfactual_grade=AC 且 should_fork → 生成 fork task 加入队列
-```
+  ├── Planner plan_intent → Executor execute_intent → Planner review
+  │     ├── approved → MoveSequence 执行
+  │     └── rejected → Planner corrected_actions → MoveSequence 执行
+  ├── 成功 → episode_manager.add_step()（eb_reasoning 填 Executor 的输出）
+  ├── LookAround → 四向截图 → 旧 propose_action_lookaround 决策
+  ├── Done → check_task_complete() → 完成或 done_rejected
+  └── 环境失败 → Phase 3 Planner 诊断 + Phase 4 Oracle 评估
+       └── counterfactual_grade=AC + should_fork → fork task
 
-续跑：`BranchRunner.resume()` 加载已有 JSON → replay 成功步恢复环境 → 继续 Phase 1-4。
+Phase 3 字段归属：eb_diagnosis/counterfactual 填 Planner 的输出
+Phase 1 字段归属：eb_reasoning 填 Executor 的输出
+```
 
 ## 关键设计约束
 
-1. **信息权限**：EB Agent 不知道 fork 存在、不知道注入存在。Oracle 知道一切（fork 分支上也知道自己是 fork）。分岔点前 context 共享，分岔后隔离。
-2. **Fork 推理重写**：fork root step 的 `eb_reasoning` 由 Oracle 重写，不能提及"反事实""替代"等词。
-3. **step_id 格式**：main 分支为 `s0, s1, s2...`，fork 分支也从 `s0` 开始（通过 branch_id 区分）。
-4. **动作参数**：EB 输出 `objectType` / `receptacleType`，不要输出坐标或 objectId；`action_adapter.py` 根据当前 metadata 解析成 AI2-THOR 需要的 objectId。
-5. **任务完成条件**：`Done` 只信 `task_conditions.py` 的硬检查。prompt 中的 `TASK COMPLETION CRITERIA` 必须和同一套检查逻辑保持一致。
-6. **LookAround**：只允许单次四向扫描。重复 `LookAround` 是模型无效决策，不再重复扫同一圈图。
+1. **信息权限**：Oracle 不知道 Planner/Executor 分工，看到统一 EB 历史。EB 不知道 fork/注入存在。
+2. **visibleBounds2D 过滤**：所有"视野内物体"列表用 `visibleBounds2D`（instance segmentation 渲染，正确处理遮挡）。`visibilityDistance=100` 确保 metadata 包含全场景物体，但 prompt 只展示真正在画面中的。
+3. **空间记忆**：累积所有曾 `visibleBounds2D=True` 的物体，按 objectId 存，同 type 异 ID 自动编号。离开视野标为 remembered 而非删除。
+4. **MoveSequence**：动作序列顺序执行，首次失败即停。支持 movement + object interaction（经 action_adapter）。
+5. **Planner review**：只在有关键错误时拒绝（PickupObject >0.5m、MoveAhead 撞已知障碍、明显远离目标）。STUCK 检测：连续 2+ 次失败时 MoveBack 是正确的。
+6. **gridSize=0.125m**：MoveAhead/MoveBack/MoveLeft/MoveRight 均 0.125m/步。
+7. **任务完成**：`Done` 只信 `task_conditions.py` 硬检查。prompt 中的 CRITERIA 与检查逻辑一致。
+8. **LookAround**：仅允许单次扫描，重复则记录 `model_repeated_lookaround`。
+9. **_fix_visible_bounds**：AI2-THOR 5.0.0 的 `process_visible_bounds2D` 在 `instance_detections2D` 赋值前调用。env_controller 每次 step/snapshot 后手动修复。
 
 ## 已知待修复问题
 
-1. **PickupObject 持续失败**：元数据标为 visible 但 PickupObject 返回 "not found"，可能是距离、遮挡或 AI2-THOR 可交互状态问题。需要继续用 e2e 日志和截图定位。
+1. **部分 teleport 位置差**：ALFRED 的 TeleportFull 可能把 agent 放在墙角/家具边缘，导致所有移动被 Floor 阻挡
+2. **Fork 机制未端到端测试**：代码在但 e2e 和 pipeline 默认 `enable_fork=False`
+3. **heat/cool/clean 任务未充分测试**
+4. **Phase 2 guard**：`cascade_level <= 1` 可能偏严格
+5. **Stage 0 未做**：failure_type_library.json 手工 8 种类型
+6. **无自动化测试**：纯逻辑模块（task_conditions, action_adapter, context_builder, episode_manager, trap_planner, alfred_parser）可测但未测
 
-2. **EB 空间推理不稳定**：即使多图输入正确，模型仍可能看错方向、距离或可达路径。提示词只能部分缓解，需要继续比较 8B/32B 的 e2e 表现。
+## AI2-THOR 5.0.0 注意
 
-3. **Fork 机制未端到端测试**：代码在但 e2e 和 pipeline 默认 `enable_fork=False`。当前调 prompt 和单 branch 生成级联失败数据，暂不调反事实 fork。
-
-4. **Phase 2 guard**：`cascade_level <= 1` 守卫可能仍偏严格。
-
-5. **调度器 max_parallel**：参数存在但始终串行执行。
-
-6. **Stage 0 未做**：failure_type_library.json 是手工写的 8 种失败类型，应该让 Oracle 阅读 AI2-THOR 文档自动生成。
-
-## 最近补丁
-
-1. EB prompt 统一加入 `HAND STATUS` 和 `TASK COMPLETION CRITERIA`，普通 Phase 1、LookAround 多图决策、Phase 3 失败恢复复用同一个上下文生成函数。
-2. `task_conditions.py` 负责 ALFRED 任务完成检查，所有 checker 返回 `(bool, reason)`。`Done` 被拒时会写具体缺失条件。
-3. `get_completion_criteria_text()` 复用 `_official_task_type()`，避免 movable receptacle 任务的文案和真实检查逻辑不一致。
-4. `LookAround` 不再循环重复扫描；模型重复输出 `LookAround` 时记录 `model_repeated_lookaround` 并回到普通 Phase 1。
-5. 多图请求给每张图单独加方向标签：`VIEW 1: ahead`、`VIEW 2: left`、`VIEW 3: behind`、`VIEW 4: right`。
-6. `TrapPlanner._find_object()` 支持 `exclude_types`，`run_single_branch` 中调用 `_extract_task_target_types()` 提取 pddl_params 中的目标物体类型。
-7. 新增动作：MoveLeft, MoveRight, MoveBack, BreakObject, FillObjectWithLiquid, EmptyLiquidFromObject。已加入 `_VALID_ACTIONS` 和 prompt。
+- `SetObjectStatic` 不存在；`BreakObject` 代替做 `immovable_object` trap
+- `Blinds` 不能 Close（blocklist）
+- `process_visible_bounds2D` 初始化顺序 bug → `_fix_visible_bounds` 手动修
+- PickupObject 交互范围 ~0.5m，metadata.visible 不保证可交互
