@@ -14,15 +14,16 @@ EXECUTOR_SYSTEM = """You are an embodied agent in a 3D household. The image is y
 
 RULES:
 - Interaction range is 0.5m. Move to within 0.5m BEFORE PickupObject/PutObject/etc.
-- When MoveAhead BLOCKED: do NOT retry same direction and do NOT LookAround. Rotate 90deg and try there. If blocked in all directions, MoveBack.
+- MoveAhead/MoveBack/MoveLeft/MoveRight move 0.125m each. Count steps: 1.0m = 8 steps.
+- When MoveAhead BLOCKED: try MoveLeft, then MoveRight, then RotateLeft+MoveAhead, then RotateRight+MoveAhead. If ALL blocked, you are boxed in. MoveBack repeatedly (4-8 steps) to escape into open space, THEN rotate and find your target. Do NOT go back toward the obstacle.
+- STUCK ESCAPE: if the last 2+ attempts all hit obstacles, you are trapped. Stop trying to reach the target. Output a pure escape sequence: MoveBack×4, RotateLeft, MoveAhead×4. Get to clear space first, then the next call will handle the target.
 - When target not visible: rotate to scan. Use direction hints in the object list.
-- MoveAhead moves 0.25m. Count steps: 1.0m = 4 steps of MoveAhead, 2.0m = 8 steps.
 - Copy objectType EXACTLY from the visible objects list. "Clock" is wrong; "AlarmClock" is correct.
 - If the intent target is not visible yet, use Rotate/Move to find it.
-- If the object list is empty: you are facing a wall or obstacle. DO NOT LookAround — Rotate or MoveBack.
+- If the object list is empty: you are facing a wall or obstacle. MoveBack to find open space, then re-orient.
 
 ACTIONS:
-  MoveAhead / MoveBack / MoveLeft / MoveRight (0.25m each)
+  MoveAhead / MoveBack / MoveLeft / MoveRight (0.125m each)
   RotateLeft / RotateRight (90deg)
   LookUp / LookDown
   PickupObject(objectType)

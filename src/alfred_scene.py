@@ -4,7 +4,7 @@ from src.action_adapter import adapt
 
 
 ALFRED_INIT_SETTINGS = {
-    "gridSize": 0.25,
+    "gridSize": 0.125,
     "cameraY": 0.75,
     "renderImage": True,
     "renderDepthImage": False,

@@ -21,7 +21,7 @@ from src.context_builder import build_eb_history_context
 PHASE1_SYSTEM = """You are an embodied agent in a 3D household. The image is your FIRST-PERSON VIEW. You occupy a physical body; every action moves or rotates you.
 
 RULES:
-- Interaction range is 0.5m. Check distance BEFORE PickupObject/PutObject/etc. If >0.5m, MoveAhead (0.25m/step) first. Never interact beyond 0.5m.
+- Interaction range is 0.5m. Check distance BEFORE PickupObject/PutObject/etc. If >0.5m, MoveAhead (0.125m/step) first. Never interact beyond 0.5m.
 - When MoveAhead BLOCKED: do NOT retry same direction and do NOT LookAround. Instead, Rotate 90deg and try there. If blocked in all 4 directions, MoveBack to escape the tight spot. LookAround is useless when you are boxed in — you already know you're stuck, you need to MOVE.
 - When target not visible AND you have open space around you: rotate to scan. Use direction hints in the object list.
 - If the object list below is empty: you are facing a wall or obstacle. DO NOT LookAround — Rotate or MoveBack to find open space, then locate your target.
@@ -31,10 +31,10 @@ RULES:
 AVAILABLE ACTIONS — use EXACT names and syntax:
 
 Navigation:
-  MoveAhead          — forward 0.25m
-  MoveBack           — backward 0.25m
-  MoveLeft           — strafe left 0.25m
-  MoveRight          — strafe right 0.25m
+  MoveAhead          — forward 0.125m
+  MoveBack           — backward 0.125m
+  MoveLeft           — strafe left 0.125m
+  MoveRight          — strafe right 0.125m
   RotateLeft         — turn 90deg left
   RotateRight        — turn 90deg right
   LookUp             — tilt camera up
@@ -245,10 +245,10 @@ Your job is to:
 AVAILABLE ACTIONS (use EXACTLY these names, do NOT invent new ones):
 
 NAVIGATION:
-- MoveAhead: move forward 0.25m. If BLOCKED, Rotate to find a clear path.
-- MoveBack: move backward 0.25m.
-- MoveLeft: strafe left 0.25m.
-- MoveRight: strafe right 0.25m.
+- MoveAhead: move forward 0.125m. If BLOCKED, Rotate to find a clear path.
+- MoveBack: move backward 0.125m.
+- MoveLeft: strafe left 0.125m.
+- MoveRight: strafe right 0.125m.
 - RotateLeft: rotate 90 degrees left.
 - RotateRight: rotate 90 degrees right.
 - LookUp: tilt camera up.
