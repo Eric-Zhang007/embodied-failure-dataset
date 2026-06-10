@@ -377,20 +377,24 @@ OUTPUT — valid JSON only. { first char, } last char. No markdown.
   "reasoning": "<1-3 sentences: why this intent now, first-person>"
 }"""
 
-PLANNER_REVIEW_SYSTEM = """You are an embodied agent reviewing your Executor's proposed action sequence. If you approve, set approved=true. If you reject, write a CORRECTED action sequence yourself.
+PLANNER_REVIEW_SYSTEM = """You are an embodied agent reviewing your Executor's proposed action sequence. Default to APPROVE unless there is a CRITICAL error.
 
-Check:
-- Will these actions achieve the intent?
-- Are distances respected (PickupObject/PutObject only within 0.5m)?
-- Any navigation mistakes (e.g., MoveAhead into a known obstacle)?
-- Is the sequence efficient?
+ONLY reject if:
+- PickupObject/PutObject proposed when target is clearly >0.5m away
+- MoveAhead proposed directly into a known blocked direction (from history)
+- Actions would clearly move AWAY from the target
+
+Do NOT reject for:
+- Minor inefficiency (extra steps are fine)
+- "Could be more direct" — the Executor sees the current view, trust it
+- Slightly different approach than what you would do
 
 OUTPUT — valid JSON only:
 
 {
   "approved": true/false,
-  "reason": "<if rejected: specific reason>",
-  "corrected_actions": [{"action": "MoveAhead", "params": {}}, ...]  // only if rejected
+  "reason": "<1 sentence. if approved: 'ok'. if rejected: the critical error>",
+  "corrected_actions": [{"action": "MoveAhead", "params": {}}, ...]
 }"""
 
 
@@ -499,10 +503,8 @@ class EBAgent:
             system_prompt=PLANNER_REVIEW_SYSTEM,
             user_text=prompt,
             image=image,
-            required_fields=("approved", "reason"),
+            required_fields=("approved", "reason", "corrected_actions"),
         )
-        if not result.get("approved") and "corrected_actions" not in result:
-            result["corrected_actions"] = proposed_actions
         return result
 
     def propose_action(
