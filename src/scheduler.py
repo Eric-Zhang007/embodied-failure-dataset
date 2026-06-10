@@ -4,8 +4,10 @@
 
 import os
 import glob
+import threading
 from dataclasses import dataclass
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.vlm_client import VLMClient
 from src.eb_agent import EBAgent
@@ -107,15 +109,35 @@ class Scheduler:
     def run(self):
         self.load_tasks()
         total = len(self.queue)
+        max_workers = max(1, self.config.max_parallel)
+        self._lock = threading.Lock()
 
-        while self.queue:
-            task = self.queue.popleft()
-            result = self._run_branch(task)
-            self.stats["completed"] += 1
-            for ft in result.fork_tasks:
-                self.fork_queue.append(self._fork_entry(task, ft))
-            self._report(total)
+        # Phase 1: parallel main branches
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for i, task in enumerate(self.queue):
+                futures[executor.submit(self._run_branch_worker, task, i + 1, total)] = task
 
+            for future in as_completed(futures):
+                task = futures[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    result = BranchResult(
+                        branch_id=task["branch_config"].branch_id,
+                        termination_reason=f"worker_crash:{e}",
+                        total_steps=0, fork_tasks=[],
+                    )
+                    with self._lock:
+                        self.stats["failed"] += 1
+                if result:
+                    with self._lock:
+                        self.stats["completed"] += 1
+                        for ft in result.fork_tasks:
+                            self.fork_queue.append(self._fork_entry(task, ft))
+                        self._report(total)
+
+        # Phase 2: serial fork branches (depends on parent completion)
         if self.fork_queue:
             print(f"\nProcessing {len(self.fork_queue)} fork branches...")
         while self.fork_queue:
@@ -127,6 +149,26 @@ class Scheduler:
             self._report(total)
 
         print(f"\n\nDone. {self.stats['completed']} branches, {self.stats['failed']} failed.")
+
+    def _run_branch_worker(self, task: dict, n: int, total: int) -> BranchResult:
+        """Thread-safe wrapper around _run_branch."""
+        ep_id = task["episode_id"]
+        out_file = os.path.join(self.config.output_dir, f"{ep_id}.json")
+        if os.path.exists(out_file):
+            with self._lock:
+                self.stats["skipped"] += 1
+            return BranchResult(branch_id="main", termination_reason="skipped",
+                                total_steps=0, fork_tasks=[], fork_source_step_ids=[])
+        print(f"\n[{n}/{total}] Starting {ep_id}")
+        result = run_single_branch(
+            traj_path=task["traj_path"],
+            eb_agent=self.eb_agent,
+            oracle_agent=self.oracle_agent,
+            output_dir=self.config.output_dir,
+            enable_fork=self.config.enable_fork,
+        )
+        print(f"[{n}/{total}] Finished {ep_id}: {result.termination_reason} ({result.total_steps} steps)")
+        return result
 
     # ------------------------------------------------------------------
     # Main 分支 → 委托 run_single_branch

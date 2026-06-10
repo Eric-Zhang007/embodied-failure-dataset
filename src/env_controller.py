@@ -91,21 +91,22 @@ class EnvController:
     def _start_xvfb(cls):
         if cls._xvfb_proc is not None:
             return
-        # Check if DISPLAY already set
+        # DISPLAY already set — use it
         if os.environ.get("DISPLAY"):
             return
-        # Check if Xvfb already running on :99
-        try:
-            subprocess.check_call(
-                ["xdpyinfo", "-display", cls._xvfb_display],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            os.environ["DISPLAY"] = cls._xvfb_display
-            return
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
-
+        # WSLg provides XWayland at :0
+        for display in (":0", ":0.0"):
+            try:
+                subprocess.check_call(
+                    ["xdpyinfo", "-display", display],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                os.environ["DISPLAY"] = display
+                return
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
+        # Fallback: Xvfb headless
         cls._xvfb_proc = subprocess.Popen(
             ["Xvfb", cls._xvfb_display, "-screen", "0", "1024x768x24", "-ac"],
             stdout=subprocess.DEVNULL,
