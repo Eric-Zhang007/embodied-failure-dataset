@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--data-dir", default="data/json_2.1.0")
     parser.add_argument("--output", default="output_e2e")
     parser.add_argument("--no-traps", action="store_true", help="Disable initial traps")
+    parser.add_argument("--random", action="store_true", help="Pick a random episode instead of the first")
     args = parser.parse_args()
 
     # 1. 找一条轨迹
@@ -44,7 +45,11 @@ def main():
         print(f"No trajectories found for task_type={args.task}")
         sys.exit(1)
 
-    traj_path = all_files[0]
+    if args.random:
+        import random
+        traj_path = random.choice(all_files)
+    else:
+        traj_path = all_files[0]
     print(f"Episode: {os.path.basename(os.path.dirname(traj_path))}")
     print(f"Traj: {traj_path}\n")
 
