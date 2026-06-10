@@ -56,9 +56,11 @@ class BranchRunner:
         step_limit_multiplier: int = 4,
         enable_fork: bool = True,
         enable_phase2: bool = True,
+        executor_agent=None,
     ):
         self.eb_agent = eb_agent
         self.oracle_agent = oracle_agent
+        self.executor_agent = executor_agent
         self.output_dir = output_dir
         self.enable_phase2 = enable_phase2
         self.step_limit_multiplier = step_limit_multiplier
@@ -191,7 +193,69 @@ class BranchRunner:
             # Skip Phase 1 VLM if initial LookAround already decided
             if step_index == 1 and proposed_action:
                 pass
+            elif self.executor_agent is not None:
+                # ── Planner→Executor→Review cycle ──
+                hand_status = "empty"
+                if inventory_objects:
+                    h = inventory_objects[0]
+                    hand_status = f"holding {h.get('objectType', '?')}"
+
+                for review_round in range(3):
+                    # 1. Planner proposes intent
+                    planner_intent = self.eb_agent.plan_intent(
+                        task_goal=ep.data["task_goal"],
+                        image=image,
+                        visible_objects=metadata.get("objects", []),
+                        action_history=eb_history,
+                        last_error=last_error,
+                        inventory_objects=inventory_objects,
+                        hand_status=hand_status,
+                        task_criteria=task_criteria,
+                        memory_text=memory.render(),
+                    )
+                    intent = planner_intent["intent"]
+                    intent_target = planner_intent.get("target", "")
+                    planner_reasoning = planner_intent.get("reasoning", "")
+
+                    # 2. Executor proposes actions
+                    feedback = last_error if review_round > 0 else None
+                    exec_result = self.executor_agent.execute_intent(
+                        intent=intent,
+                        target=intent_target,
+                        image=image,
+                        visible_objects=metadata.get("objects", []),
+                        agent_pos=agent_pose.get("position"),
+                        agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
+                        hand_status=hand_status,
+                        planner_feedback=feedback,
+                    )
+
+                    # 3. Planner reviews
+                    review = self.eb_agent.review_actions(
+                        intent=intent,
+                        target=intent_target,
+                        proposed_actions=exec_result.get("actions", []),
+                        executor_reasoning=exec_result.get("reasoning", ""),
+                        image=image,
+                        visible_objects=metadata.get("objects", []),
+                        action_history=eb_history,
+                    )
+
+                    if review.get("approved"):
+                        proposed_action = "MoveSequence"
+                        proposed_params = {"steps": exec_result.get("actions", [])}
+                        eb_reasoning = exec_result.get("reasoning", "")
+                        break
+                    else:
+                        # Feedback for next Executor attempt
+                        last_error = f"Planner rejected actions for intent '{intent}': {review.get('reason', 'no reason given')}"
+                else:
+                    # 3 review rounds exhausted — use last attempt anyway
+                    proposed_action = "MoveSequence"
+                    proposed_params = {"steps": exec_result.get("actions", [])}
+                    eb_reasoning = exec_result.get("reasoning", "")
             else:
+                # ── Original single-agent path (no executor) ──
                 eb_phase1 = self.eb_agent.propose_action(
                     task_goal=ep.data["task_goal"],
                     image=image,
@@ -769,12 +833,38 @@ class BranchRunner:
 
         for i, step in enumerate(steps):
             action = step.get("action", "")
-            if action not in _MOVEMENT_ACTIONS:
+            step_params = {k: v for k, v in step.items() if k not in ("action", "repeat")}
+
+            # Resolve objectType → objectId for object-interaction actions
+            if action not in _MOVEMENT_ACTIONS and action != "Done":
+                if action not in _VALID_ACTIONS:
+                    desc = " → ".join(executed) if executed else "(nothing)"
+                    msg = f"MoveSequence: {desc} succeeded, then invalid action '{action}' at step {i+1}."
+                    return (
+                        {"success": False, "error": msg, "partial": True,
+                         "executed": executed, "frame": final_frame, "metadata": final_metadata},
+                        msg,
+                    )
+                current_objs = (final_metadata or metadata).get("objects", [])
+                resolved, warn = resolve_object_ids(action, step_params, current_objs)
+                if warn and action in _OBJECT_ACTIONS:
+                    desc = " → ".join(executed) if executed else "(nothing)"
+                    msg = f"MoveSequence partially executed: {desc}, then {action} failed — {warn}"
+                    return (
+                        {"success": False, "error": msg, "partial": True,
+                         "executed": executed, "frame": final_frame, "metadata": final_metadata},
+                        msg,
+                    )
+                act, params = adapt(action, resolved)
+            elif action in _MOVEMENT_ACTIONS:
+                act = action
+                params = {}
+            elif action == "Done":
+                act = "Done"
+                params = {}
+            else:
                 desc = " → ".join(executed) if executed else "(nothing)"
-                msg = (
-                    f"MoveSequence: {desc} succeeded, then invalid movement '{action}' at step {i+1}. "
-                    f"Allowed movements: {', '.join(sorted(_MOVEMENT_ACTIONS))}."
-                )
+                msg = f"MoveSequence: {desc} succeeded, then unknown action '{action}' at step {i+1}."
                 return (
                     {"success": False, "error": msg, "partial": True,
                      "executed": executed, "frame": final_frame, "metadata": final_metadata},
@@ -782,12 +872,11 @@ class BranchRunner:
                 )
 
             repeat = max(1, int(step.get("repeat", 1)))
-            # Cap to prevent runaway (10000 → effectively unlimited within 200-step hard limit)
             repeat = min(repeat, 200)
 
             succeeded = 0
             for r in range(repeat):
-                result = env.step(action)
+                result = env.step(act, **params)
                 if result["success"]:
                     succeeded += 1
                     final_frame = result["frame"]
@@ -820,7 +909,7 @@ class BranchRunner:
                              "frame": result["frame"], "metadata": result["metadata"]},
                             msg,
                         )
-                    break  # stop this step
+                    break
 
             if not all_succeeded:
                 break
@@ -1037,6 +1126,7 @@ def run_single_branch(
     trap_planner=None,
     enable_fork: bool = False,
     step_limit_multiplier: int = 4,
+    executor_agent=None,
 ) -> BranchResult:
     """
     一个 episode 的完整生命周期：加载数据 → 初始化环境 → 陷阱 → 跑分支。
@@ -1097,7 +1187,8 @@ def run_single_branch(
         runner = BranchRunner(eb_agent, oracle_agent, output_dir,
                               step_limit_multiplier=step_limit_multiplier,
                               enable_fork=enable_fork,
-                              enable_phase2=(trap_planner is not False and trap_planner is not None))
+                              enable_phase2=(trap_planner is not False and trap_planner is not None),
+                              executor_agent=executor_agent)
 
         config = BranchConfig(
             episode_id=episode_id,

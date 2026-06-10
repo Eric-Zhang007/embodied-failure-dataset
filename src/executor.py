@@ -1,52 +1,55 @@
 """
-Executor Agent — translates a Planner intent into a short action chunk.
+Executor — takes a Planner intent + current view → outputs concrete action chunk.
+Same agent identity as Planner (first-person). Uses 8B model for fast per-step execution.
 
-Operates in a tight loop: receives an intent, outputs 1-5 concrete actions,
-executes them, reports status back to Planner. Does NOT know the task goal —
-only the current intent.
+Review loop: Executor proposes actions → Planner reviews → approve or reject with feedback.
 """
-
 from __future__ import annotations
-
 import numpy as np
-
 from src.vlm_client import VLMClient
 
-EXECUTOR_SYSTEM = """You are an action executor. Given a first-person view and a single intent, output 1-5 concrete actions to achieve it.
+EXECUTOR_SYSTEM = """You are an embodied agent in a 3D household. You receive a high-level intent and must output 1-5 concrete actions to carry it out.
 
 RULES:
-- Interaction range is 0.5m. Check distance before PickupObject/PutObject/etc.
-- When MoveAhead is BLOCKED: do NOT retry same direction. Rotate or MoveBack.
-- Never interact with objects beyond 0.5m.
+- Interaction range is 0.5m. Move to within 0.5m BEFORE PickupObject/PutObject/etc.
+- When MoveAhead BLOCKED: try MoveLeft/Right, then Rotate, then MoveBack. Do NOT retry same blocked direction.
+- MoveAhead moves 0.25m. Count steps: 1.0m = 4 steps of MoveAhead.
 - Copy objectType EXACTLY from the visible objects list.
+- If the intent target is not visible yet, use Rotate/Move to find it.
 
 ACTIONS:
-  MoveAhead / MoveBack / MoveLeft / MoveRight  (0.25m each)
-  RotateLeft / RotateRight  (90°)
+  MoveAhead / MoveBack / MoveLeft / MoveRight (0.25m each)
+  RotateLeft / RotateRight (90deg)
   LookUp / LookDown
   PickupObject(objectType)
-  PutObject(objectType, receptacleType)  — receptacleType from intent
+  PutObject(objectType, receptacleType) — receptacleType from visible list
   OpenObject(objectType) / CloseObject(objectType)
   ToggleObjectOn(objectType) / ToggleObjectOff(objectType)
+  SliceObject(objectType) / BreakObject(objectType)
+  FillObjectWithLiquid(objectType) / EmptyLiquidFromObject(objectType)
   DropHandObject
   Done
 
-OUTPUT — valid JSON only. { first char, } last char.
+OUTPUT — valid JSON only:
+- { must be the FIRST character, } must be the LAST character.
+- NO text outside braces. NO markdown.
+
 {
   "actions": [
     {"action": "MoveAhead", "params": {}},
     {"action": "PickupObject", "params": {"objectType": "AlarmClock"}}
   ],
   "status": "done" | "partial" | "failed",
-  "status_reason": "<1 sentence>"
+  "reasoning": "<first-person reasoning: what you see and why these actions>",
+  "status_reason": "<1 sentence: why done/partial/failed>"
 }
-- "done": intent fully achieved
-- "partial": made progress but need more actions (will be called again with same intent)
+- "done": intent fully achieved with these actions
+- "partial": made progress, need another call with same intent
 - "failed": intent cannot be achieved from current position (Planner will replan)"""
 
 
 class ExecutorAgent:
-    """Translates intents into short action chunks."""
+    """Low-level action executor using 8B model."""
 
     def __init__(self, client: VLMClient):
         self.client = client
@@ -59,34 +62,32 @@ class ExecutorAgent:
         visible_objects: list[dict],
         agent_pos: dict | None = None,
         agent_rot_y: float = 0.0,
+        hand_status: str = "",
+        planner_feedback: str | None = None,
+        max_retries: int = 2,
     ) -> dict:
-        """Given an intent and current view, output an action chunk.
+        """Given an intent and current view, output action chunk.
 
-        Returns: {"actions": [...], "status": "done"|"partial"|"failed", "status_reason": "..."}
+        planner_feedback: if Planner rejected a previous attempt, this is the reason.
         """
         from src.eb_agent import _direction
 
-        # Build compact user prompt
-        lines = [f"Intent: {intent}"]
+        lines = [f"Your intent: {intent}"]
         if target:
-            lines.append(f"Target object: {target}")
+            lines.append(f"Target: {target}")
+        if hand_status:
+            lines.append(f"HAND STATUS: {hand_status}")
         lines.append("")
 
-        # Visible receptacles
-        visible = [o for o in visible_objects if o.get("visibleBounds2D")]
-        receptacles = [o for o in visible if o.get("receptacle")]
-        if receptacles:
-            lines.append("Receptacles in view:")
-            for o in receptacles:
-                d = ""
-                if agent_pos and o.get("position"):
-                    d = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
-                lines.append(f"  {o['objectType']}{d}")
+        if planner_feedback:
+            lines.append(f"PLANNER REJECTED YOUR PREVIOUS ACTIONS: {planner_feedback}")
+            lines.append("Rewrite your actions based on this feedback.\n")
 
-        # All visible objects
+        # Visible objects
+        visible = [o for o in visible_objects if o.get("visibleBounds2D")]
         if visible:
-            lines.append("\nVisible objects:")
-            for o in visible[:15]:
+            lines.append("Objects in view — direction relative to your facing:")
+            for o in visible[:12]:
                 extra = []
                 if o.get("isPickedUp"):
                     extra.append("held")
@@ -99,13 +100,16 @@ class ExecutorAgent:
                 if agent_pos and o.get("position"):
                     d = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
                 lines.append(f"  {o['objectType']}{tag}{d}")
+        else:
+            lines.append("(No objects in view — you may be facing a wall. Rotate or MoveBack.)")
 
+        lines.append("\nOutput your action sequence. Be concise.")
         prompt = "\n".join(lines)
 
-        result = self.client.chat_with_image_json(
+        return self.client.chat_with_image_json(
             system_prompt=EXECUTOR_SYSTEM,
             user_text=prompt,
             image=image,
-            required_fields=("actions", "status", "status_reason"),
+            required_fields=("actions", "status", "reasoning", "status_reason"),
+            max_retries=max_retries,
         )
-        return result

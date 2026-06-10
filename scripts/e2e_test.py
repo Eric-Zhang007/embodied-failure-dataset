@@ -16,6 +16,7 @@ import sys
 from src.vlm_client import VLMClient
 from src.eb_agent import EBAgent
 from src.oracle_agent import OracleAgent
+from src.executor import ExecutorAgent
 from src.branch_runner import run_single_branch
 from src.trap_planner import TrapPlanner
 
@@ -25,6 +26,7 @@ def main():
     parser.add_argument("--api-key", required=True)
     parser.add_argument("--eb-model", default="Qwen/Qwen3-VL-32B-Instruct")
     parser.add_argument("--oracle-model", default="Qwen/Qwen3-VL-32B-Instruct")
+    parser.add_argument("--executor-model", default="Qwen/Qwen3-VL-8B-Instruct")
     parser.add_argument("--task", default="", help="ALFRED task_type filter")
     parser.add_argument("--data-dir", default="data/json_2.1.0")
     parser.add_argument("--output", default="output_e2e")
@@ -49,8 +51,10 @@ def main():
     # 2. 创建 Agent
     eb_client = VLMClient.siliconflow(args.eb_model, args.api_key)
     oracle_client = VLMClient.siliconflow(args.oracle_model, args.api_key)
+    executor_client = VLMClient.siliconflow(args.executor_model, args.api_key)
     eb_agent = EBAgent(eb_client)
     oracle_agent = OracleAgent(oracle_client)
+    executor_agent = ExecutorAgent(executor_client)
 
     # 2.5 Warmup: 32B 首次调用需要加载模型，提前发一个请求
     import time as _time
@@ -69,6 +73,7 @@ def main():
         trap_planner=trap_planner,
         enable_fork=False,
         step_limit_multiplier=2,
+        executor_agent=executor_agent,
     )
 
     # 4. 结果

@@ -345,9 +345,157 @@ def build_phase3_prompt(
 # EB Agent 顶层
 # ------------------------------------------------------------------
 
+PLANNER_SYSTEM = """You are an embodied agent in a 3D household. The image is your FIRST-PERSON VIEW. Your job is HIGH-LEVEL PLANNING: you decide WHAT to do, not exactly HOW. Another part of you (Executor) will handle the detailed action steps.
+
+Output a single high-level intent. Be specific about the target object. Use EXACT objectType names.
+
+RULES:
+- Look at the image, visible objects, task goal, hand status, and spatial memory.
+- Decide the next logical sub-goal to make progress toward the task.
+- If target is >0.5m away: intent is to APPROACH it first.
+- If target is in hand and task requires putting it somewhere: intent is to PLACE it.
+- If target is not visible: intent is to LOCATE it.
+
+INTENTS (use these exact forms):
+  approach <objectType>      — move toward the object until within 0.5m
+  pickup <objectType>        — pick up the object (only if within 0.5m!)
+  put <objectType> on <receptacleType> — place held object into receptacle
+  open <objectType>          — open a container/cabinet/drawer
+  close <objectType>         — close a container
+  toggle on <objectType>     — turn on an appliance
+  toggle off <objectType>    — turn off an appliance
+  locate <objectType>        — search the room for a target not currently visible
+  scan room                  — full 4-direction scan to understand surroundings
+  wait                       — nothing to do, task in progress
+  Done                       — task is complete
+
+OUTPUT — valid JSON only. { first char, } last char. No markdown.
+
+{
+  "intent": "<intent phrase>",
+  "target": "<objectType or empty>",
+  "reasoning": "<1-3 sentences: why this intent now, first-person>"
+}"""
+
+PLANNER_REVIEW_SYSTEM = """You are an embodied agent reviewing your own (Executor's) proposed action sequence. The Executor took your intent and wrote concrete actions. You must review them.
+
+Check:
+- Will these actions achieve the intent?
+- Are distances respected (PickupObject/PutObject only within 0.5m)?
+- Are there any obvious navigation mistakes (e.g., MoveAhead into a known obstacle)?
+- Is the sequence efficient (no unnecessary scans or rotations)?
+
+OUTPUT — valid JSON only:
+
+{
+  "approved": true/false,
+  "reason": "<if rejected: specific reason, what to fix>"
+}"""
+
+
 class EBAgent:
     def __init__(self, client: VLMClient):
         self.client = client
+
+    # ------------------------------------------------------------------
+    # Planner: high-level intent
+    # ------------------------------------------------------------------
+    def plan_intent(
+        self,
+        task_goal: str,
+        image: np.ndarray,
+        visible_objects: list[dict],
+        action_history: list[dict],
+        last_error: str | None,
+        inventory_objects: list[dict] | None = None,
+        hand_status: str = "",
+        task_criteria: str = "",
+        memory_text: str = "",
+    ) -> dict:
+        """Propose the next high-level intent."""
+        lines = [f"Task goal: {task_goal}\n"]
+        if memory_text:
+            lines.append(memory_text)
+            lines.append("")
+        if hand_status:
+            lines.append(f"HAND STATUS: {hand_status}")
+        if task_criteria:
+            lines.append(f"\nTASK COMPLETION CRITERIA:\n{task_criteria}")
+
+        visible = [o for o in visible_objects if o.get("visibleBounds2D")]
+        if visible:
+            lines.append("\nObjects in view:")
+            for o in visible[:12]:
+                extra = []
+                if o.get("isPickedUp"): extra.append("held")
+                if o.get("receptacle"): extra.append("receptacle")
+                if o.get("openable"): extra.append("open")
+                if o.get("toggleable"): extra.append("on" if o.get("isToggled") else "off")
+                tag = f" ({','.join(extra)})" if extra else ""
+                lines.append(f"  {o['objectType']}{tag}")
+        else:
+            lines.append("\n(No objects in view)")
+
+        if last_error:
+            lines.append(f"\nLast error: {last_error}")
+
+        lines.append("\nRecent history:")
+        lines.append(build_eb_history_context(action_history[-5:] if len(action_history) > 5 else action_history))
+
+        lines.append("\nPropose the next intent. Be specific. Output JSON only.")
+        prompt = "\n".join(lines)
+
+        return self.client.chat_with_image_json(
+            system_prompt=PLANNER_SYSTEM,
+            user_text=prompt,
+            image=image,
+            required_fields=("intent", "target", "reasoning"),
+        )
+
+    # ------------------------------------------------------------------
+    # Planner: review Executor's action sequence
+    # ------------------------------------------------------------------
+    def review_actions(
+        self,
+        intent: str,
+        target: str,
+        proposed_actions: list[dict],
+        executor_reasoning: str,
+        image: np.ndarray,
+        visible_objects: list[dict],
+        action_history: list[dict],
+    ) -> dict:
+        """Review the Executor's proposed action sequence. Approve or reject."""
+        lines = [f"Your intent was: {intent}"]
+        if target:
+            lines.append(f"Target: {target}")
+        lines.append("")
+        lines.append("Executor proposed these actions:")
+        for i, a in enumerate(proposed_actions, 1):
+            act = a.get("action", "?")
+            params = a.get("params", {})
+            if params:
+                lines.append(f"  {i}. {act}({params})")
+            else:
+                lines.append(f"  {i}. {act}")
+        lines.append(f"\nExecutor reasoning: {executor_reasoning}")
+
+        visible = [o for o in visible_objects if o.get("visibleBounds2D")]
+        if visible:
+            lines.append("\nObjects in view:")
+            for o in visible[:8]:
+                d = f" ({', '.join(k for k in ['receptacle','held'] if o.get(k))})" if any(k in o for k in ['receptacle','isPickedUp']) else ""
+                lines.append(f"  {o['objectType']}{d}")
+
+        lines.append("\nReview the action sequence. Approve or reject with reason. Output JSON only.")
+        prompt = "\n".join(lines)
+
+        return self.client.chat_with_image_json(
+            system_prompt=PLANNER_REVIEW_SYSTEM,
+            user_text=prompt,
+            image=image,
+            required_fields=("approved", "reason"),
+        )
 
     def propose_action(
         self,

@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.vlm_client import VLMClient
 from src.eb_agent import EBAgent
 from src.oracle_agent import OracleAgent
+from src.executor import ExecutorAgent
 from src.branch_runner import (
     BranchRunner, BranchConfig, BranchResult,
     run_single_branch, replay_steps,
@@ -42,8 +43,10 @@ class Scheduler:
         self.config = config
         eb_client = VLMClient.siliconflow(config.eb_model, config.siliconflow_key)
         oracle_client = VLMClient.siliconflow(config.oracle_model, config.siliconflow_key)
+        executor_client = VLMClient.siliconflow("Qwen/Qwen3-VL-8B-Instruct", config.siliconflow_key)
         self.eb_agent = EBAgent(eb_client)
         self.oracle_agent = OracleAgent(oracle_client)
+        self.executor_agent = ExecutorAgent(executor_client)
         # Warmup: 32B 模型首次调用需加载，避免首次 Phase 2 超时
         import time as _time
         _t0 = _time.time()
@@ -52,6 +55,7 @@ class Scheduler:
         self.branch_runner = BranchRunner(
             self.eb_agent, self.oracle_agent, config.output_dir,
             enable_fork=config.enable_fork,
+            executor_agent=self.executor_agent,
         )
         self.fork_manager = ForkManager(
             self.eb_agent, self.oracle_agent, self.branch_runner, config.output_dir,
@@ -166,6 +170,7 @@ class Scheduler:
             oracle_agent=self.oracle_agent,
             output_dir=self.config.output_dir,
             enable_fork=self.config.enable_fork,
+            executor_agent=self.executor_agent,
         )
         print(f"[{n}/{total}] Finished {ep_id}: {result.termination_reason} ({result.total_steps} steps)")
         return result
