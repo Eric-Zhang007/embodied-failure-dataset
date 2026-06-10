@@ -16,7 +16,7 @@ from src.scheduler import Scheduler, SchedulerConfig
 def main():
     parser = argparse.ArgumentParser(description="Embodied Failure Dataset Pipeline")
     parser.add_argument("--data-dir", default="data/json_2.1.0")
-    parser.add_argument("--output", default="output")
+    parser.add_argument("--output", default="")
     parser.add_argument("--max", type=int, default=0)
     parser.add_argument("--task", type=str, default="")
     parser.add_argument("--splits", default="train,valid_seen,valid_unseen")
@@ -26,6 +26,10 @@ def main():
     parser.add_argument("--no-fork", action="store_true", help="Disable counterfactual forks")
     parser.add_argument("--parallel", type=int, default=1)
     args = parser.parse_args()
+
+    if not args.output:
+        from datetime import datetime
+        args.output = f"output_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     config = SchedulerConfig(
         data_dir=args.data_dir,

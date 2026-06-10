@@ -29,10 +29,15 @@ def main():
     parser.add_argument("--executor-model", default="Qwen/Qwen3-VL-8B-Instruct")
     parser.add_argument("--task", default="", help="ALFRED task_type filter")
     parser.add_argument("--data-dir", default="data/json_2.1.0")
-    parser.add_argument("--output", default="output_e2e")
+    parser.add_argument("--output", default="")
     parser.add_argument("--no-traps", action="store_true", help="Disable initial traps")
     parser.add_argument("--random", action="store_true", help="Pick a random episode instead of the first")
     args = parser.parse_args()
+
+    # Auto-generate timestamped output dir if not specified
+    if not args.output:
+        from datetime import datetime
+        args.output = f"output_e2e_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     # 1. 找一条轨迹
     pattern = os.path.join(args.data_dir, "train", "**", "traj_data.json")
