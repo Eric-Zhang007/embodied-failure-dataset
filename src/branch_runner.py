@@ -886,8 +886,8 @@ class BranchRunner:
                              "executed": executed,
                              "failed_action": action,
                              "failed_at_repeat": succeeded,
-                             "frame": final_frame or result["frame"],
-                             "metadata": final_metadata or result["metadata"]},
+                             "frame": (final_frame if final_frame is not None else result["frame"]),
+                             "metadata": (final_metadata if final_metadata is not None else result["metadata"])},
                             msg,
                         )
                     else:
