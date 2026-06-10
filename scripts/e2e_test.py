@@ -60,8 +60,11 @@ def main():
     import time as _time
     print("Warming up Oracle model...", end=" ", flush=True)
     _t0 = _time.time()
-    oracle_client.chat_text(system_prompt="Say OK.", user_text="OK", max_tokens=5)
-    print(f"done ({_time.time() - _t0:.1f}s)\n")
+    try:
+        oracle_client.chat_text(system_prompt="Say OK.", user_text="OK", max_tokens=5)
+        print(f"done ({_time.time() - _t0:.1f}s)")
+    except Exception as e:
+        print(f"skipped (API error: {e})")
 
     # 3. 跑
     trap_planner = None if args.no_traps else TrapPlanner()

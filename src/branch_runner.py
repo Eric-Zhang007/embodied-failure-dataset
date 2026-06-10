@@ -200,60 +200,51 @@ class BranchRunner:
                     h = inventory_objects[0]
                     hand_status = f"holding {h.get('objectType', '?')}"
 
-                for review_round in range(3):
-                    # 1. Planner proposes intent
-                    planner_intent = self.eb_agent.plan_intent(
-                        task_goal=ep.data["task_goal"],
-                        image=image,
-                        visible_objects=metadata.get("objects", []),
-                        action_history=eb_history,
-                        last_error=last_error,
-                        inventory_objects=inventory_objects,
-                        hand_status=hand_status,
-                        task_criteria=task_criteria,
-                        memory_text=memory.render(),
-                    )
-                    intent = planner_intent["intent"]
-                    intent_target = planner_intent.get("target", "")
-                    planner_reasoning = planner_intent.get("reasoning", "")
+                # 1. Planner proposes intent
+                planner_intent = self.eb_agent.plan_intent(
+                    task_goal=ep.data["task_goal"],
+                    image=image,
+                    visible_objects=metadata.get("objects", []),
+                    action_history=eb_history,
+                    last_error=last_error,
+                    inventory_objects=inventory_objects,
+                    hand_status=hand_status,
+                    task_criteria=task_criteria,
+                    memory_text=memory.render(),
+                )
+                intent = planner_intent["intent"]
+                intent_target = planner_intent.get("target", "")
 
-                    # 2. Executor proposes actions
-                    feedback = last_error if review_round > 0 else None
-                    exec_result = self.executor_agent.execute_intent(
-                        intent=intent,
-                        target=intent_target,
-                        image=image,
-                        visible_objects=metadata.get("objects", []),
-                        agent_pos=agent_pose.get("position"),
-                        agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
-                        hand_status=hand_status,
-                        planner_feedback=feedback,
-                    )
+                # 2. Executor proposes actions
+                exec_result = self.executor_agent.execute_intent(
+                    intent=intent,
+                    target=intent_target,
+                    image=image,
+                    visible_objects=metadata.get("objects", []),
+                    agent_pos=agent_pose.get("position"),
+                    agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
+                    hand_status=hand_status,
+                )
 
-                    # 3. Planner reviews
-                    review = self.eb_agent.review_actions(
-                        intent=intent,
-                        target=intent_target,
-                        proposed_actions=exec_result.get("actions", []),
-                        executor_reasoning=exec_result.get("reasoning", ""),
-                        image=image,
-                        visible_objects=metadata.get("objects", []),
-                        action_history=eb_history,
-                    )
+                # 3. Planner reviews — if rejected, Planner provides corrected actions
+                review = self.eb_agent.review_actions(
+                    intent=intent,
+                    target=intent_target,
+                    proposed_actions=exec_result.get("actions", []),
+                    executor_reasoning=exec_result.get("reasoning", ""),
+                    image=image,
+                    visible_objects=metadata.get("objects", []),
+                    action_history=eb_history,
+                )
 
-                    if review.get("approved"):
-                        proposed_action = "MoveSequence"
-                        proposed_params = {"steps": exec_result.get("actions", [])}
-                        eb_reasoning = exec_result.get("reasoning", "")
-                        break
-                    else:
-                        # Feedback for next Executor attempt
-                        last_error = f"Planner rejected actions for intent '{intent}': {review.get('reason', 'no reason given')}"
-                else:
-                    # 3 review rounds exhausted — use last attempt anyway
+                if review.get("approved"):
                     proposed_action = "MoveSequence"
                     proposed_params = {"steps": exec_result.get("actions", [])}
                     eb_reasoning = exec_result.get("reasoning", "")
+                else:
+                    proposed_action = "MoveSequence"
+                    proposed_params = {"steps": review.get("corrected_actions", exec_result.get("actions", []))}
+                    eb_reasoning = review.get("reason", "")
             else:
                 # ── Original single-agent path (no executor) ──
                 eb_phase1 = self.eb_agent.propose_action(

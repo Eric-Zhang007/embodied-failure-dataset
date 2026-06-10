@@ -377,19 +377,20 @@ OUTPUT — valid JSON only. { first char, } last char. No markdown.
   "reasoning": "<1-3 sentences: why this intent now, first-person>"
 }"""
 
-PLANNER_REVIEW_SYSTEM = """You are an embodied agent reviewing your own (Executor's) proposed action sequence. The Executor took your intent and wrote concrete actions. You must review them.
+PLANNER_REVIEW_SYSTEM = """You are an embodied agent reviewing your Executor's proposed action sequence. If you approve, set approved=true. If you reject, write a CORRECTED action sequence yourself.
 
 Check:
 - Will these actions achieve the intent?
 - Are distances respected (PickupObject/PutObject only within 0.5m)?
-- Are there any obvious navigation mistakes (e.g., MoveAhead into a known obstacle)?
-- Is the sequence efficient (no unnecessary scans or rotations)?
+- Any navigation mistakes (e.g., MoveAhead into a known obstacle)?
+- Is the sequence efficient?
 
 OUTPUT — valid JSON only:
 
 {
   "approved": true/false,
-  "reason": "<if rejected: specific reason, what to fix>"
+  "reason": "<if rejected: specific reason>",
+  "corrected_actions": [{"action": "MoveAhead", "params": {}}, ...]  // only if rejected
 }"""
 
 
@@ -465,7 +466,7 @@ class EBAgent:
         visible_objects: list[dict],
         action_history: list[dict],
     ) -> dict:
-        """Review the Executor's proposed action sequence. Approve or reject."""
+        """Review Executor's action sequence. If rejected, provide corrected actions."""
         lines = [f"Your intent was: {intent}"]
         if target:
             lines.append(f"Target: {target}")
@@ -484,18 +485,25 @@ class EBAgent:
         if visible:
             lines.append("\nObjects in view:")
             for o in visible[:8]:
-                d = f" ({', '.join(k for k in ['receptacle','held'] if o.get(k))})" if any(k in o for k in ['receptacle','isPickedUp']) else ""
+                d = ""
+                if o.get("receptacle"):
+                    d = " (receptacle)"
+                if o.get("isPickedUp"):
+                    d += " (held)"
                 lines.append(f"  {o['objectType']}{d}")
 
-        lines.append("\nReview the action sequence. Approve or reject with reason. Output JSON only.")
+        lines.append("\nReview. If rejected, provide corrected_actions. Output JSON only.")
         prompt = "\n".join(lines)
 
-        return self.client.chat_with_image_json(
+        result = self.client.chat_with_image_json(
             system_prompt=PLANNER_REVIEW_SYSTEM,
             user_text=prompt,
             image=image,
             required_fields=("approved", "reason"),
         )
+        if not result.get("approved") and "corrected_actions" not in result:
+            result["corrected_actions"] = proposed_actions
+        return result
 
     def propose_action(
         self,
