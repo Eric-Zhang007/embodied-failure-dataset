@@ -880,7 +880,11 @@ class BranchRunner:
 
         for i, step in enumerate(steps):
             action = step.get("action", "")
-            step_params = {k: v for k, v in step.items() if k not in ("action", "repeat")}
+            # Executor outputs {"action": "PickupObject", "params": {"objectType": "AlarmClock"}}
+            if "params" in step and isinstance(step["params"], dict):
+                step_params = dict(step["params"])
+            else:
+                step_params = {k: v for k, v in step.items() if k not in ("action", "repeat")}
 
             # Resolve objectType → objectId for object-interaction actions
             if action not in _MOVEMENT_ACTIONS and action != "Done":
