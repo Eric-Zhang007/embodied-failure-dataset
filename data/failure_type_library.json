@@ -2,8 +2,8 @@
   {
     "failure_type": "immovable_object",
     "category": "physical",
-    "description": "Target object is fixed in place and cannot be picked up.",
-    "injection": {"method": "set_object_property", "params": {"object_type": "<target>", "property": "is_static", "value": true}},
+    "description": "Target object is broken and cannot be picked up.",
+    "injection": {"method": "set_object_property", "params": {"object_type": "<target>", "property": "is_broken", "value": true}},
     "applicable_tasks": ["pick_and_place", "clean", "heat", "cool", "examine", "pick_two"],
     "severity": 0.25
   },

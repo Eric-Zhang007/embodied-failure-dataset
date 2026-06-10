@@ -111,7 +111,7 @@ def build_phase2_prompt(
         lines.append(f"Agent reasoning: {eb_reasoning}")
 
     objects = env_state.get("objects", [])
-    visible = [o for o in objects if o.get("visible")]
+    visible = [o for o in objects if o.get("visibleBounds2D")]
     if visible:
         lines.append(f"\nVisible objects ({len(visible)}):")
         for o in visible:
@@ -249,8 +249,10 @@ class OracleAgent:
             system_prompt=system,
             user_text=prompt,
             image=image,
-            required_fields=("inject", "reasoning", "injection"),
+            required_fields=("inject", "reasoning"),
         )
+        if "injection" not in result:
+            result["injection"] = None
         return result
 
     def evaluate_failure(

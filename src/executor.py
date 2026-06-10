@@ -73,7 +73,7 @@ class ExecutorAgent:
         lines.append("")
 
         # Visible receptacles
-        visible = [o for o in visible_objects if o.get("visible")]
+        visible = [o for o in visible_objects if o.get("visibleBounds2D")]
         receptacles = [o for o in visible if o.get("receptacle")]
         if receptacles:
             lines.append("Receptacles in view:")

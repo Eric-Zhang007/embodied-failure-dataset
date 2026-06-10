@@ -9,8 +9,8 @@ ALFRED_INIT_SETTINGS = {
     "renderImage": True,
     "renderDepthImage": False,
     "renderClassImage": False,
-    "renderObjectImage": False,
-    "visibilityDistance": 1.5,
+    "renderObjectImage": True,
+    "visibilityDistance": 100.0,
     "makeAgentsVisible": False,
 }
 

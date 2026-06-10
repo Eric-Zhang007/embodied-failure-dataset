@@ -166,7 +166,7 @@ def _close_container(controller: Controller, object_type: str):
         if obj["objectType"] == object_type and obj.get("openable") and obj.get("isOpen"):
             _step_or_raise(controller, "CloseObject", objectId=obj["objectId"], forceAction=True)
             return
-    raise ValueError(f"No open {object_type} found to close")
+    # Already closed — desired state achieved, nothing to do
 
 
 def _remove_object(controller: Controller, object_type: str):

@@ -21,7 +21,7 @@ def main():
     parser.add_argument("--task", type=str, default="")
     parser.add_argument("--splits", default="train,valid_seen,valid_unseen")
     parser.add_argument("--eb-model", default="Qwen/Qwen3-VL-32B-Instruct")
-    parser.add_argument("--oracle-model", default="Qwen/Qwen3.6-27B")
+    parser.add_argument("--oracle-model", default="Qwen/Qwen3-VL-32B-Instruct")
     parser.add_argument("--api-key", default="", help="SiliconFlow API key")
     parser.add_argument("--no-fork", action="store_true", help="Disable counterfactual forks")
     parser.add_argument("--parallel", type=int, default=1)

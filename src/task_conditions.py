@@ -188,7 +188,7 @@ def _look_at_obj_in_light(metadata: dict, pddl: dict, task_state: dict) -> tuple
 
     pickup_ids = {p["objectId"] for p in pickupables}
     in_hand = inventory and inventory[0].get("objectId") in pickup_ids
-    lamp_on = any(o.get("isToggled") and o.get("visible") for o in toggleables)
+    lamp_on = any(o.get("isToggled") and o.get("visibleBounds2D") for o in toggleables)
 
     missing = []
     if not in_hand:

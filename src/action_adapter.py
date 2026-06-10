@@ -50,7 +50,7 @@ def resolve_object_ids(action: str, params: dict, visible_objects: list[dict]):
     if action == "PutObject" and "receptacleType" in p:
         rt = p.pop("receptacleType")
         candidates = [o for o in visible_objects
-                      if o["objectType"] == rt and o.get("receptacle") and o.get("visible")]
+                      if o["objectType"] == rt and o.get("receptacle") and o.get("visibleBounds2D")]
         if not candidates:
             candidates = [o for o in visible_objects
                       if o["objectType"] == rt and o.get("receptacle")]
@@ -69,10 +69,10 @@ def resolve_object_ids(action: str, params: dict, visible_objects: list[dict]):
         ot = p.pop("objectType")
         # Prioritize: visible + pickupable, then visible, then pickupable, then any
         candidates = [o for o in visible_objects
-                      if o["objectType"] == ot and o.get("visible") and o.get("pickupable")]
+                      if o["objectType"] == ot and o.get("visibleBounds2D") and o.get("pickupable")]
         if not candidates:
             candidates = [o for o in visible_objects
-                      if o["objectType"] == ot and o.get("visible")]
+                      if o["objectType"] == ot and o.get("visibleBounds2D")]
         if not candidates:
             candidates = [o for o in visible_objects
                       if o["objectType"] == ot and o.get("pickupable")]

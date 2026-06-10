@@ -22,8 +22,9 @@ PHASE1_SYSTEM = """You are an embodied agent in a 3D household. The image is you
 
 RULES:
 - Interaction range is 0.5m. Check distance BEFORE PickupObject/PutObject/etc. If >0.5m, MoveAhead (0.25m/step) first. Never interact beyond 0.5m.
-- When MoveAhead BLOCKED: do NOT retry same direction. Rotate 90deg and try there. If blocked in all directions, MoveBack.
-- When target not visible: rotate to scan. Use direction hints in the object list.
+- When MoveAhead BLOCKED: do NOT retry same direction and do NOT LookAround. Instead, Rotate 90deg and try there. If blocked in all 4 directions, MoveBack to escape the tight spot. LookAround is useless when you are boxed in — you already know you're stuck, you need to MOVE.
+- When target not visible AND you have open space around you: rotate to scan. Use direction hints in the object list.
+- If the object list below is empty: you are facing a wall or obstacle. DO NOT LookAround — Rotate or MoveBack to find open space, then locate your target.
 - Use all 4 movement directions. Sidestep (MoveLeft/Right) to go around obstacles.
 - If hitting same obstacle repeatedly: MoveBack then wider path.
 
@@ -40,7 +41,7 @@ Navigation:
   LookDown           — tilt camera down
   LookAround         — 4-direction scan. Use when target is lost.
 
-Object interaction — use objectType from the visible objects list:
+Object interaction — use objectType from the visible objects list. Must be within 0.5m reach:
   PickupObject(objectType)
   PutObject(objectType, receptacleType)   — objectType=what you hold, receptacleType=TASK TARGET (not Floor!)
   OpenObject(objectType) / CloseObject(objectType)
@@ -48,6 +49,9 @@ Object interaction — use objectType from the visible objects list:
   SliceObject(objectType) / BreakObject(objectType)
   FillObjectWithLiquid(objectType) / EmptyLiquidFromObject(objectType)
   DropHandObject
+
+Multi-step movement:
+  MoveSequence(steps)  — chain multiple movements in ONE action. Steps: [{"action": "MoveAhead", "repeat": 5}, {"action": "MoveLeft", "repeat": 2}]. Repeat defaults to 1. Execution stops on first failure. Use this INSTEAD of MoveAhead+LookAround loops: scan ONCE, then use MoveSequence to close the distance.
 
 Task control:
   Done   — call ONLY when ALL completion criteria are met.
@@ -71,7 +75,10 @@ Params examples:
 
 
 
-def _direction(agent_pos, agent_rot_y, obj_pos):
+def _egocentric_angle(agent_pos, agent_rot_y, obj_pos):
+    """Return (angle_degrees, distance_m) of object relative to agent facing.
+    angle=0 is straight ahead, positive=right, negative=left.
+    """
     dx = obj_pos["x"] - agent_pos["x"]
     dz = obj_pos["z"] - agent_pos["z"]
     rad = math.radians(agent_rot_y)
@@ -80,6 +87,16 @@ def _direction(agent_pos, agent_rot_y, obj_pos):
     right = dx * fz - dz * fx
     angle = math.degrees(math.atan2(right, forward))
     d = math.sqrt(dx*dx + dz*dz)
+    return angle, d
+
+
+def _is_in_front(angle: float) -> bool:
+    """True if object is within ±90° of agent facing (roughly in camera frustum)."""
+    return -90 <= angle <= 90
+
+
+def _direction(agent_pos, agent_rot_y, obj_pos):
+    angle, d = _egocentric_angle(agent_pos, agent_rot_y, obj_pos)
     ds = f"{d:.1f}m"
     if -22.5 <= angle <= 22.5:       return f"ahead ({ds})"
     elif 22.5 < angle <= 67.5:       return f"ahead-right ({ds})"
@@ -141,7 +158,7 @@ def build_phase1_prompt(
     if failed_object_ids is None:
         failed_object_ids = set()
 
-    visible = [o for o in visible_objects if o.get("visible")]
+    visible = [o for o in visible_objects if o.get("visibleBounds2D")]
     receptacles = [o for o in visible if o.get("receptacle")]
     if receptacles:
         lines.append("Available RECEPTACLES (for PutObject) — pick the one matching your TASK GOAL:")
@@ -170,7 +187,7 @@ def build_phase1_prompt(
                 dir_label = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
             lines.append(f"  {o['objectType']}{tag}{prev}{dir_label}")
     else:
-        lines.append("(No objects currently in view)")
+        lines.append("(No objects currently in view — you are likely facing a wall or obstacle. Rotate or MoveBack to find open space. Do NOT LookAround from here.)")
 
     if failed_object_ids:
         lines.append("\nWARNING: The following objectIds were tried and FAILED. Do NOT propose them again:")
@@ -245,6 +262,7 @@ OBJECT INTERACTION — use objectType (plain type name, no coordinates):
 
 TASK CONTROL:
 - Done: only when task is FULLY achieved.
+- MoveSequence(steps): chain multiple movements. Steps: [{"action": "MoveAhead", "repeat": 5}, ...]. Stops on first failure. Use to close distance to a known target without re-scanning.
 
 Important rules for the counterfactual:
 - Only provide it if you genuinely believe a different EARLIER decision would have prevented the failure
@@ -298,7 +316,7 @@ def build_phase3_prompt(
         lines.append(f"Context: {cascade_description}\n")
 
     if visible_objects:
-        visible = [o for o in visible_objects if o.get("visible")]
+        visible = [o for o in visible_objects if o.get("visibleBounds2D")]
         if visible:
             lines.append("Objects currently in view — use the TYPE name. Direction shown relative to your facing:")
             for o in visible:
@@ -312,7 +330,7 @@ def build_phase3_prompt(
                     dir_label = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
                 lines.append(f"  {o['objectType']}{tag}{dir_label}")
         else:
-            lines.append("(No objects currently in view)")
+            lines.append("(No objects currently in view — you are likely facing a wall or obstacle. Rotate or MoveBack to find open space. Do NOT LookAround from here.)")
         lines.append("")
 
     if not memory_text:
@@ -392,7 +410,7 @@ class EBAgent:
             extra = []
             if o.get("isPickedUp"): extra.append("HELD")
             if o.get("receptacle"): extra.append("receptacle")
-            if o.get("visible"): extra.append("VISIBLE")
+            if o.get("visibleBounds2D"): extra.append("VISIBLE")
             else: extra.append("hidden")
             tag = " [" + ", ".join(extra) + "]" if extra else ""
             lines.append(f"  {o['objectType']}{tag}")

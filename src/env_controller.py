@@ -35,6 +35,7 @@ class EnvController:
         success = event.metadata["lastActionSuccess"]
         update_alfred_task_state(self.alfred_task_state, action, params, event.metadata)
         clean_sink_contents_after_faucet(self.controller, action, params, event.metadata)
+        self._fix_visible_bounds(event)
         return {
             "success": success,
             "error": event.metadata.get("errorMessage") if not success else None,
@@ -46,11 +47,25 @@ class EnvController:
     def get_state_snapshot(self) -> dict:
         """返回当前帧和环境状态的完整快照。"""
         event = self.controller.step(action="Pass")
+        self._fix_visible_bounds(event)
         return {
             "frame": event.frame,
             "metadata": event.metadata,
             "task_state": serializable_task_state(self.alfred_task_state),
         }
+
+    @staticmethod
+    def _fix_visible_bounds(event):
+        """AI2-THOR 5.0.0 bug: process_visible_bounds2D runs before
+        instance_detections2D is populated. Manually set visibleBounds2D."""
+        det = event.instance_detections2D
+        if det is None:
+            return
+        for obj in event.metadata["objects"]:
+            obj["visibleBounds2D"] = (
+                obj.get("visible", False)
+                and obj["objectId"] in det
+            )
 
     def reset_scene(self, scene: str = None):
         if scene is not None:

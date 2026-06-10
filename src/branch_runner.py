@@ -24,7 +24,7 @@ _VALID_ACTIONS = {
     "MoveAhead", "MoveBack", "MoveLeft", "MoveRight", "RotateLeft", "RotateRight", "LookUp", "LookDown",
     "PickupObject", "PutObject", "OpenObject", "CloseObject",
     "ToggleObjectOn", "ToggleObjectOff", "SliceObject", "BreakObject", "FillObjectWithLiquid", "EmptyLiquidFromObject", "DropHandObject",
-    "Done", "LookAround",
+    "Done", "LookAround", "MoveSequence",
 }
 
 
@@ -119,7 +119,9 @@ class BranchRunner:
                         raise RuntimeError(f"Init LookAround RotateLeft failed: {r['error']}")
                     snap = r["frame"]
                 look_images.append((d, snap))
-            env.step("RotateLeft")
+            restore_result = env.step("RotateLeft")
+            if not restore_result["success"]:
+                raise RuntimeError(f"Init LookAround restore RotateLeft failed: {restore_result['error']}")
             look_step = self._build_step_entry(
                 ep.episode_id, config.branch_id, 0, None,
                 "LookAround", {},
@@ -446,6 +448,60 @@ class BranchRunner:
                     continue
 
             # ==========================================================
+            # MoveSequence: execute a chain of movement steps sequentially.
+            # Stops on first failure, reports what actually succeeded.
+            # ==========================================================
+            if proposed_action == "MoveSequence":
+                seq_result, seq_msg = self._execute_move_sequence(
+                    proposed_params, env, metadata, failure_log_path,
+                    config.branch_id, step_index, ep.episode_id,
+                    eb_reasoning, injection_decision,
+                )
+                if seq_result.get("all_succeeded"):
+                    # All steps succeeded — record as one successful step
+                    cascade_level = 0
+                    last_error = None
+                    step_entry = self._build_step_entry(
+                        ep.episode_id, config.branch_id, step_index, parent_id,
+                        "MoveSequence", proposed_params, seq_result, eb_reasoning, injection_decision,
+                    )
+                    self._write_success_step_direct(ep, step_entry)
+                    eb_history.append(step_entry)
+                    step_index += 1
+                    nonexecuted_retry_count = 0
+                    memory.update(metadata, metadata.get("objects", []),
+                                  "MoveSequence", True, None, task_criteria)
+                    # Restore image/metadata from final state
+                    image = seq_result["frame"]
+                    metadata = seq_result["metadata"]
+                    continue
+                elif seq_result.get("partial"):
+                    # Some steps succeeded — record what happened, let EB continue from there
+                    cascade_level = max(0, cascade_level - 1)  # partial success is still progress
+                    last_error = seq_msg
+                    step_entry = self._build_step_entry(
+                        ep.episode_id, config.branch_id, step_index, parent_id,
+                        "MoveSequence", proposed_params, seq_result, eb_reasoning, injection_decision,
+                    )
+                    step_entry["error_type"] = "move_sequence_partial"
+                    self._write_success_step_direct(ep, step_entry)
+                    eb_history.append(step_entry)
+                    step_index += 1
+                    nonexecuted_retry_count = 0
+                    image = seq_result["frame"]
+                    metadata = seq_result["metadata"]
+                    memory.update(metadata, metadata.get("objects", []),
+                                  "MoveSequence", False, seq_msg, task_criteria)
+                    continue
+                else:
+                    # Nothing executed at all
+                    cascade_level += 1
+                    last_error = seq_msg
+                    step_index += 1
+                    nonexecuted_retry_count = 0
+                    continue
+
+            # ==========================================================
             # 执行 EB 动作（objectType → objectId 解析 + 适配）
             # ==========================================================
             resolved, resolve_warning = resolve_object_ids(proposed_action, proposed_params,
@@ -686,6 +742,115 @@ class BranchRunner:
             f"Allowed actions are: {', '.join(sorted(_VALID_ACTIONS))}. "
             "Re-think from the current image and output a valid JSON action."
         )
+
+    def _execute_move_sequence(self, params, env, metadata, failure_log_path,
+                                branch_id, step_index, episode_id,
+                                eb_reasoning, injection_decision):
+        """Execute a sequence of movement steps. Stop on first failure.
+
+        params format: {"steps": [{"action": "MoveAhead", "repeat": 5}, ...]}
+        Each step in the sequence is a movement action with optional repeat count (default 1).
+        Returns (result_dict, message_string).
+        """
+        steps = params.get("steps", [])
+        if not steps:
+            return (
+                {"success": False, "error": "MoveSequence has no steps"},
+                "MoveSequence failed: empty steps list. Provide at least one movement step.",
+            )
+
+        _MOVEMENT_ACTIONS = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight",
+                             "RotateLeft", "RotateRight", "LookUp", "LookDown"}
+
+        executed = []
+        final_frame = None
+        final_metadata = None
+        all_succeeded = True
+
+        for i, step in enumerate(steps):
+            action = step.get("action", "")
+            if action not in _MOVEMENT_ACTIONS:
+                desc = " → ".join(executed) if executed else "(nothing)"
+                msg = (
+                    f"MoveSequence: {desc} succeeded, then invalid movement '{action}' at step {i+1}. "
+                    f"Allowed movements: {', '.join(sorted(_MOVEMENT_ACTIONS))}."
+                )
+                return (
+                    {"success": False, "error": msg, "partial": True,
+                     "executed": executed, "frame": final_frame, "metadata": final_metadata},
+                    msg,
+                )
+
+            repeat = max(1, int(step.get("repeat", 1)))
+            # Cap to prevent runaway (10000 → effectively unlimited within 200-step hard limit)
+            repeat = min(repeat, 200)
+
+            succeeded = 0
+            for r in range(repeat):
+                result = env.step(action)
+                if result["success"]:
+                    succeeded += 1
+                    final_frame = result["frame"]
+                    final_metadata = result["metadata"]
+                else:
+                    all_succeeded = False
+                    desc = self._format_seq(executed, action, succeeded, repeat)
+                    if executed or succeeded > 0:
+                        msg = (
+                            f"MoveSequence partially executed: {desc}. "
+                            f"Last failure: {result['error']}. "
+                            f"The agent is now at a new position. Continue from here."
+                        )
+                        return (
+                            {"success": False, "error": msg, "partial": True,
+                             "executed": executed,
+                             "failed_action": action,
+                             "failed_at_repeat": succeeded,
+                             "frame": final_frame or result["frame"],
+                             "metadata": final_metadata or result["metadata"]},
+                            msg,
+                        )
+                    else:
+                        msg = (
+                            f"MoveSequence: first step {action} failed immediately: {result['error']}. "
+                            f"Nothing was executed."
+                        )
+                        return (
+                            {"success": False, "error": msg, "partial": False,
+                             "frame": result["frame"], "metadata": result["metadata"]},
+                            msg,
+                        )
+                    break  # stop this step
+
+            if not all_succeeded:
+                break
+
+            if succeeded > 0:
+                executed.append(f"{action}×{succeeded}")
+            # Continue to next step in sequence
+
+        if all_succeeded:
+            desc = " → ".join(executed) if executed else "(all steps executed)"
+            msg = f"MoveSequence completed: {desc}."
+            return (
+                {"success": True, "error": None, "all_succeeded": True,
+                 "executed": executed,
+                 "frame": final_frame, "metadata": final_metadata},
+                msg,
+            )
+
+        # Shouldn't reach here, but safe fallback
+        return (
+            {"success": False, "error": "MoveSequence unexpected state"},
+            "MoveSequence failed unexpectedly.",
+        )
+
+    @staticmethod
+    def _format_seq(executed, current_action, succeeded, total):
+        parts = list(executed)
+        if succeeded > 0:
+            parts.append(f"{current_action}×{succeeded}/{total}")
+        return " → ".join(parts) if parts else f"{current_action}×0/{total}"
 
     # ------------------------------------------------------------------
     # 内部：fork / finalize

@@ -306,7 +306,7 @@ class VLMClient:
                      self.model, "json" if json_mode else "text", body_size, msg_summary)
 
         last_conn_error = None
-        timeout = 120
+        timeout = 300
         for attempt in range(3):  # 最多 3 次尝试（1 次正常 + 2 次重试）
             try:
                 resp = requests.post(
@@ -348,7 +348,7 @@ class VLMClient:
                 logger.warning("TIMEOUT model=%s attempt=%d/3 timeout=%ds elapsed=%.1fs",
                               self.model, attempt + 1, timeout, elapsed)
                 if attempt < 2:
-                    timeout += 30  # 60 → 90 → 120
+                    timeout += 100  # 300 → 400 → 500
                     continue
                 self._dump_failure(body, "TIMEOUT_EXHAUSTED",
                                    f"All retries exhausted, last timeout={timeout}s", elapsed)
@@ -455,16 +455,29 @@ def parse_json_response(response: str, default=None) -> dict | None:
     text = response.strip()
     if not text:
         return default
+
+    # Try direct parse first
     try:
         parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
-        logger.warning("JSON_PARSE_FAIL raw=%s", response[:300])
-        return default
+        pass
 
-    if not isinstance(parsed, dict):
-        logger.warning("JSON_PARSE_NOT_OBJECT raw=%s", response[:300])
-        return default
-    return parsed
+    # Thinking models may output CoT before/after the JSON. Extract from {...}.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(text[start:end + 1])
+            if isinstance(parsed, dict):
+                logger.debug("JSON_EXTRACTED_FROM_THINKING start=%d end=%d", start, end)
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    logger.warning("JSON_PARSE_FAIL raw=%s", response[:300])
+    return default
 
 
 def _json_response_error(parsed, required_fields: tuple[str, ...] | None) -> str | None:

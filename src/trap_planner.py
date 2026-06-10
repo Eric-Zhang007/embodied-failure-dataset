@@ -103,7 +103,11 @@ class TrapPlanner:
         # 需要解析的参数值（如 "<target>", "<appliance>"）
         for key, val in list(params.items()):
             if isinstance(val, str) and val.startswith("<"):
-                obj = self._find_object(val, entry["failure_type"], scene_objects, exclude_types)
+                extra_filter = {}
+                prop = params.get("property", "")
+                if prop == "is_broken":
+                    extra_filter["breakable"] = True
+                obj = self._find_object(val, scene_objects, exclude_types, extra_filter)
                 if obj is None:
                     return None
                 params[key] = obj
@@ -116,10 +120,14 @@ class TrapPlanner:
         }
 
     def _find_object(
-        self, placeholder: str, failure_type: str, scene_objects: list[dict],
-        exclude_types: set,
+        self, placeholder: str, scene_objects: list[dict],
+        exclude_types: set, extra_filter: dict = None,
     ) -> Optional[str]:
-        """根据占位符类型找场景中合适的物体 objectType，排除 exclude_types 中的类型。"""
+        """根据占位符类型找场景中合适的物体 objectType，排除 exclude_types 中的类型。
+
+        extra_filter: 额外的属性要求，如 {"breakable": True}。
+        """
+        extra_filter = extra_filter or {}
         need = placeholder.strip("<>")
 
         if need == "target":
@@ -127,7 +135,9 @@ class TrapPlanner:
         elif need == "appliance":
             candidates = [o for o in scene_objects if o.get("toggleable")]
         elif need == "container":
-            candidates = [o for o in scene_objects if o.get("openable")]
+            _close_blocklist = {"Blinds"}
+            candidates = [o for o in scene_objects
+                          if o.get("openable") and o["objectType"] not in _close_blocklist]
         elif need == "receptacle":
             candidates = [o for o in scene_objects if o.get("receptacle")]
         elif need == "tool":
@@ -142,6 +152,9 @@ class TrapPlanner:
 
         # 排除任务关键物体
         candidates = [o for o in candidates if o["objectType"] not in exclude_types]
+        # 额外属性过滤（如 breakable）
+        for prop, val in extra_filter.items():
+            candidates = [o for o in candidates if o.get(prop) == val]
         if not candidates:
             return None
         return random.choice(candidates)["objectType"]
