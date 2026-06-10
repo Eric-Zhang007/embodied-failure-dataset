@@ -242,6 +242,7 @@ class BranchRunner:
                     image=image,
                     visible_objects=metadata.get("objects", []),
                     action_history=eb_history,
+                    last_error=last_error,
                 )
 
                 if review.get("approved"):

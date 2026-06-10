@@ -381,8 +381,10 @@ PLANNER_REVIEW_SYSTEM = """You are an embodied agent reviewing your Executor's p
 
 ONLY reject if:
 - PickupObject/PutObject proposed when target is clearly >0.5m away
-- MoveAhead proposed directly into a known blocked direction (from history)
+- MoveAhead proposed directly into a known blocked direction (check recent history!)
 - Actions would clearly move AWAY from the target
+
+STUCK DETECTION: if the last 2+ attempts in recent history all failed at their FIRST action, the agent is trapped at a navigable-area edge. In this case, MoveBack IS the correct action — approve it, or if the Executor didn't propose it, add it to corrected_actions.
 
 Do NOT reject for:
 - Minor inefficiency (extra steps are fine)
@@ -474,12 +476,25 @@ class EBAgent:
         image: np.ndarray,
         visible_objects: list[dict],
         action_history: list[dict],
+        last_error: str | None = None,
     ) -> dict:
         """Review Executor's action sequence. If rejected, provide corrected actions."""
         lines = [f"Your intent was: {intent}"]
         if target:
             lines.append(f"Target: {target}")
         lines.append("")
+
+        # Show recent history so Planner knows if agent is stuck
+        recent = action_history[-5:] if len(action_history) > 5 else action_history
+        if recent:
+            lines.append("Recent actions (check for repeated failures):")
+            lines.append(build_eb_history_context(recent))
+            lines.append("")
+
+        if last_error:
+            lines.append(f"Last error: {last_error}")
+            lines.append("If the last 2+ actions all failed on the first step, the agent is STUCK. MoveBack IS correct.")
+
         lines.append("Executor proposed these actions:")
         for i, a in enumerate(proposed_actions, 1):
             act = a.get("action", "?")
