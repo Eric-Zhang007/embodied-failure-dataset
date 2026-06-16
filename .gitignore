@@ -19,8 +19,17 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Temp analysis files
+# Project planning (internal)
+.planning/
+CLAUDE.md
+DESIGN.md
+PLANNER_EXECUTOR_RESEARCH.md
+
+# Temp analysis and dev scripts
 .deepseek/
 *.html
 .codewhale/
 docs/superpowers/
+smoke_test.py
+.python-version
+.gitignore
