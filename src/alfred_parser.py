@@ -28,14 +28,54 @@ def load_traj(traj_path: str) -> dict:
         return json.load(f)
 
 
+def _generate_task_goal(task_type: str, pddl_params: dict) -> str:
+    """Generate a clear imperative task instruction from PDDL parameters.
+
+    ALFRED's turk_annotations are often vague descriptions like
+    "Yellow apple sitting in a pan on the table". This produces
+    unambiguous instructions for the Planner and Executor.
+    """
+    obj = pddl_params.get("object_target", "")
+    parent = pddl_params.get("parent_target", "")
+    mrecep = pddl_params.get("mrecep_target", "")
+    toggle = pddl_params.get("toggle_target", "")
+    sliced = pddl_params.get("object_sliced", False)
+
+    if task_type == "pick_and_place_simple":
+        return f"Pick up the {obj} and put it on the {parent}."
+    elif task_type == "pick_and_place_with_movable_recep":
+        return f"Pick up the {obj}, put it in the {mrecep}, and place the {mrecep} on the {parent}."
+    elif task_type == "pick_clean_then_place_in_recep":
+        return f"Clean the {obj} and put it in the {parent}."
+    elif task_type == "pick_heat_then_place_in_recep":
+        return f"Heat the {obj} and put it in the {parent}."
+    elif task_type == "pick_cool_then_place_in_recep":
+        return f"Cool the {obj} and put it in the {parent}."
+    elif task_type == "look_at_obj_in_light":
+        return f"Turn on the {toggle} and check the {obj} under its light."
+    elif task_type == "pick_two_obj_and_place":
+        return f"Pick up the {obj} and the {mrecep}, and put both on the {parent}."
+    else:
+        # Fallback: construct basic instruction from available params
+        parts = []
+        if obj:
+            action = "Slice" if sliced else "Pick up"
+            parts.append(f"{action} the {obj}")
+        if mrecep and mrecep != obj:
+            parts.append(f"use the {mrecep}")
+        if parent:
+            parts.append(f"put it on the {parent}")
+        return ". ".join(parts) + "." if parts else f"Complete the task: {task_type}"
+
+
 def extract_metadata(traj: dict) -> dict:
     """
     从 ALFRED 轨迹提取任务元信息，映射到我们 schema 的 metadata 字段。
     """
-    anns = traj.get("turk_annotations", {}).get("anns", [])
-    task_desc = anns[0]["task_desc"] if anns else "Unknown task"
     task_type_raw = traj.get("task_type", "unknown")
     task_type = TASK_TYPE_MAP.get(task_type_raw, task_type_raw)
+    pddl_params = traj.get("pddl_params", {})
+    task_desc = _generate_task_goal(task_type_raw, pddl_params)
 
     return {
         "task_goal": task_desc,

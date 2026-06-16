@@ -26,6 +26,7 @@ class _ObjectEntry:
     egocentric_dist: float
     last_seen_step: int
     seen_count: int
+    parent_receptacle_id: str | None = None  # objectId of receptacle this object sits on/in
 
 @dataclass
 class _ObstacleEntry:
@@ -66,8 +67,6 @@ def _egocentric_direction(
 
 class EgocentricMemory:
     AGING_THRESHOLD: int = 20
-    MAX_OBJECTS: int = 15
-    MAX_OBSTACLES: int = 3
     BLOCK_THRESHOLD: int = 2
 
     def __init__(self):
@@ -147,6 +146,7 @@ class EgocentricMemory:
                 entry.seen_count += 1
                 entry.is_receptacle = is_recep
                 entry.is_task_receptacle = is_task_recep
+                entry.parent_receptacle_id = (obj.get("parentReceptacles") or [None])[0]
             else:
                 self._objects[oid] = _ObjectEntry(
                     object_id=oid,
@@ -158,6 +158,7 @@ class EgocentricMemory:
                     egocentric_dist=dist,
                     last_seen_step=self._step_counter,
                     seen_count=1,
+                    parent_receptacle_id=(obj.get("parentReceptacles") or [None])[0],
                 )
 
         # Mark previously-visible objects that are no longer in view as "remembered"
@@ -209,7 +210,7 @@ class EgocentricMemory:
         ]
         if active_obstacles:
             lines.append("\nOBSTACLES:")
-            for o in active_obstacles[:self.MAX_OBSTACLES]:
+            for o in active_obstacles:
                 suggestion = self._obstacle_suggestion(o)
                 lines.append(
                     f"  {o.object_type} {o.direction} blocked MoveAhead "
@@ -363,18 +364,22 @@ class EgocentricMemory:
             if count > 1:
                 type_indices[t] = 0
 
+        # Build labels and store for parent-reference resolution
+        oid_to_label: dict[str, str] = {}
         lines: list[str] = []
-        for e in sorted_entries[:self.MAX_OBJECTS]:
+        for e in sorted_entries:
             label = e.object_type
             if e.object_type in type_indices:
                 type_indices[e.object_type] += 1
                 label = f"{e.object_type}{type_indices[e.object_type]}"
-            line = self._render_object_line(e, label)
+            oid_to_label[e.object_id] = label
+            line = self._render_object_line(e, label, oid_to_label)
             if line:
                 lines.append(line)
         return lines
 
-    def _render_object_line(self, e: _ObjectEntry, label: str) -> str:
+    def _render_object_line(self, e: _ObjectEntry, label: str,
+                            oid_to_label: dict[str, str] | None = None) -> str:
         if e.status == "held":
             status_text = "held in hand"
         elif e.status == "placed":
@@ -392,6 +397,14 @@ class EgocentricMemory:
             tags.append("receptacle?")
 
         line = f"  {label} — {status_text}"
+        # Show parent relationship if known (object-to-object spatial relation)
+        if e.parent_receptacle_id and oid_to_label:
+            parent_label = oid_to_label.get(e.parent_receptacle_id)
+            if parent_label:
+                if e.status == "visible":
+                    line += f" on {parent_label}"
+                else:
+                    line += f" (was on {parent_label})"
         if tags:
             line += f" ({', '.join(tags)})"
         return line

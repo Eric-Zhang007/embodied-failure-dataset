@@ -46,14 +46,35 @@ def check_unrecoverable(metadata: dict, ep_data: dict) -> str | None:
     return None
 
 
+def _make_hashable(v):
+    """Convert dict/list to a hashable form for dead-loop detection."""
+    if isinstance(v, dict):
+        return tuple(sorted((k, _make_hashable(v2)) for k, v2 in v.items()))
+    if isinstance(v, list):
+        return tuple(_make_hashable(i) for i in v)
+    return v
+
+
 def detect_dead_loop(action_history: list[dict], window: int = 10, threshold: int = 5) -> bool:
+    # Weak signal: same (action, params) failing ≥3 times in last 8 steps
+    if len(action_history) >= 8:
+        recent_fails: dict[tuple, int] = {}
+        for s in action_history[-8:]:
+            if not s.get("success"):
+                params = _make_hashable(s.get("action_params") or {})
+                key = (s.get("action"), params)
+                recent_fails[key] = recent_fails.get(key, 0) + 1
+        if recent_fails and max(recent_fails.values()) >= 3:
+            return True
+
     if len(action_history) < window:
         return False
 
     fail_counts: dict[tuple, int] = {}
     for s in action_history[-window:]:
         if not s.get("success"):
-            key = (s.get("action"), frozenset((s.get("action_params") or {}).items()))
+            params = _make_hashable(s.get("action_params") or {})
+            key = (s.get("action"), params)
             fail_counts[key] = fail_counts.get(key, 0) + 1
 
     if not fail_counts:
@@ -62,11 +83,6 @@ def detect_dead_loop(action_history: list[dict], window: int = 10, threshold: in
     max_count = max(fail_counts.values())
     if max_count >= threshold:
         return True
-
-    if len(action_history) >= 8:
-        recent_actions = [s.get("action", "") for s in action_history[-8:]]
-        if len(set(recent_actions)) <= 2 and max_count >= 2:
-            return True
 
     return False
 

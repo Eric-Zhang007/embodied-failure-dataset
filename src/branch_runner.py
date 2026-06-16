@@ -27,6 +27,10 @@ _VALID_ACTIONS = {
     "Done", "LookAround", "MoveSequence",
 }
 
+# Meta-actions: handled by Planner / branch_runner, must never reach AI2-THOR.
+# Executor and Phase 3 recovery are forbidden from outputting these.
+_META_ACTIONS = {"Done", "LookAround"}
+
 
 @dataclass
 class BranchConfig:
@@ -66,6 +70,7 @@ class BranchRunner:
         self.step_limit_multiplier = step_limit_multiplier
         self.enable_fork = enable_fork
         self.recorder = StepRecorder()
+        self._last_scan_step = -100
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -99,6 +104,8 @@ class BranchRunner:
 
         failed_object_ids: set[str] = set()
         memory = EgocentricMemory()
+        intent_history: list[dict] = []  # completed/failed intent summaries
+        current_intent = {"intent": "", "target": "", "steps": [], "start_step": 0}
         phase2_injection_count = 0
         phase2_max_injections = 3
         nonexecuted_retry_count = 0
@@ -145,24 +152,32 @@ class BranchRunner:
             )
             memory.update(metadata0, metadata0.get("objects", []), "LookAround", True, None, tc0)
             step_index = 1
-            eb_phase1 = self.eb_agent.propose_action_lookaround(
+            # Use new scan analysis to get direction + intent (not old propose_action)
+            scan_result = self.eb_agent.analyze_scan_room(
                 task_goal=ep.data["task_goal"],
                 look_images=look_images,
                 visible_objects=metadata0.get("objects", []),
                 action_history=eb_history,
                 last_error=None,
-                failed_object_ids=set(),
                 inventory_objects=[],
                 task_criteria=tc0,
                 memory_text=memory.render(),
             )
-            proposed_action = eb_phase1["action"]
-            proposed_params = eb_phase1.get("params", {})
-            eb_reasoning = eb_phase1.get("reasoning", "")
+            # Rotate to face the determined direction
+            face_dir = scan_result.get("face_direction", "ahead")
+            dir_rotations = {"right": 1, "behind": 2, "left": 3, "ahead": 0}
+            for _ in range(dir_rotations.get(face_dir, 0)):
+                env.step("RotateLeft")
+            # Let the Planner→Executor cycle handle the first intent naturally
+            proposed_action = ""  # cleared, so step 1 enters Planner→Executor cycle
+            proposed_params = {}
+            eb_reasoning = ""
 
         while True:
             if step_index >= 200:
                 return self._make_result(config, "step_hard_limit", step_index, fork_tasks, fork_source_ids, ep)
+            parent_id = f"s{step_index - 1}" if step_index > 0 else None
+            injection_decision = None
             # ==========================================================
             # Phase 1: EB Agent 提议动作
             # ==========================================================
@@ -200,12 +215,12 @@ class BranchRunner:
                     h = inventory_objects[0]
                     hand_status = f"holding {h.get('objectType', '?')}"
 
-                # 1. Planner proposes intent
+                # 1. Planner proposes intent (sees intent history + recent raw steps)
                 planner_intent = self.eb_agent.plan_intent(
                     task_goal=ep.data["task_goal"],
                     image=image,
                     visible_objects=metadata.get("objects", []),
-                    action_history=eb_history,
+                    action_history=eb_history[-3:] if len(eb_history) > 3 else eb_history,
                     last_error=last_error,
                     agent_pos=agent_pose.get("position"),
                     agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
@@ -213,17 +228,114 @@ class BranchRunner:
                     hand_status=hand_status,
                     task_criteria=task_criteria,
                     memory_text=memory.render(),
+                    intent_history=intent_history,
                 )
                 intent = planner_intent["intent"]
                 intent_target = planner_intent.get("target", "")
 
-                # 2. Executor proposes actions
+                # Track intent — if intent changed, close previous and start new
+                prev_intent_key = (current_intent.get("intent", ""), current_intent.get("target", ""))
+                new_intent_key = (intent, intent_target)
+                if new_intent_key != prev_intent_key:
+                    if current_intent.get("steps"):
+                        current_intent["completed"] = current_intent["steps"][-1].get("success", False)
+                        current_intent["end_step"] = step_index
+                        intent_history.append(dict(current_intent))
+                    current_intent = {"intent": intent, "target": intent_target,
+                                      "steps": [], "start_step": step_index}
+
+                # ── Special intent: Done → task_conditions hard check ──
+                if intent == "Done":
+                    task_complete_done, done_reason = check_task_complete(metadata, ep.data, task_state)
+                    if task_complete_done:
+                        done_step = self._build_step_entry(
+                            ep.episode_id, config.branch_id, step_index, parent_id,
+                            "Done", {}, {"success": True, "error": None, "frame": image, "metadata": metadata},
+                            planner_intent.get("reasoning", ""), injection_decision,
+                        )
+                        self._write_success_step_direct(ep, done_step)
+                        return self._make_result(config, "task_complete", step_index + 1,
+                                                 fork_tasks, fork_source_ids, ep)
+                    last_error = f"Done rejected: {done_reason}. Fix the unmet criteria before calling Done."
+                    continue
+
+                # ── Scan cooldown: block repeat scans within 3 steps ──
+                if intent == "scan room" and (step_index - self._last_scan_step) <= 3:
+                    last_error = (
+                        "scan room rejected: last scan was only "
+                        f"{step_index - self._last_scan_step} steps ago. "
+                        "Use the SPATIAL MEMORY section to pick a concrete approach target."
+                    )
+                    continue
+
+                # ── Special intent: scan room → 4-view capture → 32B analysis ──
+                if intent == "scan room":
+                    self._last_scan_step = step_index
+                    look_images = []
+                    look_dirs = ["ahead", "left", "behind", "right"]
+                    for d in look_dirs:
+                        if d == "ahead":
+                            snap = image
+                        else:
+                            r = env.step("RotateLeft")
+                            if not r["success"]:
+                                raise RuntimeError(f"Scan room RotateLeft failed: {r['error']}")
+                            snap = r["frame"]
+                        look_images.append((d, snap))
+                    env.step("RotateLeft")  # restore original facing
+                    # Record LookAround step
+                    look_result = {"success": True, "error": None, "frame": image, "metadata": metadata}
+                    look_step = self._build_step_entry(
+                        ep.episode_id, config.branch_id, step_index, parent_id,
+                        "LookAround", {}, look_result, planner_intent.get("reasoning", ""), injection_decision,
+                    )
+                    image_dir = os.path.join(self.output_dir, ep.episode_id)
+                    view_paths = []
+                    for label, frame in look_images:
+                        vp = os.path.join(image_dir, f"s{step_index}_look_{label}.png")
+                        StepRecorder.save_frame(frame, vp)
+                        view_paths.append({"label": label, "image_path": vp})
+                    look_step["lookaround_views"] = view_paths
+                    self._write_success_step_direct(ep, look_step)
+                    eb_history.append(look_step)
+                    parent_id = f"s{step_index}"
+                    step_index += 1
+                    memory.update(metadata, metadata.get("objects", []),
+                                  "LookAround", True, None, task_criteria)
+                    # 32B multi-image analysis → direction + intent
+                    scan_result = self.eb_agent.analyze_scan_room(
+                        task_goal=ep.data["task_goal"],
+                        look_images=look_images,
+                        visible_objects=metadata.get("objects", []),
+                        action_history=eb_history,
+                        last_error=last_error,
+                        inventory_objects=inventory_objects,
+                        task_criteria=task_criteria,
+                        memory_text=memory.render(),
+                    )
+                    # Rotate to face the determined direction
+                    face_dir = scan_result.get("face_direction", "ahead")
+                    dir_rotations = {"right": 1, "behind": 2, "left": 3, "ahead": 0}
+                    for _ in range(dir_rotations.get(face_dir, 0)):
+                        env.step("RotateLeft")
+                    # Refresh state after rotation
+                    snap = env.step("Pass")
+                    image = snap["frame"]
+                    metadata = snap["metadata"]
+                    memory.update(metadata, metadata.get("objects", []),
+                                  "LookAround", True, None, task_criteria)
+                    # Use the new intent for Executor
+                    intent = scan_result.get("intent", intent)
+                    intent_target = scan_result.get("target", intent_target)
+                    # Falls through to Executor below with the new intent
+
+                # 2. Executor proposes actions (sees only current-intent history)
                 exec_result = self.executor_agent.execute_intent(
                     intent=intent,
                     target=intent_target,
                     image=image,
                     visible_objects=metadata.get("objects", []),
-                    action_history=eb_history,
+                    action_history=current_intent.get("steps", []),
                     last_error=last_error,
                     agent_pos=agent_pose.get("position"),
                     agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
@@ -231,6 +343,7 @@ class BranchRunner:
                     task_criteria=task_criteria,
                     memory_text=memory.render(),
                     failed_object_ids=failed_object_ids,
+                    camera_horizon=agent_pose.get("cameraHorizon", 0.0),
                 )
 
                 # 3. Planner reviews — if rejected, Planner provides corrected actions
@@ -413,8 +526,6 @@ class BranchRunner:
                     "injection": None,
                 }
 
-            parent_id = f"s{step_index - 1}" if step_index > 0 else None
-
             # ==========================================================
             # LookAround: 站原地旋转 4 次，截 4 张图发给 EB 做多图综合分析。
             # 如果 EB 扫完还想再扫，记录为无效决策并回到普通 Phase 1。
@@ -533,6 +644,7 @@ class BranchRunner:
                     )
                     self._write_success_step_direct(ep, step_entry)
                     eb_history.append(step_entry)
+                    current_intent["steps"].append(step_entry)
                     step_index += 1
                     nonexecuted_retry_count = 0
                     memory.update(metadata, metadata.get("objects", []),
@@ -576,6 +688,7 @@ class BranchRunner:
                         inventory_objects=inventory_objects,
                         task_criteria=task_criteria,
                         memory_text=memory.render(),
+                        current_intent=f"{current_intent.get('intent', '')} ({current_intent.get('target', '')})",
                     )
                     # Phase 4: Oracle evaluates
                     oracle_phase4 = self.oracle_agent.evaluate_failure(
@@ -600,6 +713,7 @@ class BranchRunner:
                     step_entry["oracle_recovery_verdict"] = oracle_phase4.get("recovery_verdict")
                     self._write_success_step_direct(ep, step_entry)
                     eb_history.append(step_entry)
+                    current_intent["steps"].append(step_entry)
                     # Dead loop / unrecoverable checks
                     hard_unrec = check_unrecoverable(metadata, ep.data)
                     if hard_unrec:
@@ -614,6 +728,60 @@ class BranchRunner:
                         result_br = BranchResult(branch_id=config.branch_id, termination_reason="unrecoverable", total_steps=step_index, fork_tasks=fork_tasks, fork_source_step_ids=fork_source_ids)
                         self._finalize(ep, config, result_br, fork_source_ids)
                         return result_br
+
+                    # ── Recovery execution ──
+                    recovery_verdict = oracle_phase4.get("recovery_verdict", "")
+                    if recovery_verdict == "recoverable":
+                        rec_action = eb_phase3.get("proposed_recovery_action") or {}
+                        rec_name = rec_action.get("action", "")
+                        rec_params = rec_action.get("params", {})
+                        if rec_name and rec_name in _VALID_ACTIONS and rec_name not in _META_ACTIONS:
+                            resolved, warn = resolve_object_ids(rec_name, rec_params,
+                                                                metadata.get("objects", []))
+                            rec_act, rec_adapt_params = adapt(rec_name, resolved)
+                            rec_result = env.step(rec_act, **rec_adapt_params)
+                            if rec_result.get("frame") is None:
+                                rec_result["frame"] = image
+                            memory.update(metadata, metadata.get("objects", []),
+                                          rec_act, rec_result["success"],
+                                          rec_result.get("error"), task_criteria)
+                            # Build a dedicated recovery step entry
+                            rec_step = self._build_step_entry(
+                                ep.episode_id, config.branch_id, step_index, parent_id,
+                                rec_act, rec_adapt_params, rec_result,
+                                f"[recovery] {eb_phase3.get('recovery_reasoning', '')}",
+                                injection_decision,
+                            )
+                            rec_step["recovery_step"] = True
+                            rec_step["eb_diagnosis"] = eb_phase3.get("diagnosis")
+                            self._write_success_step_direct(ep, rec_step)
+                            eb_history.append(rec_step)
+                            current_intent["steps"].append(rec_step)
+                            step_index += 1
+                            if rec_result["success"]:
+                                cascade_level = 0
+                                last_error = None
+                                image = rec_result["frame"]
+                                metadata = rec_result["metadata"]
+                            else:
+                                cascade_level += 1
+                                last_error = f"Recovery {rec_name} failed: {rec_result.get('error', '')}"
+                                image = rec_result.get("frame", image)
+                                metadata = rec_result.get("metadata", metadata)
+                        else:
+                            self._write_failure_log(failure_log_path, {
+                                "step_index": step_index,
+                                "branch_id": config.branch_id,
+                                "failure_type": "recovery_skipped",
+                                "proposed_recovery": rec_action,
+                                "error_message": f"Recovery action '{rec_name}' is invalid or meta-action, skipped",
+                            })
+                            last_error = (
+                                f"Your proposed recovery action '{rec_name}' is a meta-action "
+                                f"(Done/LookAround). Propose a physical movement or object "
+                                f"interaction instead (MoveAhead, RotateLeft, PickupObject, etc.)."
+                            )
+                        # continue to next Planner cycle
                     continue
 
             # ==========================================================
@@ -710,6 +878,7 @@ class BranchRunner:
                 inventory_objects=inventory_objects,
                 task_criteria=task_criteria,
                 memory_text=memory.render(),
+                current_intent=f"{current_intent.get('intent', '')} ({current_intent.get('target', '')})",
             )
 
             oracle_phase4 = self.oracle_agent.evaluate_failure(
@@ -791,7 +960,8 @@ class BranchRunner:
         branch_id: str,
         eb_agent: EBAgent,
         oracle_agent: OracleAgent,
-        output_dir: str,
+        executor_agent: "ExecutorAgent" = None,
+        output_dir: str = "",
         step_limit_multiplier: int = 4,
         enable_fork: bool = False,
     ) -> BranchResult:
@@ -812,9 +982,12 @@ class BranchRunner:
             branch_id=branch_id,
             parent_branch_id=None,
         )
+        if not output_dir:
+            output_dir = os.path.dirname(episode_path)
         runner = cls(eb_agent, oracle_agent, output_dir,
                      step_limit_multiplier=step_limit_multiplier,
                      enable_fork=enable_fork)
+        runner.executor_agent = executor_agent
         return runner.run(
             config=config, env=env, ep=ep,
             start_step_index=start_idx,
@@ -876,6 +1049,7 @@ class BranchRunner:
 
         _MOVEMENT_ACTIONS = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight",
                              "RotateLeft", "RotateRight", "LookUp", "LookDown"}
+        _META_ACTIONS = {"Done", "LookAround"}  # handled by branch_runner / Planner, never AI2-THOR
 
         executed = []
         final_frame = None
@@ -884,6 +1058,22 @@ class BranchRunner:
 
         for i, step in enumerate(steps):
             action = step.get("action", "")
+
+            # Meta-actions (Done, LookAround) belong to Planner / branch_runner,
+            # not Executor. Executor does NOT know these actions — if one appears,
+            # it's a hallucination. Reject the entire MoveSequence as failure.
+            if action in _META_ACTIONS:
+                executed_desc = (" → ".join(executed)) if executed else "(nothing executed)"
+                msg = (f"MoveSequence FAILED: hallucinated meta-action '{action}' "
+                       f"at step {i+1}/{len(steps)}. Executed before error: {executed_desc}. "
+                       f"Do NOT output {action} — it is not a valid action.")
+                return (
+                    {"success": False, "all_succeeded": False,
+                     "error": msg,
+                     "executed": executed, "frame": final_frame, "metadata": final_metadata},
+                    msg,
+                )
+
             # Executor outputs {"action": "PickupObject", "params": {"objectType": "AlarmClock"}}
             if "params" in step and isinstance(step["params"], dict):
                 step_params = dict(step["params"])
@@ -891,7 +1081,7 @@ class BranchRunner:
                 step_params = {k: v for k, v in step.items() if k not in ("action", "repeat")}
 
             # Resolve objectType → objectId for object-interaction actions
-            if action not in _MOVEMENT_ACTIONS and action != "Done":
+            if action not in _MOVEMENT_ACTIONS:
                 if action not in _VALID_ACTIONS:
                     desc = " → ".join(executed) if executed else "(nothing)"
                     msg = f"MoveSequence: {desc} succeeded, then invalid action '{action}' at step {i+1}."
@@ -914,9 +1104,6 @@ class BranchRunner:
             elif action in _MOVEMENT_ACTIONS:
                 act = action
                 params = {}
-            elif action == "Done":
-                act = "Done"
-                params = {}
             else:
                 desc = " → ".join(executed) if executed else "(nothing)"
                 msg = f"MoveSequence: {desc} succeeded, then unknown action '{action}' at step {i+1}."
@@ -938,6 +1125,15 @@ class BranchRunner:
                     final_metadata = result["metadata"]
                 else:
                     all_succeeded = False
+                    # Hard rule: if agent position is unchanged, it's definitively blocked.
+                    pre_pos = (final_metadata or metadata).get("agent", {}).get("position")
+                    post_pos = result.get("metadata", {}).get("agent", {}).get("position")
+                    if pre_pos and post_pos:
+                        dx = abs(pre_pos.get("x", 0) - post_pos.get("x", 0))
+                        dz = abs(pre_pos.get("z", 0) - post_pos.get("z", 0))
+                        if dx < 0.001 and dz < 0.001:
+                            result["error"] = (result.get("error", "")
+                                + " [CONFIRMED BLOCKED: position unchanged]")
                     desc = self._format_seq(executed, action, succeeded, repeat)
                     if executed or succeeded > 0:
                         msg = (
@@ -983,10 +1179,8 @@ class BranchRunner:
                 msg,
             )
 
-        # Shouldn't reach here, but safe fallback
-        return (
-            {"success": False, "error": "MoveSequence unexpected state"},
-            "MoveSequence failed unexpectedly.",
+        raise RuntimeError(
+            "MoveSequence: reached unreachable code after step loop — logic bug"
         )
 
     @staticmethod
@@ -1106,22 +1300,76 @@ def _extract_task_target_types(traj: dict) -> set[str]:
 
 def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True):
     """
-    在环境中逐步 replay，恢复状态。
-    用于 resume 和 fork 初始化。
+    Replay steps to restore agent state for resume / fork init.
+    Handles MoveSequence, LookAround, and single actions correctly.
+    MoveSequence steps are expanded and replayed individually; execution stops
+    on first failure (matching the original MoveSequence behavior).
+    Failed steps are skipped when skip_failed=True.
     """
+    from src.action_adapter import resolve_object_ids, adapt
+
+    _MOVEMENT = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight",
+                 "RotateLeft", "RotateRight", "LookUp", "LookDown"}
+
     for s in steps:
         action = s["action"]
+        params = s.get("action_params", {})
+
         if action in ("Pass", "Done"):
             continue
-        if skip_failed and not s.get("success", True):
+
+        # LookAround: replay the 4 rotation sequence that captured views
+        if action == "LookAround":
+            for _ in range(4):
+                r = env.step("RotateLeft")
+                if not r["success"]:
+                    raise RuntimeError(
+                        f"Replay LookAround RotateLeft failed at {s.get('step_id')}: {r['error']}"
+                    )
             continue
-        # Strict for now: a replay mismatch means the branch state is not trustworthy.
-        # After the core system is stable, add an explicit repair policy here if needed.
-        result = env.step(action, **s.get("action_params", {}))
-        if not result["success"]:
+
+        # MoveSequence: expand and replay individual steps
+        if action == "MoveSequence":
+            objects = env.controller.last_event.metadata.get("objects", [])
+            seq_steps = params.get("steps", [])
+            for st in seq_steps:
+                a = st.get("action", "")
+                sp = dict(st.get("params", {}))
+                if a in _META_ACTIONS:
+                    break  # meta-action in sequence → stop, matches _execute_move_sequence
+                if a not in _MOVEMENT:
+                    resolved, warn = resolve_object_ids(a, sp, objects)
+                    if warn:
+                        break  # object not found → stop, matches original behavior
+                    a, sp = adapt(a, resolved)
+                r = env.step(a, **sp)
+                if not r["success"]:
+                    if skip_failed:
+                        break  # partial execution accepted, stop here
+                    raise RuntimeError(
+                        f"Replay MoveSequence step {a} failed at {s.get('step_id')}: {r['error']}"
+                    )
+            continue
+
+        # Single actions (old single-agent path)
+        if action in _MOVEMENT:
+            act, p = action, {}
+        elif action in _META_ACTIONS:
+            continue
+        else:
+            objects = env.controller.last_event.metadata.get("objects", [])
+            resolved, warn = resolve_object_ids(action, params, objects)
+            if warn and skip_failed:
+                continue
+            act, p = adapt(action, resolved)
+
+        r = env.step(act, **p)
+        if not r["success"]:
+            if skip_failed:
+                continue
             raise RuntimeError(
                 f"Replay failed at {s.get('step_id')}: {action}({s.get('action_params', {})}) "
-                f"-> {result['error']}"
+                f"-> {r['error']}"
             )
 
 

@@ -1,6 +1,7 @@
 {
   "project_name": "embodied-failure-dataset",
   "created": "2026-06-10",
+  "updated": "2026-06-10",
   "type": "brownfield",
   "workflow": {
     "auto_plan": true,
@@ -9,7 +10,7 @@
     "commit_per_task": true
   },
   "intel": {
-    "enabled": false
+    "enabled": true
   },
   "testing": {
     "framework": "pytest",
@@ -19,9 +20,10 @@
       "action_adapter.py",
       "context_builder.py",
       "episode_manager.py",
-      "trap_planner.py"
+      "trap_planner.py",
+      "alfred_parser.py",
+      "egocentric_memory.py"
     ]
   },
-  "model_profile": "deepseek-v4-pro",
-  "subagent_issue": "gsd-* subagent types incompatible with deepseek-v4-pro (thinking disable conflict)"
+  "model_profile": "deepseek-v4-pro"
 }

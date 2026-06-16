@@ -17,7 +17,9 @@ class StepRecorder:
         image_dir: str,
     ) -> dict:
         image_path = os.path.join(image_dir, f"{step_id}.png")
-        StepRecorder.save_frame(result["frame"], image_path)
+        frame = result.get("frame")
+        if frame is not None:
+            StepRecorder.save_frame(frame, image_path)
 
         return {
             "step_id": step_id,
@@ -27,7 +29,7 @@ class StepRecorder:
             "action": action,
             "action_params": action_params,
             "success": result["success"],
-            "error_message": result["error"],
+            "error_message": result.get("error"),
             "image_path": image_path,
             # Agent 相关字段：底座阶段填 None，Agent 接入后再填充
             "eb_reasoning": None,

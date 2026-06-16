@@ -120,6 +120,7 @@ def main():
         print(f"skipped (API error: {e})")
 
     total = len(tasks_to_run)
+    VLMClient.set_api_log_dir(args.output)
     print(f"\nRunning {total} task(s) -> {args.output}/\n")
 
     if total == 1:

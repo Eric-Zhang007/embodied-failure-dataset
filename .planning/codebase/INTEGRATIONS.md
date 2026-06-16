@@ -1,76 +1,181 @@
-# INTEGRATIONS.md — External Integrations
+# External Integrations
 
-## 1. AI2-THOR Simulator
+**Analysis Date:** 2026-06-12
 
-**File**: `src/env_controller.py`
+## APIs & External Services
 
-- Wraps `ai2thor.controller.Controller` in `EnvController` class
-- Each episode creates a fresh controller with a specific scene
-- `step(action, **params)` returns `{success, error, frame, metadata, task_state}`
-- `get_state_snapshot()` captures current frame + metadata via `Pass` action
-- `reset_to_alfred_scene()` restores scene from ALFRED scene state JSON
-- Xvfb auto-start on class first use (display `:99`, 1024×768×24)
-- Scene restoration uses `src/alfred_scene.py` utilities (object placement, init action)
-- `alfred_task_state` tracks cleaned/heated/cooled sets across steps
-- `clean_sink_contents_after_faucet()` handles an AI2-THOR edge case
+### VLM Inference (SiliconFlow)
+- **Service:** SiliconFlow API (`api.siliconflow.cn/v1`) — OpenAI-compatible `/chat/completions` endpoint.
+- **SDK/Client:** Custom lightweight client in `src/vlm_client.py` using `requests` directly (no OpenAI SDK).
+- **Auth:** API key passed as `--api-key` CLI argument. Stored in `VLMClient.api_key`, sent as `Authorization: Bearer <key>` header.
+- **Models:**
+  - Planner: `Qwen/Qwen3-VL-32B-Instruct` (intent proposal, review, diagnosis, scan analysis)
+  - Executor: `Qwen/Qwen3-VL-8B-Instruct` (concrete action generation)
+  - Oracle: `Qwen/Qwen3-VL-32B-Instruct` (injection decisions, failure evaluation, counterfactual grading)
+- **Endpoint:** `POST {base_url}/chat/completions`
+- **Retry logic (`_chat_openai()`):**
+  1. Normal attempt with 300s timeout.
+  2. Timeout: escalate by 100s (400s, then 500s), up to 3 tries.
+  3. Connection error: exponential backoff (1s, 2s, 4s), up to 3 tries.
+  4. HTTP 429 rate limit: wait 5s x (attempt+1), up to 3 tries.
+  5. JSON parse failure: up to 2 retries with error feedback in prompt.
+- **Image encoding:** numpy array → PIL → PNG → base64 → `data:image/png;base64,...` inline URI.
+- **Multi-image support:** `chat_with_images()` sends direction labels ("VIEW 1: ahead", "VIEW 2: left", etc.) as text blocks before each image.
+- **Thinking model CoT compatibility:** `parse_json_response()` extracts JSON `{...}` from surrounding text (`src/vlm_client.py` lines 467-477).
+- **Logging:**
+  - Full API exchanges → `logs/api_calls.jsonl` (sanitized: images replaced with `<image_base64 len=N>` stubs).
+  - Failed calls → `logs/failure_<ts>_<model>.json` with full request body.
+  - Controlled by env var `EFD_LOG_FULL_API` (default enabled).
 
-## 2. VLM API (SiliconFlow)
+### Alternative Backends (factory methods in `src/vlm_client.py`)
+| Factory | Default Model | Base URL | Status |
+|---------|--------------|----------|--------|
+| `siliconflow()` | configurable | `https://api.siliconflow.cn/v1` | **Active** (primary) |
+| `openai()` | `gpt-5` | `https://api.openai.com/v1` | Available, not actively used |
+| `openrouter()` | `anthropic/claude-opus-4` | `https://openrouter.ai/api/v1` | Available, not actively used |
+| `ollama()` | `qwen2.5-vl:7b` | `http://localhost:11434` | Available, not actively used (tested historically) |
 
-**File**: `src/vlm_client.py`
+## Data Storage
 
-- `VLMClient` class with factory methods: `ollama()`, `openai()`, `openrouter()`, `siliconflow()`
-- Primary use: `VLMClient.siliconflow(model, api_key)`
-- OpenAI-compatible protocol via `requests.post(f"{base_url}/chat/completions", ...)`
-- Image handling: numpy array → PIL → PNG bytes → base64 → `data:image/png;base64,...` inline URI
-- Key methods:
-  - `chat_with_image()` — single image + text → string
-  - `chat_with_image_json()` — single image → parsed dict with JSON retry
-  - `chat_with_images()` — multi-image with VIEW labels
-  - `chat_with_images_json()` — multi-image → parsed dict
-  - `chat_text()` / `chat_text_json()` — text-only variants
-- JSON retry: up to 2 retries with explicit error feedback in prompt
-- Network retry: 3 attempts for connection errors and timeouts
-- Rate limit: detects 429, waits 5s×(attempt+1)
-- All exchanges logged to `logs/api_calls.jsonl` (base64 images replaced with length stubs)
-- Failed exchanges dumped to `logs/failure_*.json` for debugging
+**Databases:**
+- None — no SQL/NoSQL database used. All state is in-memory during execution.
 
-## 3. ALFRED Dataset
+**File Storage:**
+- **Local filesystem only** — output directories named `output_e2e_YYYYMMDD_HHMMSS/`. Contents:
+  - Per-episode JSON files (`EpisodeManager` writes incremental episode data as JSON, flushed each step).
+  - Step screenshots (PNG, named `s<step_index>.png`).
+  - LookAround view images (PNG, named `s<step_index>_look_<dir>.png` for ahead/left/behind/right).
+  - Failure logs (`failures_<branch_id>.jsonl` — JSON Lines format per branch).
+- **No cloud storage integration** (no S3, GCS, Azure Blob).
 
-**Files**: `src/alfred_parser.py`, `scripts/download_alfred.py`
+**Caching:**
+- None — no Redis, memcached, or on-disk cache. Every VLM call is fresh.
 
-- Data stored in `data/json_2.1.0/{split}/{task_type}-{object}-{receptacle}-{idx}/trial_*/traj_data.json`
-- `load_traj(path)` — loads a single traj_data.json
-- `extract_metadata(traj)` — extracts task_goal, scene, task_type, pddl_params, alfred_scene, alfred_task_id
-- `extract_low_actions(traj)` — extracts expert low-level actions for step count baseline
-- Supports both old (string) and new (dict) `api_action` formats
-- Scene state (`alfred_scene`) contains object_poses and init_action for environment restoration
-- `data/failure_type_library.json` — 8 hand-crafted failure types for trap injection (separate from ALFRED)
+## Data Sources
 
-## 4. File System
+### ALFRED Dataset
+- **Source:** Downloaded from ALFRED repository to `data/json_2.1.0/`.
+- **Format:** `json_2.1.0` — each episode is a subdirectory containing `traj_data.json`.
+- **Structure:**
+  ```
+  data/json_2.1.0/
+    train/
+    valid_seen/
+    valid_unseen/
+      <episode_id>/
+        traj_data.json
+  ```
+- **Parser:** `src/alfred_parser.py` — `load_traj()`, `extract_metadata()`, `extract_scene_state()`, `extract_low_actions()`.
+- **7 task types:**
+  | ALFRED Type | Mapped Type | Checker in `task_conditions.py` |
+  |-------------|-------------|--------------------------------|
+  | `pick_and_place_simple` | `pick_and_place` | `_pick_and_place_simple` |
+  | `pick_and_place_with_movable_recep` | `pick_and_place` | `_pick_and_place_with_movable_recep` |
+  | `pick_clean_then_place_in_recep` | `clean` | `_pick_clean_then_place` |
+  | `pick_heat_then_place_in_recep` | `heat` | `_pick_heat_then_place` |
+  | `pick_cool_then_place_in_recep` | `cool` | `_pick_cool_then_place` |
+  | `look_at_obj_in_light` | `examine` | `_look_at_obj_in_light` |
+  | `pick_two_obj_and_place` | `pick_two` | `_pick_two` |
 
+### Failure Type Library
+- **File:** `data/failure_type_library.json` — 8 hand-written failure types.
+- **Loader:** `TrapPlanner` in `src/trap_planner.py`.
+- **Format:** Each entry has `failure_type`, `description`, `applicable_tasks`, `injection` (method + params with `<target>`, `<appliance>`, `<container>` type placeholders that are resolved against scene objects at runtime).
+- **Constraints:** Supports `exclude_types` to protect task-critical objects; has `Blinds` blocklist for close operations (AI2-THOR timeout guard).
+
+## Input / Output
+
+### Entry Points
+
+| Script | Purpose | Command |
+|--------|---------|---------|
+| `scripts/e2e_test.py` | Single/multi-episode end-to-end test | `uv run python scripts/e2e_test.py --api-key sk-xxx --task pick_and_place_simple` |
+| `scripts/run_pipeline.py` | Batch data generation pipeline | `uv run python scripts/run_pipeline.py --max 10 --api-key sk-xxx --parallel 3` |
+
+### e2e_test.py CLI Flags
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--api-key` | (required) | SiliconFlow API key |
+| `--task` | `""` | Single task type |
+| `--all` | `False` | Run all 7 task types in parallel |
+| `--random` | `False` | Random trajectory selection |
+| `--no-traps` | `False` | Disable trap injection |
+| `--parallel` | `3` | Max ThreadPoolExecutor workers |
+| `--output` | timestamp | Output directory override |
+| `--data-dir` | `data/json_2.1.0` | ALFRED data path |
+| `--eb-model` | `Qwen/Qwen3-VL-32B-Instruct` | Planner model override |
+| `--oracle-model` | `Qwen/Qwen3-VL-32B-Instruct` | Oracle model override |
+| `--executor-model` | `Qwen/Qwen3-VL-8B-Instruct` | Executor model override |
+
+### Output Layout
 | Path | Format | Writer | Purpose |
 |------|--------|--------|---------|
-| `output/{episode_id}.json` | JSON (pretty-printed) | `EpisodeManager._flush()` | Episode state, flushed after every step |
-| `output/{episode_id}/*.png` | PNG | `StepRecorder.save_frame()` | Per-step and LookAround screenshots |
-| `output/{episode_id}/failures_{branch}.jsonl` | JSONL | `BranchRunner._write_failure_log()` | Structured failure events |
-| `logs/api_calls.jsonl` | JSONL | `VLMClient._write_api_exchange()` | Full API request/response pairs |
-| `logs/api_calls.log` | Text | Python logging | Human-readable API call summary |
-| `logs/failure_*.json` | JSON | `VLMClient._dump_failure()` | Failed API call dump |
+| `output_e2e_<ts>/<ep_id>.json` | JSON (incremental) | `EpisodeManager._flush()` | Complete episode data with all steps, metadata, traps, outcome |
+| `output_e2e_<ts>/<ep_id>/s<N>.png` | PNG | `StepRecorder.save_frame()` | Per-step first-person screenshots |
+| `output_e2e_<ts>/<ep_id>/s<N>_look_<dir>.png` | PNG | `BranchRunner.run()` | LookAround multi-directional views |
+| `output_e2e_<ts>/<ep_id>/failures_<branch>.jsonl` | JSONL | `BranchRunner._write_failure_log()` | Structured failure events |
 
-## 5. Environment Variable Dependencies
+### Resume Capability
+- `BranchRunner.resume()` (`src/branch_runner.py` line 940) loads existing episode JSON, replays successful steps, continues from last step.
+- Requires `alfred_scene` state in episode JSON (for `reset_to_alfred_scene`).
 
-| Variable | Used In | Purpose |
-|----------|---------|---------|
-| `EFD_LOG_FULL_API` | `vlm_client.py` | Set to "0" to disable full API JSONL logging |
-| `DISPLAY` | `env_controller.py` | X display for AI2-THOR; auto-set to `:99` if unset |
-| `OPENAI_API_KEY` | `vlm_client.py` | Fallback for openai factory method |
-| `OPENROUTER_API_KEY` | `vlm_client.py` | Fallback for openrouter factory method |
+## Authentication & Identity
 
-## 6. No Other Integrations
+**Auth Provider:**
+- **Custom** — API key authentication for SiliconFlow.
+- Implementation: `Authorization: Bearer <key>` header in `VLMClient._chat_openai()` (`src/vlm_client.py` line 289).
+- The API key value is documented (with value) in `CLAUDE.md`. This is a known security concern.
 
-- No database
-- No message queue
-- No cloud storage
-- No monitoring/observability (beyond local log files)
-- No authentication service
-- No web server or API
+## Monitoring & Observability
+
+**Error Tracking:**
+- None — no Sentry, Datadog, or similar service.
+
+**Logs:**
+- Python `logging` module with two handlers per API logger:
+  - Console handler (INFO level): API call summaries.
+  - File handler (DEBUG level): `logs/api_calls.log`.
+- Full API journal: `logs/api_calls.jsonl` (disablable via `EFD_LOG_FULL_API=false`).
+- Failure dump: `logs/failure_<ts>_<model>.json` with full request body on catastrophic failures.
+
+## CI/CD & Deployment
+
+**Hosting:**
+- Not deployed — runs locally on developer machine (WSL2 Ubuntu 24.04).
+
+**CI Pipeline:**
+- None — no GitHub Actions, Jenkins, or other CI configuration files found.
+
+## Environment Configuration
+
+| Variable | Source File | Purpose |
+|----------|-------------|---------|
+| `DISPLAY` | `src/env_controller.py` | X display for AI2-THOR. Auto-detected: WSLg `:0` → fallback Xvfb `:99`. |
+| `EFD_LOG_FULL_API` | `src/vlm_client.py` | Set to `"0"` to disable full API exchange logging. |
+| `OPENAI_API_KEY` | `src/vlm_client.py` | Fallback for `VLMClient.openai()` factory (not actively used). |
+| `OPENROUTER_API_KEY` | `src/vlm_client.py` | Fallback for `VLMClient.openrouter()` factory (not actively used). |
+
+**Secrets:**
+- SiliconFlow API key passed via `--api-key` CLI argument. Not read from environment variables or `.env` files.
+- No `.env` file used.
+
+## Webhooks & Callbacks
+
+**Incoming:**
+- None — no HTTP server running.
+
+**Outgoing:**
+- None — no webhook/callback integration.
+
+## No Other Integrations
+
+- No database (all persistence is JSON files on local filesystem).
+- No message queue.
+- No cloud storage.
+- No authentication service beyond the API key header.
+- No web server or API endpoints.
+- No gRPC or protobuf.
+
+---
+
+*Integration audit: 2026-06-12*

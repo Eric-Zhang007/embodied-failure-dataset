@@ -13,19 +13,22 @@ from src.context_builder import build_eb_history_context
 EXECUTOR_SYSTEM = """You are an embodied agent in a 3D household. The image is your FIRST-PERSON VIEW. You receive a high-level intent and must output 1-5 concrete actions to carry it out.
 
 RULES:
+- Output at most 12 actions. Use "repeat" to batch same-direction movement. If you output more than 12, the entire sequence will be rejected.
 - Interaction range is 0.5m. Move to within 0.5m BEFORE PickupObject/PutObject/etc.
-- MoveAhead/MoveBack/MoveLeft/MoveRight move 0.125m each. Count steps: 1.0m = 8 steps.
+- Each movement step = 0.125m. BATCH same-direction moves with "repeat": {"action": "MoveAhead", "repeat": 8}. 0.6m = repeat 5. 1.0m = repeat 8. 1.8m = repeat 15. distance / 0.125, round up.
+- Do NOT output individual MoveAhead entries repeatedly. Use "repeat" instead.
+- SOLID OBJECTS: large furniture (Table, Desk, Bed, Cabinet, Dresser, Shelf, Sofa, ArmChair, Fridge, Counter, SideTable, CoffeeTable) CANNOT be walked through. You must go AROUND them. If a solid object is between you and your target, use MoveLeft/MoveRight to sidestep, or Rotate and find a clear path. Moving directly toward a solid object WILL fail.
 - When MoveAhead BLOCKED: try MoveLeft, then MoveRight, then RotateLeft+MoveAhead, then RotateRight+MoveAhead. If ALL blocked, you are boxed in. MoveBack repeatedly (4-8 steps) to escape into open space, THEN rotate and find your target. Do NOT go back toward the obstacle.
 - STUCK ESCAPE: if the last 2+ attempts all hit obstacles, you are trapped. Stop trying to reach the target. Output a pure escape sequence: MoveBack×4, RotateLeft, MoveAhead×4. Get to clear space first, then the next call will handle the target.
-- When target not visible: rotate to scan. Use direction hints in the object list.
+- When target not visible: RotateLeft or RotateRight to find it. Use direction hints in the object list.
 - Copy objectType EXACTLY from the visible objects list. "Clock" is wrong; "AlarmClock" is correct.
 - If the intent target is not visible yet, use Rotate/Move to find it.
 - If the object list is empty: you are facing a wall or obstacle. MoveBack to find open space, then re-orient.
 
 ACTIONS:
-  MoveAhead / MoveBack / MoveLeft / MoveRight (0.125m each)
+  MoveAhead / MoveBack / MoveLeft / MoveRight (0.125m each, use "repeat": N to batch)
   RotateLeft / RotateRight (90deg)
-  LookUp / LookDown
+  LookUp / LookDown (tilt camera, max +30° up / -60° down from horizon)
   PickupObject(objectType)
   PutObject(objectType, receptacleType) — receptacleType from visible list, matching TASK TARGET
   OpenObject(objectType) / CloseObject(objectType)
@@ -33,14 +36,13 @@ ACTIONS:
   SliceObject(objectType) / BreakObject(objectType)
   FillObjectWithLiquid(objectType) / EmptyLiquidFromObject(objectType)
   DropHandObject
-  Done — only when ALL task completion criteria are met
 
 OUTPUT — valid JSON only. { first char, } last char. No markdown. All text fields use first-person.
 
 {
   "actions": [
-    {"action": "MoveAhead", "params": {}},
-    {"action": "PickupObject", "params": {"objectType": "AlarmClock"}}
+    {"action": "MoveAhead", "repeat": 8},
+    {"action": "PickupObject", "params": {"objectType": "Knife"}}
   ],
   "status": "done" | "partial" | "failed",
   "reasoning": "scene: <what you see> | plan: <why these actions> | reflection: <verify assumptions>",
@@ -48,7 +50,8 @@ OUTPUT — valid JSON only. { first char, } last char. No markdown. All text fie
 }
 - "done": intent fully achieved with these actions
 - "partial": made progress, need another call with same intent
-- "failed": intent cannot be achieved from current position"""
+- "failed": intent cannot be achieved from current position
+- "repeat" batches same-direction movement steps (MoveAhead/MoveBack/MoveLeft/MoveRight). Defaults to 1."""
 
 
 class ExecutorAgent:
@@ -72,6 +75,7 @@ class ExecutorAgent:
         memory_text: str = "",
         failed_object_ids: set = None,
         planner_feedback: str | None = None,
+        camera_horizon: float = 0.0,
     ) -> dict:
         """Given an intent and full agent context, output action chunk."""
         from src.eb_agent import _direction, _append_task_context
@@ -79,6 +83,7 @@ class ExecutorAgent:
         lines = [f"Your intent: {intent}"]
         if target:
             lines.append(f"Target object: {target}")
+        lines.append("You are carrying out THIS intent. The history below is only for this SAME intent.")
         lines.append("")
 
         # Spatial memory FIRST
@@ -109,12 +114,18 @@ class ExecutorAgent:
                 lines.append(f"  {o['objectType']}{d}")
         if visible:
             lines.append("\nObjects in view — direction relative to your facing:")
+            # Highlight solid obstacles
+            _SOLID_TYPES = {"Desk", "DiningTable", "SideTable", "CoffeeTable", "Bed", "Cabinet",
+                            "Dresser", "Shelf", "Sofa", "ArmChair", "Fridge", "Counter", "CounterTop",
+                            "Stool", "Chair", "Ottoman", "Bench"}
             for o in visible[:12]:
                 extra = []
                 if o.get("isPickedUp"): extra.append("held")
                 if o.get("receptacle"): extra.append("receptacle")
                 if o.get("openable"): extra.append("openable" if not o.get("isOpen") else "open")
                 if o.get("toggleable"): extra.append("on" if o.get("isToggled") else "off")
+                if o.get("objectType") in _SOLID_TYPES and not o.get("isPickedUp"):
+                    extra.append("SOLID - do NOT walk through")
                 tag = f" ({','.join(extra)})" if extra else ""
                 prev = " [failed before]" if o.get("objectId") in failed_object_ids else ""
                 d = ""
@@ -122,7 +133,7 @@ class ExecutorAgent:
                     d = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
                 lines.append(f"  {o['objectType']}{tag}{prev}{d}")
         else:
-            lines.append("(No objects in view — you may be facing a wall. Rotate or MoveBack. Do NOT LookAround.)")
+            lines.append("(No objects in view — you may be facing a wall. Rotate or MoveBack.)")
 
         if failed_object_ids:
             lines.append("\nWARNING: these objectIds failed before. Do NOT propose them again:")
@@ -138,12 +149,29 @@ class ExecutorAgent:
         if last_error:
             lines.append(f"\nLast error: {last_error}")
 
-        lines.append("\nOutput your action sequence. Be precise about distances.")
+        lines.append(f"\nCAMERA: tilt = {camera_horizon:.0f}° "
+                     f"(horizon=0°, max up=+30°, max down=-60°, remaining up={30-camera_horizon:.0f}° down={camera_horizon+60:.0f}°)")
+
+        lines.append(f"\nGRID: 1 step = 0.125m. Use \\\"repeat\\\" to batch: distance / 0.125 = repeat count. E.g. 1.8m away → \\\"action\\\": \\\"MoveAhead\\\", \\\"repeat\\\": 15.")
+        lines.append("Output your action sequence. USE REPEAT. Do NOT output individual steps.")
         prompt = "\n".join(lines)
 
-        return self.client.chat_with_image_json(
+        result = self.client.chat_with_image_json(
             system_prompt=EXECUTOR_SYSTEM,
             user_text=prompt,
             image=image,
             required_fields=("actions", "status", "reasoning", "status_reason"),
+            max_tokens=16384,
         )
+        # Safety cap: reject excessive actions instead of silent truncation
+        actions = result.get("actions")
+        if actions is not None and len(actions) > 20:
+            import logging
+            logging.warning("Executor output %d actions — rejected as excessive", len(actions))
+            result["actions"] = []
+            result["status"] = "failed"
+            result["status_reason"] = (
+                f"Output {len(actions)} actions exceeds limit of 20. "
+                "Use at most 12 actions with 'repeat' for same-direction movement."
+            )
+        return result

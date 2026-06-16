@@ -24,7 +24,7 @@ RULES:
 - Interaction range is 0.5m. Check distance BEFORE PickupObject/PutObject/etc. If >0.5m, MoveAhead (0.125m/step) first. Never interact beyond 0.5m.
 - When MoveAhead BLOCKED: do NOT retry same direction and do NOT LookAround. Instead, Rotate 90deg and try there. If blocked in all 4 directions, MoveBack to escape the tight spot. LookAround is useless when you are boxed in — you already know you're stuck, you need to MOVE.
 - When target not visible AND you have open space around you: rotate to scan. Use direction hints in the object list.
-- If the object list below is empty: you are facing a wall or obstacle. DO NOT LookAround — Rotate or MoveBack to find open space, then locate your target.
+- If the object list below is empty: you are facing a wall or obstacle. DO NOT LookAround — Rotate or MoveBack to find open space, then find your target.
 - Use all 4 movement directions. Sidestep (MoveLeft/Right) to go around obstacles.
 - If hitting same obstacle repeatedly: MoveBack then wider path.
 
@@ -37,8 +37,8 @@ Navigation:
   MoveRight          — strafe right 0.125m
   RotateLeft         — turn 90deg left
   RotateRight        — turn 90deg right
-  LookUp             — tilt camera up
-  LookDown           — tilt camera down
+  LookUp             — tilt camera up (+30° max from horizon)
+  LookDown           — tilt camera down (-60° max from horizon)
   LookAround         — 4-direction scan. Use when target is lost.
 
 Object interaction — use objectType from the visible objects list. Must be within 0.5m reach:
@@ -223,23 +223,15 @@ def build_phase1_prompt(
 
 
 # ------------------------------------------------------------------
-# Planner mode: high-level intents (experimental, not yet integrated)
-# ------------------------------------------------------------------
-
-PLANNER_SYSTEM = """You are a task planner. Output the NEXT intent (not an action). Available: locate X, pick X, place X, open X, close X, toggle X, clean X, Done.
-OUTPUT: {"intent": "<intent>", "target": "<objectType>", "reasoning": "<1 sentence>"}"""
-
-
-# ------------------------------------------------------------------
 # Phase 3: 失败诊断与恢复推理
 # ------------------------------------------------------------------
 
 PHASE3_SYSTEM = """You are an embodied agent that has just encountered a failure while performing a household task. Remember: you are in a 3D first-person environment — the image is what your eyes see, and you must reason about spatial relationships.
 
 Your job is to:
-0. FIRST: check your assumptions. Look at the image carefully. Is the target object where you THOUGHT it was? Could it be somewhere else (behind you, in a closed container, in a different room)? The error message and the objects list tell you what's actually around you — believe them over your memory.
-1. Diagnose WHY the failure happened — be specific about what the error and image together reveal
-2. Propose a recovery action to get back on track
+0. FIRST: look at the image and your CURRENT INTENT (shown below). What were you trying to do? Why did it fail? The error message tells you what the environment rejected — believe it.
+1. Diagnose WHY the failure happened — connect your intent, the error, and what you see. If you were trying to approach a target but hit an obstacle, say so. If you couldn't find the object, say so.
+2. Propose a recovery action to get back on track — this should address the SPECIFIC failure cause.
 3. Optionally, provide a counterfactual: "If I had done X instead of Y earlier, this failure would not have occurred."
 
 AVAILABLE ACTIONS (use EXACTLY these names, do NOT invent new ones):
@@ -251,9 +243,8 @@ NAVIGATION:
 - MoveRight: strafe right 0.125m.
 - RotateLeft: rotate 90 degrees left.
 - RotateRight: rotate 90 degrees right.
-- LookUp: tilt camera up.
-- LookDown: tilt camera down.
-- LookAround: full-room scan — 4 directional views, returns to original facing. Use when target is lost.
+- LookUp: tilt camera up (+30° max from horizon).
+- LookDown: tilt camera down (-60° max from horizon).
 
 OBJECT INTERACTION — use objectType (plain type name, no coordinates):
 - PickupObject(objectType), OpenObject(objectType), CloseObject(objectType), ToggleObjectOn(objectType), ToggleObjectOff(objectType), SliceObject(objectType), BreakObject(objectType), FillObjectWithLiquid(objectType), EmptyLiquidFromObject(objectType)
@@ -261,7 +252,6 @@ OBJECT INTERACTION — use objectType (plain type name, no coordinates):
 - DropHandObject: drop held object.
 
 TASK CONTROL:
-- Done: only when task is FULLY achieved.
 - MoveSequence(steps): chain multiple movements. Steps: [{"action": "MoveAhead", "repeat": 5}, ...]. Stops on first failure. Use to close distance to a known target without re-scanning.
 
 Important rules for the counterfactual:
@@ -287,6 +277,7 @@ OUTPUT FORMAT — YOU MUST OUTPUT VALID JSON ONLY:
   "proposed_recovery_action": {"action": "<action>", "params": {}}
 }
 
+proposed_recovery_action must be a physical movement or object interaction (MoveAhead, RotateLeft, PickupObject, etc.). Do NOT propose Done or LookAround as recovery actions.
 For counterfactual.target_step: the step number (integer) where you should have done something differently. For counterfactual.alternative_action: the action you should have taken at that step instead. If you have no counterfactual insight, set counterfactual to null."""
 
 
@@ -301,6 +292,7 @@ def build_phase3_prompt(
     inventory_objects: list[dict] | None = None,
     task_criteria: str = "",
     memory_text: str = "",
+    current_intent: str = "",
 ) -> str:
     lines = [f"Task goal: {task_goal}\n"]
 
@@ -311,6 +303,10 @@ def build_phase3_prompt(
 
     _append_task_context(lines, visible_objects, inventory_objects, task_criteria)
     lines.append(f"ERROR: {error_message}\n")
+
+    if current_intent:
+        lines.append(f"Your current intent was: {current_intent}")
+        lines.append("(You failed while trying to carry out this intent. Diagnose why.)\n")
 
     if cascade_description:
         lines.append(f"Context: {cascade_description}\n")
@@ -354,7 +350,15 @@ RULES:
 - Decide the next logical sub-goal to make progress toward the task.
 - If target is >0.5m away: intent is to APPROACH it first.
 - If target is in hand and task requires putting it somewhere: intent is to PLACE it.
-- If target is not visible: intent is to LOCATE it.
+- If target is not visible: first check SPATIAL MEMORY. If the memory says where the target was last seen (e.g. "saw Apple on Counter"), output "approach <that location>".
+- If the target has NEVER been seen: use "scan room" once to get a full-room overview. After scanning, DO NOT use "locate X" — the Executor has no spatial reasoning and will fail. Instead, pick a specific receptacle or area from the scan and use "approach <area>" to search there.
+
+IF TARGET NEVER SEEN — EXPLORATION STRATEGY:
+Instead of "locate X" (which gives the Executor no direction), create a concrete search plan:
+1. Look at the AREA label and visible receptacles (Counter, Table, Desk, Shelf, etc.)
+2. Pick ONE specific receptacle or visible object to approach
+3. Output "approach <receptacle>" — the Executor can execute this. If the target isn't there, you'll try the next location on the following turn.
+Example: if looking for an Apple in a kitchen, say "approach CounterTop" (not "locate Apple"). If it's not there, next turn say "approach DiningTable". This gives the Executor concrete targets it can reach.
 
 INTENTS (use these exact forms):
   approach <objectType>      — move toward the object until within 0.5m
@@ -364,10 +368,23 @@ INTENTS (use these exact forms):
   close <objectType>         — close a container
   toggle on <objectType>     — turn on an appliance
   toggle off <objectType>    — turn off an appliance
-  locate <objectType>        — search the room for a target not currently visible
-  scan room                  — full 4-direction scan to understand surroundings
+  scan room                  — full 4-direction scan (use ONCE, then pick specific targets from the scan)
   wait                       — nothing to do, task in progress
-  Done                       — task is complete
+  Done                       — task is complete (see below)
+
+TWO SPECIAL INTENTS — how the system handles them:
+
+1. "scan room" — when your current view is insufficient and you need a full-room overview.
+   What happens: the system captures 4 directional views (ahead/left/behind/right) and shows
+   them to you in the next call. Your job THEN is to look at all 4 views, decide which direction
+   to face, and output a normal intent (e.g. "approach Desk"). The Executor then carries it out.
+   Use "scan room" sparingly — only when the target has NEVER been seen and there is no
+   spatial memory of it. If you scanned recently, you already have the layout; use it.
+
+2. "Done" — when you believe ALL task completion criteria are met.
+   What happens: the system runs a hard verification against the task criteria. If ALL pass,
+   the episode ends successfully. If ANY criterion is missing, you will get a specific rejection
+   message telling you exactly what is not yet satisfied — fix those conditions first.
 
 OUTPUT — valid JSON only. { first char, } last char. No markdown.
 
@@ -420,6 +437,7 @@ class EBAgent:
         hand_status: str = "",
         task_criteria: str = "",
         memory_text: str = "",
+        intent_history: list[dict] | None = None,
     ) -> dict:
         """Propose the next high-level intent."""
         lines = [f"Task goal: {task_goal}\n"]
@@ -430,6 +448,24 @@ class EBAgent:
             lines.append(f"HAND STATUS: {hand_status}")
         if task_criteria:
             lines.append(f"\nTASK COMPLETION CRITERIA:\n{task_criteria}")
+
+        # Intent history — what has been tried and their outcomes
+        if intent_history:
+            lines.append("\nIntent history (what I have tried):")
+            for ih in intent_history[-15:]:
+                status = "OK" if ih.get("completed") else "INCOMPLETE"
+                n_steps = len(ih.get("steps", []))
+                intent_str = ih.get("intent", "?")
+                target_str = ih.get("target", "")
+                desc = f"{intent_str}"
+                if target_str:
+                    desc += f" ({target_str})"
+                last_err = ""
+                if n_steps and not ih.get("completed"):
+                    last_step = ih["steps"][-1]
+                    last_err = (last_step.get("error_message") or "")[:80]
+                lines.append(f"  {desc}: {status}, {n_steps} step(s)" + (f" — {last_err}" if last_err else ""))
+            lines.append("")
 
         visible = [o for o in visible_objects if o.get("visibleBounds2D")]
         if visible:
@@ -451,8 +487,11 @@ class EBAgent:
         if last_error:
             lines.append(f"\nLast error: {last_error}")
 
-        lines.append("\nRecent history:")
-        lines.append(build_eb_history_context(action_history[-5:] if len(action_history) > 5 else action_history))
+        # Recent steps — show raw actions from last few steps for spatial context
+        recent_raw = action_history[-3:] if len(action_history) > 3 else action_history
+        if recent_raw:
+            lines.append("\nRecent actions:")
+            lines.append(build_eb_history_context(recent_raw))
 
         lines.append("\nPropose the next intent. Be specific. Output JSON only.")
         prompt = "\n".join(lines)
@@ -583,7 +622,7 @@ class EBAgent:
         lines.append("")
         _append_task_context(lines, visible_objects, inventory_objects, task_criteria)
         lines.append("You just did a full-room scan. Below are 4 views: ahead, left, behind, right.")
-        lines.append("Use the views to locate your target and decide your next move.")
+        lines.append("Use the views to find your target and decide your next move.")
         lines.append("")
         if memory_text:
             lines.append(memory_text)
@@ -617,6 +656,75 @@ class EBAgent:
         )
         return result
 
+    # ------------------------------------------------------------------
+    # Planner: analyze full-room scan → direction + intent for Executor
+    # ------------------------------------------------------------------
+    SCAN_ANALYSIS_SYSTEM = """You are a task planner analyzing a full-room scan. You see 4 directional views: VIEW 1: ahead, VIEW 2: left, VIEW 3: behind, VIEW 4: right. You MUST output a direction to face AND a regular intent for the Executor to carry out.
+
+RULES:
+- Look at ALL 4 views carefully. Locate the task-relevant objects.
+- "face_direction": which way to turn — "ahead", "left", "behind", or "right". Pick the direction that gives the best view of the target or the area to explore.
+- "intent": a regular intent (approach X, pickup X, open X, etc.) from the Planner's standard intent list. NEVER use "locate X". If unsure of the target's location, pick a specific receptacle to approach and search.
+- "target": the objectType to target, or empty string if the intent has no target.
+
+OUTPUT — valid JSON only:
+
+{
+  "face_direction": "left",
+  "intent": "approach Counter",
+  "target": "Counter",
+  "reasoning": "<what you see in each direction, why this direction and intent>"
+}"""
+
+    def analyze_scan_room(
+        self,
+        task_goal: str,
+        look_images: list,
+        visible_objects: list[dict],
+        action_history: list[dict],
+        last_error: str | None = None,
+        inventory_objects: list[dict] | None = None,
+        task_criteria: str = "",
+        memory_text: str = "",
+    ) -> dict:
+        """After 4-view scan, analyze room and produce direction + intent for Executor."""
+        NL = chr(10)
+        lines = []
+        lines.append(f"Task: {task_goal}")
+        lines.append("")
+        _append_task_context(lines, visible_objects, inventory_objects, task_criteria)
+        lines.append("You just did a full-room scan. Below are 4 views: ahead, left, behind, right.")
+        lines.append("Decide which direction to face and what intent to pursue.")
+        lines.append("")
+        if memory_text:
+            lines.append(memory_text)
+        else:
+            lines.append(build_eb_history_context(action_history))
+        if last_error:
+            lines.append(f"\nLast error: {last_error}")
+        lines.append("")
+        lines.append("Objects in scene:")
+        for o in visible_objects:
+            extra = []
+            if o.get("isPickedUp"): extra.append("HELD")
+            if o.get("receptacle"): extra.append("receptacle")
+            if o.get("visibleBounds2D"): extra.append("VISIBLE")
+            else: extra.append("hidden")
+            tag = " [" + ", ".join(extra) + "]" if extra else ""
+            lines.append(f"  {o['objectType']}{tag}")
+        lines.append("")
+        lines.append("CRITICAL: Use EXACT objectType from the list above. Output direction + intent + target.")
+        prompt = NL.join(lines)
+
+        result = self.client.chat_with_images_json(
+            system_prompt=self.SCAN_ANALYSIS_SYSTEM,
+            user_text=prompt,
+            images=look_images,
+            required_fields=("face_direction", "intent", "target", "reasoning"),
+        )
+        return result
+        return result
+
     def diagnose_failure(
         self,
         task_goal: str,
@@ -630,6 +738,7 @@ class EBAgent:
         inventory_objects: list[dict] | None = None,
         task_criteria: str = "",
         memory_text: str = "",
+        current_intent: str = "",
     ) -> dict:
         """Phase 3: 诊断失败并提议恢复。"""
         if cascade_level > 1:
@@ -641,7 +750,7 @@ class EBAgent:
 
         prompt = build_phase3_prompt(task_goal, action_history, error_message, desc,
                                      visible_objects, agent_pos, agent_rot_y, inventory_objects, task_criteria,
-                                     memory_text=memory_text)
+                                     memory_text=memory_text, current_intent=current_intent)
         result = self.client.chat_with_image_json(
             system_prompt=PHASE3_SYSTEM,
             user_text=prompt,

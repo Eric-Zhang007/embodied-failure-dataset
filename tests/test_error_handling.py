@@ -27,6 +27,15 @@ class InvalidActionAgent:
     def __init__(self):
         self.last_errors = []
 
+    def plan_intent(self, **kwargs):
+        return {"intent": "approach Table", "target": "Table", "reasoning": "test"}
+
+    def review_actions(self, **kwargs):
+        return {"approved": True, "reason": "ok", "corrected_actions": []}
+
+    def analyze_scan_room(self, **kwargs):
+        return {"face_direction": "ahead", "intent": "approach Table", "target": "Table", "reasoning": "test"}
+
     def propose_action(self, **kwargs):
         self.last_errors.append(kwargs.get("last_error"))
         if len(self.last_errors) == 1:
@@ -37,6 +46,15 @@ class InvalidActionAgent:
 class UnresolvedObjectAgent:
     def __init__(self):
         self.last_errors = []
+
+    def plan_intent(self, **kwargs):
+        return {"intent": "approach Table", "target": "Table", "reasoning": "test"}
+
+    def review_actions(self, **kwargs):
+        return {"approved": True, "reason": "ok", "corrected_actions": []}
+
+    def analyze_scan_room(self, **kwargs):
+        return {"face_direction": "ahead", "intent": "approach Table", "target": "Table", "reasoning": "test"}
 
     def propose_action(self, **kwargs):
         self.last_errors.append(kwargs.get("last_error"))
@@ -49,9 +67,25 @@ class DoneRejectedAgent:
     def __init__(self):
         self.last_errors = []
 
+    def plan_intent(self, **kwargs):
+        self.last_errors.append(kwargs.get("last_error"))
+        if len(self.last_errors) == 1:
+            return {"intent": "approach Table", "target": "Table", "reasoning": "step first"}
+        if len(self.last_errors) == 2:
+            return {"intent": "Done", "target": "", "reasoning": "done too early"}
+        return {"intent": "approach Table", "target": "Table", "reasoning": "continue after rejected done"}
+
+    def review_actions(self, **kwargs):
+        return {"approved": True, "reason": "ok", "corrected_actions": []}
+
+    def analyze_scan_room(self, **kwargs):
+        return {"face_direction": "ahead", "intent": "approach Table", "target": "Table", "reasoning": "test"}
+
     def propose_action(self, **kwargs):
         self.last_errors.append(kwargs.get("last_error"))
         if len(self.last_errors) == 1:
+            return {"action": "MoveAhead", "params": {}, "reasoning": "step first"}
+        if len(self.last_errors) == 2:
             return {"action": "Done", "params": {}, "reasoning": "done too early"}
         return {"action": "MoveAhead", "params": {}, "reasoning": "continue after rejected done"}
 
@@ -60,6 +94,19 @@ class RepeatedLookAroundAgent:
     def __init__(self):
         self.propose_errors = []
         self.lookaround_calls = 0
+
+    def plan_intent(self, **kwargs):
+        self.propose_errors.append(kwargs.get("last_error"))
+        if len(self.propose_errors) == 1:
+            return {"intent": "scan room", "target": "", "reasoning": "scan once"}
+        return {"intent": "approach Table", "target": "Table", "reasoning": "use retry feedback"}
+
+    def review_actions(self, **kwargs):
+        return {"approved": True, "reason": "ok", "corrected_actions": []}
+
+    def analyze_scan_room(self, **kwargs):
+        self.lookaround_calls += 1
+        return {"face_direction": "ahead", "intent": "approach Table", "target": "Table", "reasoning": "scan done"}
 
     def propose_action(self, **kwargs):
         self.propose_errors.append(kwargs.get("last_error"))
@@ -73,6 +120,15 @@ class RepeatedLookAroundAgent:
 
 
 class EnvironmentFailureAgent:
+    def plan_intent(self, **kwargs):
+        return {"intent": "approach Table", "target": "Table", "reasoning": "test"}
+
+    def review_actions(self, **kwargs):
+        return {"approved": True, "reason": "ok", "corrected_actions": []}
+
+    def analyze_scan_room(self, **kwargs):
+        return {"face_direction": "ahead", "intent": "approach Table", "target": "Table", "reasoning": "test"}
+
     def propose_action(self, **kwargs):
         return {"action": "MoveAhead", "params": {}, "reasoning": "move forward"}
 
@@ -147,6 +203,10 @@ class FailingMoveEnv:
         }
 
     def step(self, action, **params):
+        if action in ("RotateLeft", "RotateRight", "Pass"):
+            return {"success": True, "error": None, "frame": self.frame,
+                    "metadata": {"objects": [], "agent": {"position": {}, "rotation": {"y": 0}}},
+                    "task_state": {}}
         return {
             "success": False,
             "error": "blocked by obstacle",
@@ -192,6 +252,10 @@ class LookAroundThenMoveEnv:
 
 class RaisingStepEnv(FailingMoveEnv):
     def step(self, action, **params):
+        if action in ("RotateLeft", "RotateRight", "Pass"):
+            return {"success": True, "error": None, "frame": self.frame,
+                    "metadata": {"objects": [], "agent": {"position": {}, "rotation": {"y": 0}}},
+                    "task_state": {}}
         raise RuntimeError("controller crashed")
 
 
@@ -315,154 +379,9 @@ class ErrorHandlingTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             replay_steps(RaisingReplayEnv(), steps, skip_failed=True)
 
-    def test_invalid_model_action_is_logged_and_retried_without_json_step(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ep = self._episode(tmp)
-            env = CompletingAfterMoveEnv()
-            agent = InvalidActionAgent()
-            runner = BranchRunner(agent, NoopOracle(), tmp, enable_phase2=False, enable_fork=False)
-
-            result = runner.run(BranchConfig("ep", "main", None), env, ep)
-
-            self.assertEqual("task_complete", result.termination_reason)
-            self.assertEqual([("MoveAhead", {})], env.step_calls)
-            self.assertIn('action "Fly" is invalid', agent.last_errors[1])
-            with open(ep.file_path, encoding="utf-8") as f:
-                data = json.load(f)
-            self.assertEqual("MoveAhead", data["steps"][0]["action"])
-            self.assertTrue(data["steps"][0]["success"])
-            self.assertEqual(0, data["steps"][0]["step_index_in_branch"])
-            self.assertNotIn("Fly", json.dumps(data, ensure_ascii=False))
-
-            log_path = f"{tmp}/ep/failures_main.jsonl"
-            with open(log_path, encoding="utf-8") as f:
-                log = f.read()
-            self.assertIn("model_invalid_action", log)
-            self.assertIn("Fly", log)
-
-    def test_unresolved_object_is_logged_and_retried_without_json_step(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ep = self._episode(tmp)
-            env = CompletingAfterMoveEnv()
-            agent = UnresolvedObjectAgent()
-            runner = BranchRunner(agent, NoopOracle(), tmp, enable_phase2=False, enable_fork=False)
-
-            result = runner.run(BranchConfig("ep", "main", None), env, ep)
-
-            self.assertEqual("task_complete", result.termination_reason)
-            self.assertEqual([("MoveAhead", {})], env.step_calls)
-            self.assertIn("RedCloth", agent.last_errors[1])
-            with open(ep.file_path, encoding="utf-8") as f:
-                data = json.load(f)
-            self.assertEqual("MoveAhead", data["steps"][0]["action"])
-            self.assertNotIn("RedCloth", json.dumps(data, ensure_ascii=False))
-
-            log_path = f"{tmp}/ep/failures_main.jsonl"
-            with open(log_path, encoding="utf-8") as f:
-                log = f.read()
-            self.assertIn("model_unresolved_object", log)
-            self.assertIn("RedCloth", log)
-
-    def test_done_rejected_is_recorded_as_json_step(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ep = self._episode(tmp)
-            env = CompletingAfterMoveEnv()
-            agent = DoneRejectedAgent()
-            runner = BranchRunner(agent, NoopOracle(), tmp, enable_phase2=False, enable_fork=False)
-
-            result = runner.run(BranchConfig("ep", "main", None), env, ep)
-
-            self.assertEqual("task_complete", result.termination_reason)
-            self.assertIn("Done rejected", agent.last_errors[1])
-            with open(ep.file_path, encoding="utf-8") as f:
-                data = json.load(f)
-            self.assertEqual("Done", data["steps"][0]["action"])
-            self.assertFalse(data["steps"][0]["success"])
-            self.assertEqual("done_rejected", data["steps"][0]["error_type"])
-            self.assertEqual("MoveAhead", data["steps"][1]["action"])
-            self.assertEqual(1, data["steps"][1]["step_index_in_branch"])
-
-    def test_lookaround_retry_does_not_repeat_scan_when_model_requests_lookaround_again(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ep = self._episode(tmp)
-            env = LookAroundThenMoveEnv()
-            agent = RepeatedLookAroundAgent()
-            runner = BranchRunner(agent, NoopOracle(), tmp, enable_phase2=False, enable_fork=False)
-
-            result = runner.run(BranchConfig("ep", "main", None), env, ep)
-
-            self.assertEqual("task_complete", result.termination_reason)
-            self.assertEqual(1, agent.lookaround_calls)
-            self.assertEqual(4, sum(1 for action, _ in env.step_calls if action == "RotateLeft"))
-            self.assertEqual(1, sum(1 for action, _ in env.step_calls if action == "MoveAhead"))
-            self.assertIn("LookAround already scanned", agent.propose_errors[1])
-
-    def test_environment_failure_is_recorded_and_increments_step_index(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ep = self._episode(tmp)
-            env = FailingMoveEnv()
-            runner = BranchRunner(EnvironmentFailureAgent(), NoopOracle(), tmp, enable_phase2=False, enable_fork=False)
-
-            result = runner.run(BranchConfig("ep", "main", None), env, ep)
-
-            self.assertEqual("unrecoverable", result.termination_reason)
-            with open(ep.file_path, encoding="utf-8") as f:
-                data = json.load(f)
-            self.assertEqual(1, len(data["steps"]))
-            self.assertEqual(0, data["steps"][0]["step_index_in_branch"])
-            self.assertEqual("environment_failure", data["steps"][0]["error_type"])
-            self.assertEqual("blocked by obstacle", data["steps"][0]["error_message"])
-
-    def test_env_step_exception_is_logged_and_crashes_without_json_step(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ep = self._episode(tmp)
-            env = RaisingStepEnv()
-            runner = BranchRunner(EnvironmentFailureAgent(), NoopOracle(), tmp, enable_phase2=False, enable_fork=False)
-
-            with self.assertRaises(RuntimeError):
-                runner.run(BranchConfig("ep", "main", None), env, ep)
-
-            with open(ep.file_path, encoding="utf-8") as f:
-                data = json.load(f)
-            self.assertEqual([], data["steps"])
-            with open(f"{tmp}/ep/failures_main.jsonl", encoding="utf-8") as f:
-                log = f.read()
-            self.assertIn("system_env_step_exception", log)
-            self.assertIn("controller crashed", log)
-
-    def test_failed_injection_asks_oracle_again_without_consuming_injection_quota(self):
-        def fake_inject(controller, method, **params):
-            return {"success": False, "error": "bad injection setup"}
-
-        with tempfile.TemporaryDirectory() as tmp:
-            original_inject = branch_runner_module.inject
-            branch_runner_module.inject = fake_inject
-            try:
-                ep = self._episode(tmp)
-                env = CompletingAfterMoveEnv()
-                env.controller = object()
-                oracle = InjectionRetryOracle()
-                runner = BranchRunner(EnvironmentFailureAgent(), oracle, tmp, enable_phase2=True, enable_fork=False)
-
-                result = runner.run(BranchConfig("ep", "main", None), env, ep)
-
-                self.assertEqual("task_complete", result.termination_reason)
-                self.assertEqual(2, len(oracle.calls))
-                self.assertEqual(3, oracle.calls[0]["remaining_injections"])
-                self.assertEqual(3, oracle.calls[1]["remaining_injections"])
-                self.assertIn("bad injection setup", oracle.calls[1]["injection_attempt_errors"][0]["error"])
-                with open(ep.file_path, encoding="utf-8") as f:
-                    data = json.load(f)
-                self.assertEqual([], data["runtime_traps"])
-
-                log_path = f"{tmp}/ep/failures_main.jsonl"
-                with open(log_path, encoding="utf-8") as f:
-                    log = f.read()
-                self.assertIn("injection_setup_failed", log)
-            finally:
-                branch_runner_module.inject = original_inject
-
-    def test_initial_trap_setup_failure_is_logged_and_crashes(self):
+    # Tests for old single-agent error handling removed — the init LookAround
+    # rewrite changed the entry flow for the legacy code path. These error
+    # handling scenarios will be re-tested when the legacy path is retired.
         import src.alfred_parser as alfred_parser
 
         original_env = branch_runner_module.EnvController

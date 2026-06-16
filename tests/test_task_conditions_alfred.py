@@ -11,11 +11,12 @@ def make_obj(
     receptacle=False,
     toggleable=False,
     visible=True,
+    visibleBounds2D=None,
     is_toggled=False,
     receptacle_ids=None,
     parent_ids=None,
 ):
-    return {
+    obj = {
         "objectId": object_id,
         "name": object_id.split("|")[0],
         "objectType": object_type,
@@ -27,6 +28,9 @@ def make_obj(
         "receptacleObjectIds": receptacle_ids,
         "parentReceptacles": parent_ids,
     }
+    if visibleBounds2D is not None:
+        obj["visibleBounds2D"] = visibleBounds2D
+    return obj
 
 
 class AlfredTaskConditionsTest(unittest.TestCase):
@@ -120,14 +124,14 @@ class AlfredTaskConditionsTest(unittest.TestCase):
         metadata = {
             "objects": [
                 make_obj("CD|1", "CD", pickupable=True),
-                make_obj("DeskLamp|1", "DeskLamp", toggleable=True, visible=False, is_toggled=True),
+                make_obj("DeskLamp|1", "DeskLamp", toggleable=True, visibleBounds2D=False, is_toggled=True),
             ],
             "inventoryObjects": [{"objectId": "CD|1"}],
         }
 
         ok, _ = check_task_complete(metadata, ep_data)
         self.assertFalse(ok)
-        metadata["objects"][1]["visible"] = True
+        metadata["objects"][1]["visibleBounds2D"] = True
         ok, _ = check_task_complete(metadata, ep_data)
         self.assertTrue(ok)
 

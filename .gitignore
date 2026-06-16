@@ -23,3 +23,6 @@ Thumbs.db
 _*
 .deepseek/
 *.html
+.codewhale/
+docs/superpowers/
+.gitignore

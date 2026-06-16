@@ -21,8 +21,18 @@ from PIL import Image
 # ------------------------------------------------------------------
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
-FULL_API_LOG_PATH = LOG_DIR / "api_calls.jsonl"
 LOG_FULL_API = os.environ.get("EFD_LOG_FULL_API", "1") != "0"
+
+# Per-instance api_calls.jsonl directory. Set via VLMClient.set_api_log_dir().
+_api_log_dir: Path | None = None
+
+
+def _get_api_log_path() -> Path:
+    """Return the api_calls.jsonl path. Uses per-test dir if set, else global."""
+    base = _api_log_dir or LOG_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "api_calls.jsonl"
+
 
 logger = logging.getLogger("vlm_client")
 logger.setLevel(logging.DEBUG)
@@ -57,6 +67,12 @@ def _summarize_messages(messages: list[dict]) -> str:
 # ------------------------------------------------------------------
 
 class VLMClient:
+    @staticmethod
+    def set_api_log_dir(log_dir: str | Path | None):
+        """Set per-test directory for api_calls.jsonl. Call before creating clients."""
+        global _api_log_dir
+        _api_log_dir = Path(log_dir) if log_dir else None
+
     def __init__(self, backend: str, model: str, base_url: str = None, api_key: str = None):
         self.backend = backend
         self.model = model
@@ -390,7 +406,8 @@ class VLMClient:
             "request_body": _sanitize_for_log(body),
             "response": response_text,
         }
-        with open(FULL_API_LOG_PATH, "a", encoding="utf-8") as f:
+        log_path = _get_api_log_path()
+        with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     # ------------------------------------------------------------------
@@ -451,12 +468,50 @@ def _encode_image(image: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def _repair_json(text: str) -> str:
+    """Multi-stage JSON repair: fix common 8B model output issues.
+    Adapted from Voyager's fix_and_parse_json pipeline.
+    """
+    # Strip leading/trailing whitespace and tabs
+    repaired = text.strip().replace("\t", " ")
+
+    # Fix invalid escape sequences (e.g. \s, \d, \w that aren't valid JSON escapes)
+    import re
+    repaired = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', repaired)
+
+    # Fix unquoted property names: {key: "val"} → {"key": "val"}
+    # Matches word chars before a colon that aren't inside quotes
+    repaired = re.sub(r'(?<=[{,])\s*(\w+)\s*:', r'"\1":', repaired)
+
+    # Balance braces: if missing closing braces, add them
+    open_count = repaired.count("{")
+    close_count = repaired.count("}")
+    if open_count > close_count:
+        repaired += "}" * (open_count - close_count)
+    elif close_count > open_count:
+        # Too many closing braces — truncate from last valid position
+        # Find the position where braces balance
+        balance = 0
+        cut_idx = 0
+        for i, ch in enumerate(repaired):
+            if ch == "{":
+                balance += 1
+            elif ch == "}":
+                balance -= 1
+            if balance == 0 and i > 0:
+                cut_idx = i + 1
+        if cut_idx > 0:
+            repaired = repaired[:cut_idx]
+
+    return repaired
+
+
 def parse_json_response(response: str, default=None) -> dict | None:
     text = response.strip()
     if not text:
         return default
 
-    # Try direct parse first
+    # Stage 1: direct parse
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
@@ -464,7 +519,7 @@ def parse_json_response(response: str, default=None) -> dict | None:
     except json.JSONDecodeError:
         pass
 
-    # Thinking models may output CoT before/after the JSON. Extract from {...}.
+    # Stage 2: extract from {...} (handles CoT before/after)
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
@@ -472,6 +527,28 @@ def parse_json_response(response: str, default=None) -> dict | None:
             parsed = json.loads(text[start:end + 1])
             if isinstance(parsed, dict):
                 logger.debug("JSON_EXTRACTED_FROM_THINKING start=%d end=%d", start, end)
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Stage 3: repair common issues and retry
+    repaired = _repair_json(text)
+    try:
+        parsed = json.loads(repaired)
+        if isinstance(parsed, dict):
+            logger.debug("JSON_REPAIRED")
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Stage 4: extract from repaired text
+    start = repaired.find("{")
+    end = repaired.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(repaired[start:end + 1])
+            if isinstance(parsed, dict):
+                logger.debug("JSON_REPAIRED_AND_EXTRACTED")
                 return parsed
         except json.JSONDecodeError:
             pass
@@ -491,10 +568,10 @@ def _json_response_error(parsed, required_fields: tuple[str, ...] | None) -> str
 
 def _json_retry_instruction(error: str) -> str:
     return (
-        f"Your previous response failed validation: {error}. "
-        "You MUST output ONLY a valid JSON object starting with { and ending with }. "
-        "No markdown, no explanation outside the JSON. "
-        "Include all required fields."
+        f"Your previous output was INVALID: {error}. "
+        "Output ONLY valid JSON — start with {, end with }. "
+        "No markdown fences, no text outside braces. "
+        "Keep to at most 12 actions. Use 'repeat' to batch same-direction movement."
     )
 
 

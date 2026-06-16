@@ -11,6 +11,7 @@
 import argparse
 
 from src.scheduler import Scheduler, SchedulerConfig
+from src.vlm_client import VLMClient
 
 
 def main():
@@ -30,6 +31,8 @@ def main():
     if not args.output:
         from datetime import datetime
         args.output = f"output_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    VLMClient.set_api_log_dir(args.output)
 
     config = SchedulerConfig(
         data_dir=args.data_dir,
