@@ -20,9 +20,7 @@ Thumbs.db
 .idea/
 
 # Temp analysis files
-_*
 .deepseek/
 *.html
 .codewhale/
 docs/superpowers/
-.gitignore
