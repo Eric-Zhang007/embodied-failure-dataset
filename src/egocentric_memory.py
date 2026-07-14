@@ -36,6 +36,101 @@ class _ObstacleEntry:
     block_count: int
     last_block_step: int
 
+
+class StuckTracker:
+    """Tracks repetition and blockage signals for situation summary.
+
+    Uses cumulative per-(intent, target) dict so switching to another intent
+    and back does NOT reset the counter — superior to sliding-window dedup.
+    Blocked directions and obstacle-intent pairs are aged out by step expiry.
+    """
+    INTENT_REPEAT_THRESHOLD = 3
+    OBSTACLE_REPEAT_THRESHOLD = 3
+    INTENT_AGE_LIMIT = 20
+    BLOCK_AGE_LIMIT = 15
+
+    _NEUTRAL_ACTIONS = {
+        "RotateLeft", "RotateRight", "LookUp", "LookDown",
+        "Done", "LookAround",
+    }
+
+    def __init__(self):
+        self._intent_failure: dict[tuple[str, str], int] = {}
+        self._intent_last_step: dict[tuple[str, str], int] = {}
+        self._consecutive_failures = 0
+        self._blocked_directions: dict[tuple[str, str], int] = {}
+        self._block_dir_last_step: dict[tuple[str, str], int] = {}
+        self._obstacle_intent_blocks: dict[tuple[str, str, str], int] = {}
+        self._obs_last_step: dict[tuple[str, str, str], int] = {}
+
+    def update(self, step: int, intent: str, target: str,
+               success: bool, blocked_by: str | None, blocked_dir: str | None,
+               action: str = ""):
+        key = (intent, target)
+        if not success:
+            self._intent_failure[key] = self._intent_failure.get(key, 0) + 1
+        self._intent_last_step[key] = step
+        self._age_dicts(self._intent_last_step, self.INTENT_AGE_LIMIT, step,
+                        self._intent_failure)
+
+        if action in self._NEUTRAL_ACTIONS:
+            pass
+        elif success:
+            self._consecutive_failures = 0
+        else:
+            self._consecutive_failures += 1
+
+        if blocked_by and blocked_dir:
+            dk = (blocked_dir, blocked_by)
+            self._blocked_directions[dk] = self._blocked_directions.get(dk, 0) + 1
+            self._block_dir_last_step[dk] = step
+            self._age_dicts(self._block_dir_last_step, self.BLOCK_AGE_LIMIT, step,
+                            self._blocked_directions)
+
+        if blocked_by and intent:
+            ok = (blocked_by, intent, target)
+            self._obstacle_intent_blocks[ok] = self._obstacle_intent_blocks.get(ok, 0) + 1
+            self._obs_last_step[ok] = step
+            self._age_dicts(self._obs_last_step, self.BLOCK_AGE_LIMIT, step,
+                            self._obstacle_intent_blocks)
+
+    def render_summary(self, current_step: int) -> str:
+        lines: list[str] = []
+        for key in list(self._intent_last_step.keys()):
+            intent, target = key
+            fails = self._intent_failure.get(key, 0)
+            if fails >= self.INTENT_REPEAT_THRESHOLD:
+                lines.append(
+                    f"WARNING: Intent '{intent} {target}' has failed "
+                    f"{fails} times without recovery."
+                )
+        if self._consecutive_failures >= 5:
+            lines.append(
+                f"You have been stuck for {self._consecutive_failures} consecutive steps."
+            )
+        recent = {k: v for k, v in self._blocked_directions.items() if v >= 2}
+        if recent:
+            parts = [f"{d}({o}×{c})" for (d, o), c in sorted(recent.items())]
+            lines.append(f"Blocked directions: {', '.join(parts)}.")
+        for (obj, intent, tgt), cnt in self._obstacle_intent_blocks.items():
+            if cnt >= self.OBSTACLE_REPEAT_THRESHOLD:
+                lines.append(
+                    f"The same obstacle ({obj}) has blocked intent "
+                    f"'{intent} {tgt}' {cnt} times."
+                )
+        if not lines:
+            return ""
+        return "SITUATION SUMMARY:\n" + "\n".join(f"  {ln}" for ln in lines) + "\n"
+
+    @staticmethod
+    def _age_dicts(last_step: dict, age_limit: int, current_step: int, *dicts):
+        stale = [k for k, s in last_step.items() if current_step - s > age_limit]
+        for k in stale:
+            last_step.pop(k, None)
+            for d in dicts:
+                d.pop(k, None)
+
+
 # ---------------------------------------------------------------------------
 # Direction helpers
 # ---------------------------------------------------------------------------
@@ -117,6 +212,7 @@ class EgocentricMemory:
         self._agent_rot_y: float = 0.0
         self._agent_x: float = 0.0
         self._agent_z: float = 0.0
+        self._stuck_tracker = StuckTracker()
 
         # ── Spike 003: Curiosity Scoreboard visitation tracking ──
         # Track per-receptacle-type statistics for multi-dimensional scoring.
@@ -137,6 +233,7 @@ class EgocentricMemory:
         success: bool,
         error_message: str | None,
         task_criteria: str = "",
+        intent: str = "",
     ) -> None:
         self._step_counter += 1
 
@@ -238,13 +335,30 @@ class EgocentricMemory:
                     entry.last_seen_step = self._step_counter
 
         # Handle failures: track obstacles
+        blocker = None
+        blocker_dir = None
         if not success and error_message:
             blocker = self._parse_blocker(error_message)
             if blocker:
                 obs = self._find_or_create_obstacle(blocker)
                 obs.block_count += 1
                 obs.last_block_step = self._step_counter
+                blocker_dir = obs.direction
             self._last_error = self._compress_error(action, error_message)
+
+        # Update stuck tracker (PR #2 — cumulative intent failure tracking)
+        intent_parts = intent.split(maxsplit=1)
+        intent_verb = intent_parts[0] if intent_parts else ""
+        intent_target = intent_parts[1] if len(intent_parts) > 1 else ""
+        self._stuck_tracker.update(
+            step=self._step_counter,
+            intent=intent_verb,
+            target=intent_target,
+            success=success,
+            blocked_by=blocker,
+            blocked_dir=blocker_dir,
+            action=action,
+        )
 
         self._age_entries()
         if self._step_counter % 5 == 0 or not self._area_label:
@@ -291,6 +405,9 @@ class EgocentricMemory:
 
     def render(self) -> str:
         lines = []
+        situation = self._stuck_tracker.render_summary(self._step_counter)
+        if situation:
+            lines.append(situation)
         lines.append("SPATIAL MEMORY — what you remember seeing:\n")
         if self._area_label:
             lines.append(f"AREA: {self._area_label}")
