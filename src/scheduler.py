@@ -32,22 +32,39 @@ class SchedulerConfig:
     max_parallel: int = 1
     task_filter: str = ""
     splits: str = "train,valid_seen,valid_unseen"
-    eb_model: str = "Qwen/Qwen3-VL-32B-Instruct"
-    oracle_model: str = "Qwen/Qwen3-VL-32B-Instruct"
-    siliconflow_key: str = ""
+    api_key: str = ""
+    api_base_url: str = "https://api.fullcupai.com"
+    planner_model: str = "gpt-5.5"
+    executor_model: str = "gpt-5.5"
+    oracle_model: str = "gpt-5.5"
+    planner_reasoning_effort: str = "xhigh"
+    executor_reasoning_effort: str = "medium"
+    oracle_reasoning_effort: str = "xhigh"
     enable_fork: bool = True
 
 
 class Scheduler:
     def __init__(self, config: SchedulerConfig):
         self.config = config
-        eb_client = VLMClient.siliconflow(config.eb_model, config.siliconflow_key)
-        oracle_client = VLMClient.siliconflow(config.oracle_model, config.siliconflow_key)
-        executor_client = VLMClient.siliconflow("Qwen/Qwen3-VL-8B-Instruct", config.siliconflow_key)
-        self.eb_agent = EBAgent(eb_client)
+        planner_client = VLMClient.openai(
+            config.planner_model, config.api_key,
+            base_url=config.api_base_url,
+            reasoning_effort=config.planner_reasoning_effort,
+        )
+        executor_client = VLMClient.openai(
+            config.executor_model, config.api_key,
+            base_url=config.api_base_url,
+            reasoning_effort=config.executor_reasoning_effort,
+        )
+        oracle_client = VLMClient.openai(
+            config.oracle_model, config.api_key,
+            base_url=config.api_base_url,
+            reasoning_effort=config.oracle_reasoning_effort,
+        )
+        self.eb_agent = EBAgent(planner_client)
         self.oracle_agent = OracleAgent(oracle_client)
         self.executor_agent = ExecutorAgent(executor_client)
-        # Warmup: 32B 模型首次调用需加载，避免首次 Phase 2 超时
+        # Warmup: GPT-5.5 首次调用需加载，避免首次 Phase 超时
         import time as _time
         _t0 = _time.time()
         oracle_client.chat_text(system_prompt="Say OK.", user_text="OK", max_tokens=5)

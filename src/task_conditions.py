@@ -22,6 +22,14 @@ def get_completion_criteria_text(task_type: str, pddl_params: dict) -> str:
     })
     rules = _CRITERIA_RULES.get(resolved_task_type, [])
     lines = []
+    # Prepend slicing prerequisite when pddl_params says the object must be sliced.
+    # Without this, the agent only sees "put X in Y" and discovers the slicing
+    # requirement when Done is rejected — wasting steps on recovery.
+    if pddl_params.get("object_sliced"):
+        if resolved_task_type == "pick_two_obj_and_place":
+            lines.append(f"  - Two {obj} must be sliced")
+        else:
+            lines.append(f"  - {obj} must be sliced")
     for rule in rules:
         lines.append(f"  - {rule.format(object=obj, parent=parent, toggle=toggle, mrecep=mrecep)}")
     return "\n".join(lines)
@@ -108,11 +116,12 @@ def _normalize_task_state(task_state: dict | None) -> dict:
 
 
 def _targets(pddl: dict) -> dict:
-    target_object = pddl.get("object_target") or ""
-    if pddl.get("object_sliced") and target_object:
-        target_object += "Sliced"
+    # NOTE: We intentionally do NOT append "Sliced" to the object name.
+    # Criteria text and prompts use the original name (e.g. "Tomato"),
+    # while completion checks use pddl.get("object_sliced") + _sliced_count()
+    # to verify slicing state independently.
     return {
-        "object": target_object,
+        "object": pddl.get("object_target") or "",
         "parent": pddl.get("parent_target") or "",
         "toggle": pddl.get("toggle_target") or "",
         "mrecep": pddl.get("mrecep_target") or "",
@@ -152,7 +161,7 @@ def _pick_and_place_simple(metadata: dict, pddl: dict, task_state: dict) -> tupl
     receptacles = _objects_with_name_and_prop(targets["parent"], "receptacle", metadata)
     pickupables = _objects_with_name_and_prop(targets["object"], "pickupable", metadata)
 
-    if "Sliced" in targets["object"] and _sliced_count(pickupables) < 1:
+    if pddl.get("object_sliced") and _sliced_count(pickupables) < 1:
         return False, f"{targets['object']} must be sliced before placing"
 
     if not receptacles:
@@ -172,7 +181,7 @@ def _pick_two(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
     receptacles = _objects_with_name_and_prop(targets["parent"], "receptacle", metadata)
     pickupables = _objects_with_name_and_prop(targets["object"], "pickupable", metadata)
 
-    if "Sliced" in targets["object"] and _sliced_count(pickupables) < 2:
+    if pddl.get("object_sliced") and _sliced_count(pickupables) < 2:
         return False, f"Two {targets['object']} must be sliced before placing"
 
     if not receptacles:
@@ -199,7 +208,7 @@ def _look_at_obj_in_light(metadata: dict, pddl: dict, task_state: dict) -> tuple
     pickupables = _objects_with_name_and_prop(targets["object"], "pickupable", metadata)
     inventory = metadata.get("inventoryObjects") or []
 
-    if "Sliced" in targets["object"] and _sliced_count(pickupables) < 1:
+    if pddl.get("object_sliced") and _sliced_count(pickupables) < 1:
         return False, f"{targets['object']} must be sliced"
 
     pickup_ids = {p["objectId"] for p in pickupables}
@@ -239,7 +248,7 @@ def _state_then_place(metadata: dict, pddl: dict, state_object_ids: set[str], st
     receptacles = _objects_with_name_and_prop(targets["parent"], "receptacle", metadata)
     pickupables = _objects_with_name_and_prop(targets["object"], "pickupable", metadata)
 
-    if "Sliced" in targets["object"] and _sliced_count(pickupables) < 1:
+    if pddl.get("object_sliced") and _sliced_count(pickupables) < 1:
         return False, f"{targets['object']} must be sliced before placing"
 
     objs_in_place = [
@@ -274,7 +283,7 @@ def _pick_and_place_with_movable_recep(metadata: dict, pddl: dict, task_state: d
     pickupables = _objects_with_name_and_prop(targets["object"], "pickupable", metadata)
     movables = _objects_with_name_and_prop(targets["mrecep"], "pickupable", metadata)
 
-    if "Sliced" in targets["object"] and _sliced_count(pickupables) < 1:
+    if pddl.get("object_sliced") and _sliced_count(pickupables) < 1:
         return False, f"{targets['object']} must be sliced before placing"
 
     pickup_in_movable = [

@@ -27,6 +27,7 @@ class _ObjectEntry:
     last_seen_step: int
     seen_count: int
     parent_receptacle_id: str | None = None  # objectId of receptacle this object sits on/in
+    searched: bool = False  # marked when receptacle has been opened and checked
 
 @dataclass
 class _ObstacleEntry:
@@ -61,6 +62,43 @@ def _egocentric_direction(
     else:                             label = "ahead-left"
     return label, d
 
+
+# ---------------------------------------------------------------------------
+# Spike 003: auto-discovery tracking helper
+# ---------------------------------------------------------------------------
+
+def _auto_record_discovery(
+    memory: "EgocentricMemory",
+    new_obj_id: str,
+    obj_data: dict,
+    visible_objects: list[dict],
+) -> None:
+    """When a newly-discovered object enters memory, credit its parent receptacle.
+
+    Finds the parent receptacle's objectType and increments
+    memory.objects_found_by_receptacle for that type.
+    """
+    parent_ids = obj_data.get("parentReceptacles") or []
+    if not parent_ids:
+        return
+
+    parent_oid = parent_ids[0]
+    # Look up parent receptacle type: first in memory, then in visible_objects
+    parent_type = None
+    entry = memory._objects.get(parent_oid)
+    if entry and entry.is_receptacle:
+        parent_type = entry.object_type
+    else:
+        for vo in visible_objects:
+            if vo.get("objectId") == parent_oid and vo.get("receptacle"):
+                parent_type = vo.get("objectType")
+                break
+
+    if parent_type:
+        memory.objects_found_by_receptacle[parent_type] = \
+            memory.objects_found_by_receptacle.get(parent_type, 0) + 1
+
+
 # ---------------------------------------------------------------------------
 # Memory class
 # ---------------------------------------------------------------------------
@@ -79,6 +117,13 @@ class EgocentricMemory:
         self._agent_rot_y: float = 0.0
         self._agent_x: float = 0.0
         self._agent_z: float = 0.0
+
+        # ── Spike 003: Curiosity Scoreboard visitation tracking ──
+        # Track per-receptacle-type statistics for multi-dimensional scoring.
+        # Keyed by objectType (e.g. "Fridge", "CounterTop", "Cabinet").
+        self.receptacle_visit_counts: dict[str, int] = {}
+        self.receptacle_open_counts: dict[str, int] = {}
+        self.objects_found_by_receptacle: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -124,7 +169,17 @@ class EgocentricMemory:
 
             current_ids.add(oid)
             pos = obj.get("position", {})
-            ox, oz = pos.get("x", 0.0), pos.get("z", 0.0)
+            # Use AABB surface position when available for accurate distance
+            bbox = obj.get("axisAlignedBoundingBox")
+            if bbox and bbox.get("cornerPoints"):
+                corners = bbox["cornerPoints"]
+                # cornerPoints format: [[x,y,z], [x,y,z], ...]
+                xs = [p[0] for p in corners]
+                zs = [p[2] for p in corners]
+                ox = max(min(xs), min(max(xs), self._agent_x))
+                oz = max(min(zs), min(max(zs), self._agent_z))
+            else:
+                ox, oz = pos.get("x", 0.0), pos.get("z", 0.0)
             direction, dist = _egocentric_direction(
                 self._agent_x, self._agent_z, self._agent_rot_y, ox, oz,
             )
@@ -160,6 +215,8 @@ class EgocentricMemory:
                     seen_count=1,
                     parent_receptacle_id=(obj.get("parentReceptacles") or [None])[0],
                 )
+                # ── Spike 003: track object discovery per receptacle ──
+                _auto_record_discovery(self, oid, obj, visible_objects)
 
         # Mark previously-visible objects that are no longer in view as "remembered"
         for oid, entry in self._objects.items():
@@ -192,6 +249,45 @@ class EgocentricMemory:
         self._age_entries()
         if self._step_counter % 5 == 0 or not self._area_label:
             self._update_area_label(metadata)
+
+    def mark_searched(self, object_type: str | None = None, object_id: str | None = None) -> int:
+        """Mark objects as searched. Returns count of objects marked.
+
+        Args:
+            object_type: Match entries with this objectType (case-sensitive).
+            object_id: Match a specific entry by objectId. Takes precedence over object_type.
+
+        Returns:
+            Number of entries marked.
+        """
+        count = 0
+        for entry in self._objects.values():
+            if object_id is not None:
+                if entry.object_id == object_id:
+                    entry.searched = True
+                    count += 1
+            elif object_type is not None:
+                if entry.object_type == object_type:
+                    entry.searched = True
+                    count += 1
+        return count
+
+    def unmark_searched(self, object_type: str) -> int:
+        """Remove searched flag from all entries matching object_type. Returns count unmarked."""
+        count = 0
+        for entry in self._objects.values():
+            if entry.object_type == object_type and entry.searched:
+                entry.searched = False
+                count += 1
+        return count
+
+    def unmark_searched_by_id(self, object_id: str) -> int:
+        """Remove searched flag from a specific entry by objectId. Returns 1 if found, 0 otherwise."""
+        entry = self._objects.get(object_id)
+        if entry and entry.searched:
+            entry.searched = False
+            return 1
+        return 0
 
     def render(self) -> str:
         lines = []
@@ -378,6 +474,174 @@ class EgocentricMemory:
                 lines.append(line)
         return lines
 
+    # ------------------------------------------------------------------
+    # Exploration / dedup helpers
+    # ------------------------------------------------------------------
+
+    def get_remembered_receptacles(self) -> list[str]:
+        """Return receptacle object types that are remembered (not currently visible),
+        sorted by most recently seen. Used for dedup fallback exploration."""
+        candidates: list[tuple[str, int]] = []
+        for entry in self._objects.values():
+            if entry.is_receptacle and entry.status == "remembered":
+                candidates.append((entry.object_type, entry.last_seen_step))
+        candidates.sort(key=lambda x: -x[1])
+        seen: set[str] = set()
+        result: list[str] = []
+        for otype, _ in candidates:
+            if otype not in seen:
+                seen.add(otype)
+                result.append(otype)
+        return result
+
+    def get_visible_receptacles(self) -> list[str]:
+        """Return receptacle object types currently visible, sorted by distance."""
+        candidates: list[tuple[str, float]] = []
+        for entry in self._objects.values():
+            if entry.is_receptacle and entry.status == "visible":
+                candidates.append((entry.object_type, entry.egocentric_dist))
+        candidates.sort(key=lambda x: x[1])
+        seen: set[str] = set()
+        result: list[str] = []
+        for otype, _ in candidates:
+            if otype not in seen:
+                seen.add(otype)
+                result.append(otype)
+        return result
+
+    def get_all_object_types(self) -> set[str]:
+        """Return all unique objectTypes ever stored in memory.
+
+        Used by intent dedup to normalize LLM-generated target strings
+        (e.g. "refrigerator" -> "Fridge") against known canonical names.
+        """
+        return {e.object_type for e in self._objects.values()}
+
+    def get_unvisited_receptacles(self, approached_types: set[str] | None = None) -> list[str]:
+        """Return receptacle types in memory that have NOT been approached yet.
+        Prioritizes remembered over visible, then by recency."""
+        approached = approached_types or set()
+        remembered: list[tuple[str, int]] = []
+        visible: list[tuple[str, float]] = []
+        for entry in self._objects.values():
+            if not entry.is_receptacle:
+                continue
+            if entry.object_type in approached:
+                continue
+            if entry.status == "remembered":
+                remembered.append((entry.object_type, entry.last_seen_step))
+            elif entry.status == "visible":
+                visible.append((entry.object_type, entry.egocentric_dist))
+        remembered.sort(key=lambda x: -x[1])
+        visible.sort(key=lambda x: x[1])
+        seen: set[str] = set()
+        result: list[str] = []
+        for otype, _ in remembered:
+            if otype not in seen:
+                seen.add(otype)
+                result.append(otype)
+        for otype, _ in visible:
+            if otype not in seen:
+                seen.add(otype)
+                result.append(otype)
+        return result
+
+    # ------------------------------------------------------------------
+    # Phase detection helpers (Spike 005: progress-gating)
+    # ------------------------------------------------------------------
+
+    def has_type(self, object_type: str) -> bool:
+        """Check if any object of this type has ever been seen / stored in memory."""
+        for entry in self._objects.values():
+            if entry.object_type == object_type:
+                return True
+        return False
+
+    def is_type_visible(self, object_type: str) -> bool:
+        """Check if at least one instance of this type is currently in view."""
+        for entry in self._objects.values():
+            if entry.object_type == object_type and entry.status == "visible":
+                return True
+        return False
+
+    def get_type_distance(self, object_type: str) -> float | None:
+        """Return AABB surface distance to the closest visible instance of this type.
+        Returns None if no visible instance is found."""
+        best: float | None = None
+        for entry in self._objects.values():
+            if entry.object_type == object_type and entry.status == "visible":
+                if best is None or entry.egocentric_dist < best:
+                    best = entry.egocentric_dist
+        return best
+
+    def get_remembered_type_distance(self, object_type: str) -> float | None:
+        """Return last known distance for this type (most recent seen, not necessarily
+        currently visible). Returns None if never seen."""
+        best: float | None = None
+        best_step: int = -1
+        for entry in self._objects.values():
+            if entry.object_type == object_type:
+                if entry.last_seen_step > best_step:
+                    best_step = entry.last_seen_step
+                    best = entry.egocentric_dist
+        return best
+
+    def get_searched_receptacle_types(self) -> set[str]:
+        """Return the set of receptacle objectTypes that have been marked as searched."""
+        result: set[str] = set()
+        for entry in self._objects.values():
+            if entry.searched and entry.is_receptacle:
+                result.add(entry.object_type)
+        return result
+
+    # ------------------------------------------------------------------
+    # Spike 003: Curiosity Scoreboard visitation tracking
+    # ------------------------------------------------------------------
+
+    def record_receptacle_visit(self, receptacle_type: str) -> None:
+        """Record that the agent visited/approached this receptacle type."""
+        self.receptacle_visit_counts[receptacle_type] = \
+            self.receptacle_visit_counts.get(receptacle_type, 0) + 1
+
+    def record_receptacle_open(self, receptacle_type: str) -> None:
+        """Record that the agent opened/interacted with this receptacle type."""
+        self.receptacle_open_counts[receptacle_type] = \
+            self.receptacle_open_counts.get(receptacle_type, 0) + 1
+        # Opening counts as a visit too (you can't open without approaching)
+        self.receptacle_visit_counts[receptacle_type] = \
+            self.receptacle_visit_counts.get(receptacle_type, 0) + 1
+
+    def record_object_discovered_in(self, receptacle_type: str) -> None:
+        """Record that a previously-unseen object was discovered when interacting
+        with this receptacle. Used to compute discovery score."""
+        self.objects_found_by_receptacle[receptacle_type] = \
+            self.objects_found_by_receptacle.get(receptacle_type, 0) + 1
+
+    def get_receptacle_entries_for_curiosity(self) -> list[dict]:
+        """Return all known receptacle entries as a list of dicts suitable for
+        consumption by curiosity_scorer.build_curiosity_table_text().
+
+        Each dict has: object_type, status, egocentric_dir, egocentric_dist,
+        last_seen_step, age_steps (steps since last seen).
+        """
+        entries: list[dict] = []
+        seen_types: set[str] = set()
+        for e in self._objects.values():
+            if not e.is_receptacle:
+                continue
+            if e.object_type in seen_types:
+                continue
+            seen_types.add(e.object_type)
+            entries.append({
+                "object_type": e.object_type,
+                "status": e.status,
+                "egocentric_dir": e.egocentric_dir,
+                "egocentric_dist": e.egocentric_dist,
+                "last_seen_step": e.last_seen_step,
+                "age_steps": self._step_counter - e.last_seen_step,
+            })
+        return entries
+
     def _render_object_line(self, e: _ObjectEntry, label: str,
                             oid_to_label: dict[str, str] | None = None) -> str:
         if e.status == "held":
@@ -395,6 +659,8 @@ class EgocentricMemory:
             tags.append("receptacle")
         elif e.is_receptacle:
             tags.append("receptacle?")
+        if e.searched:
+            tags.append("SEARCHED")
 
         line = f"  {label} — {status_text}"
         # Show parent relationship if known (object-to-object spatial relation)
@@ -408,3 +674,81 @@ class EgocentricMemory:
         if tags:
             line += f" ({', '.join(tags)})"
         return line
+
+
+# ---------------------------------------------------------------------------
+# SearchTrail: 2D grid tracking where the agent has physically been
+# ---------------------------------------------------------------------------
+
+class SearchTrail:
+    """2D grid tracking physical agent positions for revisit detection.
+
+    Maintains a coarse grid of visited positions with visit counts.
+    Provides revisit scores and text summaries for Planner/Executor prompts.
+
+    Resolution defaults to 0.5m -- cells are ~0.5m x 0.5m squares.
+    """
+
+    def __init__(self, resolution: float = 0.5):
+        self._cells: dict[tuple[int, int], int] = {}  # (gx, gz) -> count
+        self._resolution = resolution
+
+    def record(self, agent_x: float, agent_z: float) -> int:
+        gx = int(agent_x / self._resolution)
+        gz = int(agent_z / self._resolution)
+        self._cells[(gx, gz)] = self._cells.get((gx, gz), 0) + 1
+        return self._cells[(gx, gz)]
+
+    def revisit_score(self, target_x: float, target_z: float) -> float:
+        """0.0 = never visited, higher = more visits."""
+        gx = int(target_x / self._resolution)
+        gz = int(target_z / self._resolution)
+        return float(self._cells.get((gx, gz), 0))
+
+    def total_cells_visited(self) -> int:
+        return len(self._cells)
+
+    def render_summary(self, receptacles: list[dict], agent_pos: dict | None = None) -> str:
+        """Compact text showing which receptacle areas the agent has visited.
+
+        Args:
+            receptacles: list of dicts with objectType, position, receptacle=True.
+            agent_pos: optional dict with x, z for the agent's own cell marker.
+
+        Returns:
+            Multi-line string like:
+            TRAIL (visited areas):
+              Fridge area x3 (HEAVILY visited), CounterTop x1, Cabinet x0 (unvisited)
+              -> Prioritize UNVISITED or least-visited areas.
+        """
+        # Group receptacles by objectType, dedup, get visit count per type
+        seen_types: set[str] = set()
+        entries: list[tuple[str, float]] = []
+        for obj in receptacles:
+            otype = obj.get("objectType", "")
+            if not otype or otype in seen_types:
+                continue
+            if not obj.get("receptacle"):
+                continue
+            seen_types.add(otype)
+            pos = obj.get("position", {})
+            score = self.revisit_score(pos.get("x", 0), pos.get("z", 0))
+            entries.append((otype, score))
+
+        if not entries:
+            return ""
+
+        # Build compact summary line
+        parts: list[str] = []
+        for otype, score in entries:
+            if score >= 3:
+                parts.append(f"{otype} area x{int(score)} (HEAVILY visited)")
+            elif score >= 1:
+                parts.append(f"{otype} area x{int(score)}")
+            else:
+                parts.append(f"{otype} x0 (unvisited)")
+
+        lines = ["TRAIL (visited areas):"]
+        lines.append("  " + ", ".join(parts))
+        lines.append("  -> Prioritize UNVISITED or least-visited areas.")
+        return "\n".join(lines)

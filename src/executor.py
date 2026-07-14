@@ -8,7 +8,7 @@ task criteria, recent history, last error — same information the Planner sees.
 from __future__ import annotations
 import numpy as np
 from src.vlm_client import VLMClient
-from src.context_builder import build_eb_history_context
+from src.context_builder import render_current_intent_steps
 
 EXECUTOR_SYSTEM = """You are an embodied agent in a 3D household. The image is your FIRST-PERSON VIEW. You receive a high-level intent and must output 1-5 concrete actions to carry it out.
 
@@ -76,19 +76,29 @@ class ExecutorAgent:
         failed_object_ids: set = None,
         planner_feedback: str | None = None,
         camera_horizon: float = 0.0,
+        trail_text: str = "",
+        planner_reasoning: str = "",
     ) -> dict:
         """Given an intent and full agent context, output action chunk."""
-        from src.eb_agent import _direction, _append_task_context
+        from src.eb_agent import _direction, _direction_for_obj, _append_task_context
 
-        lines = [f"Your intent: {intent}"]
-        if target:
-            lines.append(f"Target object: {target}")
-        lines.append("You are carrying out THIS intent. The history below is only for this SAME intent.")
-        lines.append("")
+        # ── Current intent block (replaces old intent header + recent actions) ──
+        current_intent_block = render_current_intent_steps(
+            intent=intent,
+            target=target,
+            planner_reasoning=planner_reasoning,
+            steps=action_history,
+        )
+        lines = [current_intent_block, ""]
 
         # Spatial memory FIRST
         if memory_text:
             lines.append(memory_text)
+            lines.append("")
+
+        # Trail summary (Spike 006: search-trail-cost)
+        if trail_text:
+            lines.append(trail_text)
             lines.append("")
 
         # Hand status + task criteria
@@ -110,7 +120,7 @@ class ExecutorAgent:
             for o in receptacles:
                 d = ""
                 if agent_pos and o.get("position"):
-                    d = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
+                    d = " <- " + _direction_for_obj(agent_pos, agent_rot_y, o)
                 lines.append(f"  {o['objectType']}{d}")
         if visible:
             lines.append("\nObjects in view — direction relative to your facing:")
@@ -130,7 +140,7 @@ class ExecutorAgent:
                 prev = " [failed before]" if o.get("objectId") in failed_object_ids else ""
                 d = ""
                 if agent_pos and o.get("position"):
-                    d = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
+                    d = " <- " + _direction_for_obj(agent_pos, agent_rot_y, o)
                 lines.append(f"  {o['objectType']}{tag}{prev}{d}")
         else:
             lines.append("(No objects in view — you may be facing a wall. Rotate or MoveBack.)")
@@ -140,11 +150,7 @@ class ExecutorAgent:
             for fid in list(failed_object_ids)[:5]:
                 lines.append(f"  - {fid}")
 
-        # Recent history for context
-        recent = action_history[-5:] if len(action_history) > 5 else action_history
-        if recent:
-            lines.append("\nRecent actions:")
-            lines.append(build_eb_history_context(recent))
+        # (Step history is already shown via render_current_intent_steps above)
 
         if last_error:
             lines.append(f"\nLast error: {last_error}")

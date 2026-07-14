@@ -7,10 +7,16 @@ EB Agent（具身 Agent）。
 """
 
 import math
+import re
 import numpy as np
 
 from src.vlm_client import VLMClient
-from src.context_builder import build_eb_history_context
+from src.context_builder import build_eb_history_context, render_intent_tree
+from src.curiosity_scorer import (
+    build_curiosity_table_text,
+    check_proposed_target,
+    CuriosityStats,
+)
 
 
 
@@ -109,6 +115,38 @@ def _direction(agent_pos, agent_rot_y, obj_pos):
     return f"? ({ds})"
 
 
+def _surface_position(agent_pos, obj):
+    """Return (x, z) of nearest point on object's AABB to agent.
+
+    Uses axisAlignedBoundingBox cornerPoints to compute distance to the
+    object surface rather than its center. Falls back to obj['position']
+    if no AABB data is available.
+    """
+    pos = obj.get("position")
+    bbox = obj.get("axisAlignedBoundingBox")
+    if bbox and bbox.get("cornerPoints"):
+        corners = bbox["cornerPoints"]
+        # cornerPoints format: [[x,y,z], [x,y,z], ...]
+        xs = [p[0] for p in corners]
+        zs = [p[2] for p in corners]
+        min_x, max_x = min(xs), max(xs)
+        min_z, max_z = min(zs), max(zs)
+        # Clamp agent position to AABB extent
+        cx = max(min_x, min(max_x, agent_pos["x"]))
+        cz = max(min_z, min(max_z, agent_pos["z"]))
+        return {"x": cx, "z": cz}
+    # Fallback: use object center
+    if pos:
+        return {"x": pos["x"], "z": pos["z"]}
+    return {"x": 0.0, "z": 0.0}
+
+
+def _direction_for_obj(agent_pos, agent_rot_y, obj):
+    """Like _direction but computes distance to object SURFACE (AABB) not center."""
+    surf = _surface_position(agent_pos, obj)
+    return _direction(agent_pos, agent_rot_y, surf)
+
+
 def _append_task_context(
     lines: list[str],
     visible_objects: list[dict] | None,
@@ -165,7 +203,7 @@ def build_phase1_prompt(
         for o in receptacles:
             dir_label = ""
             if agent_pos and o.get("position"):
-                dir_label = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
+                dir_label = " <- " + _direction_for_obj(agent_pos, agent_rot_y, o)
             lines.append(f"  {o['objectType']}{dir_label}")
         lines.append("")
     if visible:
@@ -184,7 +222,7 @@ def build_phase1_prompt(
             prev = " [failed before]" if o.get("objectId") in failed_object_ids else ""
             dir_label = ""
             if agent_pos and o.get("position"):
-                dir_label = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
+                dir_label = " <- " + _direction_for_obj(agent_pos, agent_rot_y, o)
             lines.append(f"  {o['objectType']}{tag}{prev}{dir_label}")
     else:
         lines.append("(No objects currently in view — you are likely facing a wall or obstacle. Rotate or MoveBack to find open space. Do NOT LookAround from here.)")
@@ -323,7 +361,7 @@ def build_phase3_prompt(
                 tag = f" ({', '.join(extra)})" if extra else ""
                 dir_label = ""
                 if agent_pos and o.get("position"):
-                    dir_label = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
+                    dir_label = " <- " + _direction_for_obj(agent_pos, agent_rot_y, o)
                 lines.append(f"  {o['objectType']}{tag}{dir_label}")
         else:
             lines.append("(No objects currently in view — you are likely facing a wall or obstacle. Rotate or MoveBack to find open space. Do NOT LookAround from here.)")
@@ -369,10 +407,11 @@ INTENTS (use these exact forms):
   toggle on <objectType>     — turn on an appliance
   toggle off <objectType>    — turn off an appliance
   scan room                  — full 4-direction scan (use ONCE, then pick specific targets from the scan)
+  unmark <objectType>        — undo a SEARCHED mark (use when you suspect the target is still inside)
   wait                       — nothing to do, task in progress
   Done                       — task is complete (see below)
 
-TWO SPECIAL INTENTS — how the system handles them:
+THREE SPECIAL INTENTS — how the system handles them:
 
 1. "scan room" — when your current view is insufficient and you need a full-room overview.
    What happens: the system captures 4 directional views (ahead/left/behind/right) and shows
@@ -385,6 +424,12 @@ TWO SPECIAL INTENTS — how the system handles them:
    What happens: the system runs a hard verification against the task criteria. If ALL pass,
    the episode ends successfully. If ANY criterion is missing, you will get a specific rejection
    message telling you exactly what is not yet satisfied — fix those conditions first.
+
+3. "unmark <objectType>" — when you suspect a previously-searched receptacle might still
+   contain the target (e.g. the target was occluded behind another object when you checked).
+   What happens: the system clears the SEARCHED flag so the Executor can re-open and
+   re-check that receptacle. Use this when your diagnosis of a recent failure suggests the
+   target was "missed", "occluded", or "hidden" inside an already-searched container.
 
 OUTPUT — valid JSON only. { first char, } last char. No markdown.
 
@@ -417,9 +462,255 @@ OUTPUT — valid JSON only:
 }"""
 
 
+# ------------------------------------------------------------------
+# Contrastive Planner (Spike 004): explore-bias system prompt
+# ------------------------------------------------------------------
+
+EXPLORE_BIAS_SYSTEM = """You are an embodied agent in EXPLORATION MODE. Your job is HIGH-LEVEL PLANNING with an exploration bias.
+
+CRITICAL — EXPLORATION DIRECTIVE:
+- You MUST choose a location / receptacle you have NOT yet visited or searched.
+- Avoid repeating locations that appear in your recent intent history.
+- Look at the SPATIAL MEMORY for remembered-but-unvisited receptacles (not marked SEARCHED).
+- If the target has NEVER been seen, pick a receptacle you have NOT approached yet.
+- Prefer novel locations over familiar ones. Diversity is the goal.
+
+Output a single high-level intent. Be specific about the target object. Use EXACT objectType names.
+
+RULES:
+- Look at the image, visible objects, task goal, hand status, and spatial memory.
+- Decide the next logical sub-goal to make progress toward the task.
+- If target is >0.5m away: intent is to APPROACH it first.
+- If target is in hand and task requires putting it somewhere: intent is to PLACE it.
+- If target is not visible: first check SPATIAL MEMORY. If the memory says where the target was last seen (e.g. "saw Apple on Counter"), output "approach <that location>".
+- If the target has NEVER been seen: use "scan room" once to get a full-room overview. After scanning, DO NOT use "locate X" — the Executor has no spatial reasoning and will fail. Instead, pick a specific receptacle or area from the scan and use "approach <area>" to search there.
+
+IF TARGET NEVER SEEN — EXPLORATION STRATEGY:
+Instead of "locate X" (which gives the Executor no direction), create a concrete search plan:
+1. Look at the AREA label and visible receptacles (Counter, Table, Desk, Shelf, etc.)
+2. Pick ONE specific receptacle or visible object to approach
+3. Output "approach <receptacle>" — the Executor can execute this. If the target isn't there, you'll try the next location on the following turn.
+Example: if looking for an Apple in a kitchen, say "approach CounterTop" (not "locate Apple"). If it's not there, next turn say "approach DiningTable". This gives the Executor concrete targets it can reach.
+
+INTENTS (use these exact forms):
+  approach <objectType>      — move toward the object until within 0.5m
+  pickup <objectType>        — pick up the object (only if within 0.5m!)
+  put <objectType> on <receptacleType> — place held object into receptacle
+  open <objectType>          — open a container/cabinet/drawer
+  close <objectType>         — close a container
+  toggle on <objectType>     — turn on an appliance
+  toggle off <objectType>    — turn off an appliance
+  scan room                  — full 4-direction scan (use ONCE, then pick specific targets from the scan)
+  unmark <objectType>        — undo a SEARCHED mark (use when you suspect the target is still inside)
+  wait                       — nothing to do, task in progress
+  Done                       — task is complete (see below)
+
+OUTPUT — valid JSON only. { first char, } last char. No markdown.
+
+{
+  "intent": "<intent phrase>",
+  "target": "<objectType or empty>",
+  "reasoning": "<1-3 sentences: why this intent now, first-person>"
+}"""
+
+
+# ---------------------------------------------------------------------------
+# Spike 003: Curiosity Scoreboard — prompt-bridge helpers
+# ---------------------------------------------------------------------------
+
+# Known AI2-THOR object types for extracting the target from task_goal
+_CURIOSITY_KNOWN_TYPES: set[str] = {
+    "AlarmClock", "Apple", "BaseballBat", "BasketBall", "Book", "Bowl", "Box",
+    "Bread", "BreadSliced", "ButterKnife", "Candle", "CD", "CellPhone",
+    "Cloth", "CoffeeMachine", "CreditCard", "Cup", "DishSponge", "Dumbbell",
+    "Egg", "Fork", "HandTowel", "KeyChain", "Knife", "Ladle", "Laptop",
+    "Lettuce", "Mug", "Newspaper", "Pan", "Pen", "Pencil", "PepperShaker",
+    "Pillow", "Plate", "Plunger", "Pot", "Potato", "RemoteControl",
+    "SaltShaker", "ScrubBrush", "SoapBar", "SoapBottle", "Spatula",
+    "SprayBottle", "Statue", "TeddyBear", "TennisRacket", "TissueBox",
+    "ToiletPaper", "Tomato", "Towel", "Vase", "Watch", "WateringCan",
+    "WineBottle",
+}
+
+
+def _extract_target_object(task_goal: str) -> str:
+    """Extract the most likely target object type from a task goal string.
+
+    Uses a simple heuristic: find known AI2-THOR object types in the goal text.
+    Returns the first match, or empty string if none found.
+    """
+    goal_lower = task_goal.lower()
+    # Sort by length descending so "AlarmClock" matches before "Clock"
+    for otype in sorted(_CURIOSITY_KNOWN_TYPES, key=len, reverse=True):
+        if otype.lower() in goal_lower:
+            return otype
+    return ""
+
+
+def _build_curiosity_for_prompt(task_goal: str, memory) -> str:
+    """Build the curiosity scoreboard text for injection into the Planner prompt.
+
+    Extracts the target object from task_goal, gathers receptacle entries from
+    memory, and delegates to curiosity_scorer.build_curiosity_table_text().
+    """
+    target_object = _extract_target_object(task_goal)
+    if not target_object:
+        return ""
+
+    entries = memory.get_receptacle_entries_for_curiosity()
+    if not entries:
+        return ""
+
+    self_ref = memory  # for clarity in the call below
+    return build_curiosity_table_text(
+        target_object=target_object,
+        memory_entries=entries,
+        visit_counts=self_ref.receptacle_visit_counts,
+        open_counts=self_ref.receptacle_open_counts,
+        objects_found_counts=self_ref.objects_found_by_receptacle,
+    )
+
+
+def _check_curiosity_posthoc(
+    task_goal: str,
+    proposed_target: str,
+    memory,
+    curiosity_stats: CuriosityStats,
+) -> dict:
+    """Post-hoc check: is the proposed target reasonable per curiosity scores?
+
+    Returns dict with: blocked, warning, fallback, score.
+    """
+    target_object = _extract_target_object(task_goal)
+    if not target_object or not proposed_target:
+        return {"blocked": False, "warning": None, "fallback": None, "score": 1.0}
+
+    result = check_proposed_target(
+        target_object=target_object,
+        proposed_target=proposed_target,
+        visit_counts=memory.receptacle_visit_counts,
+        open_counts=memory.receptacle_open_counts,
+        objects_found_counts=memory.objects_found_by_receptacle,
+    )
+
+    curiosity_stats.record_proposal(proposed_target, result["score"])
+
+    if result.get("blocked"):
+        fallback = result.get("best_alternative", "scan room")
+        fallback_intent = f"approach {fallback}" if fallback and fallback != "scan room" else "scan room"
+        curiosity_stats.record_block(proposed_target, result["score"], fallback_intent)
+        result["fallback"] = fallback_intent
+    elif result.get("warning"):
+        curiosity_stats.soft_warnings += 1
+
+    return result
+# ------------------------------------------------------------------
+# Phase-specific guardrails (Spike 005: progress-gating)
+# ------------------------------------------------------------------
+
+PHASE_RULES: dict[str, str] = {
+    "exploration": (
+        "\n"
+        "PHASE: EXPLORATION\n"
+        "The target has NOT been seen yet. You are surveying the environment.\n"
+        "- Visit each candidate location ONCE. Do not revisit.\n"
+        "- Start with the nearest visible receptacle.\n"
+        "- After opening a receptacle, mentally mark it as CHECKED.\n"
+        "- If all visible receptacles are checked, rotate to scan new areas.\n"
+        "- Do NOT wander aimlessly — move with purpose toward unchecked areas."
+    ),
+    "navigation": (
+        "\n"
+        "PHASE: NAVIGATION\n"
+        "Target was seen but is not currently visible. Navigate to its last known location.\n"
+        "- Move toward the known target location from spatial memory.\n"
+        "- Check your memory for the last known direction and distance.\n"
+        "- If blocked en route, go around — do NOT abandon the destination.\n"
+        "- Rotate periodically to verify you haven't passed the target."
+    ),
+    "approach": (
+        "\n"
+        "PHASE: APPROACH\n"
+        "Target is visible but > 0.5m away. Close distance for interaction.\n"
+        "- Close distance to within 0.5m for interaction.\n"
+        "- Use MoveSequence for efficient multi-step movement.\n"
+        "- If blocked, sidestep or find an alternative angle.\n"
+        "- Do NOT attempt PickupObject/OpenObject until within 0.5m."
+    ),
+    "interaction": (
+        "\n"
+        "PHASE: INTERACTION\n"
+        "Target is within reach. Manipulate it to progress the task.\n"
+        "- Pick up the target, open it, or manipulate it as needed.\n"
+        "- After interacting, re-assess: is the task complete?\n"
+        "- If the interaction fails, diagnose why before retrying."
+    ),
+    "recovery": (
+        "\n"
+        "PHASE: RECOVERY\n"
+        "The last action FAILED. You must diagnose and try an alternative.\n"
+        "- Do NOT repeat the same action or approach the same target.\n"
+        "- If a receptacle was opened and found empty, mark it as SEARCHED.\n"
+        "- Rotate 90 and look for alternative paths or unexplored receptacles.\n"
+        "- If stuck for 3+ steps, propose \"scan room\" to re-assess.\n"
+        "- Identify the root cause: was it a collision, a reach error, or a missing object?"
+    ),
+}
+
+
+
 class EBAgent:
     def __init__(self, client: VLMClient):
         self.client = client
+        self._pending_dedup_constraint: str | None = None
+        self._pending_trail_warning: str | None = None
+        # Dedup statistics (public, reset per episode)
+        self.dedup_stats: dict = {
+            "warnings": 0,
+            "forced": 0,
+            "fallbacks": [],  # list of {"original_intent": str, "original_target": str, "fallback_intent": str}
+            "blocked_intents": [],  # list of blocked (intent, target) pairs with counts
+        }
+        # Contrastive planner statistics (Spike 004, public, reset per episode)
+        self.contrastive_stats: dict = {
+            "activations": 0,          # how many times dual-planner was triggered
+            "a_selected": 0,           # exploit (standard) chosen
+            "b_selected": 0,           # explore chosen
+            "selections": [],          # list of {"step": int, "chosen": "A"/"B", "a_intent": str, "b_intent": str, "reason": str}
+        }
+        # ── Spike 003: Curiosity Scoreboard statistics ──
+        self.curiosity_stats = CuriosityStats()
+        self._pending_curiosity_warning: str | None = None
+        # ── Spike 005: Progress-gating phase tracking ──
+        self._current_phase: str | None = None
+        self._phase_transitions: list[dict] = []  # [{from, to, step_index}]
+        # ── Ablation flags (set by BranchRunner before run; all default True) ──
+        self.enable_intent_dedup: bool = True
+        self.enable_curiosity_scoreboard: bool = True
+        self.enable_progress_gating: bool = True
+
+    def reset_dedup_stats(self):
+        """Reset dedup, contrastive & curiosity statistics for a new episode."""
+        self._pending_dedup_constraint = None
+        self._pending_trail_warning = None
+        self.dedup_stats = {
+            "warnings": 0,
+            "forced": 0,
+            "fallbacks": [],
+            "blocked_intents": [],
+        }
+        self.contrastive_stats = {
+            "activations": 0,
+            "a_selected": 0,
+            "b_selected": 0,
+            "selections": [],
+        }
+        # Spike 003: reset curiosity state
+        self.curiosity_stats = CuriosityStats()
+        self._pending_curiosity_warning = None
+        # ── Spike 005: reset phase tracking ──
+        self._current_phase = None
+        self._phase_transitions = []
 
     # ------------------------------------------------------------------
     # Planner: high-level intent
@@ -438,34 +729,102 @@ class EBAgent:
         task_criteria: str = "",
         memory_text: str = "",
         intent_history: list[dict] | None = None,
+        memory=None,
+        critic_feedback: str | None = None,
+        trail_text: str = "",
     ) -> dict:
-        """Propose the next high-level intent."""
+        """Propose the next high-level intent.
+
+        If memory (EgocentricMemory) is provided, intent deduplication is active:
+        - 2 prior INCOMPLETE occurrences of the same (intent, target) -> injects a
+          hard constraint into the NEXT prompt.
+        - 3+ prior INCOMPLETE occurrences -> FORCE overrides the intent with a
+          fallback exploration strategy using spatial memory.
+
+        If critic_feedback is provided (from CriticGuard rejection), it is shown
+        prominently as a hard constraint to guide re-generation.
+        """
         lines = [f"Task goal: {task_goal}\n"]
+        # ── Phase detection and guardrail injection (Spike 005: progress-gating) ──
+        if self.enable_progress_gating:
+            try:
+                phase = self._detect_phase(
+                    task_goal, visible_objects, memory, last_error,
+                    intent_history, agent_pos, agent_rot_y,
+                )
+                if phase != self._current_phase:
+                    self._phase_transitions.append({
+                        "from": self._current_phase,
+                        "to": phase,
+                        "step_index": len(action_history),
+                    })
+                    self._current_phase = phase
+                phase_block = self._get_phase_block(phase)
+                if phase_block:
+                    lines.append(phase_block)
+            except Exception:
+                pass  # Phase detection must never break the main flow
+
+        # ── Critic feedback (002b): hard constraint from pre-execution Critic ──
+        if critic_feedback:
+            lines.append("=" * 50)
+            lines.append("CRITIC REJECTED YOUR PREVIOUS INTENT:")
+            lines.append(critic_feedback)
+            lines.append("You MUST propose a DIFFERENT intent. Do NOT repeat the rejected one.")
+            lines.append("=" * 50)
+            lines.append("")
         if memory_text:
             lines.append(memory_text)
             lines.append("")
+
+        # ── Spike 003: Curiosity Scoreboard ──
+        # Compute a multi-dimensional exploration priority table for known receptacles.
+        # Injected proactively — the Planner sees scores BEFORE forming its intent.
+        curiosity_table = ""
+        if self.enable_curiosity_scoreboard and memory is not None:
+            curiosity_table = _build_curiosity_for_prompt(task_goal, memory)
+        if curiosity_table:
+            lines.append(curiosity_table)
+            self.curiosity_stats.scoreboard_shown += 1
+
         if hand_status:
             lines.append(f"HAND STATUS: {hand_status}")
         if task_criteria:
             lines.append(f"\nTASK COMPLETION CRITERIA:\n{task_criteria}")
 
-        # Intent history — what has been tried and their outcomes
-        if intent_history:
-            lines.append("\nIntent history (what I have tried):")
-            for ih in intent_history[-15:]:
-                status = "OK" if ih.get("completed") else "INCOMPLETE"
-                n_steps = len(ih.get("steps", []))
-                intent_str = ih.get("intent", "?")
-                target_str = ih.get("target", "")
-                desc = f"{intent_str}"
-                if target_str:
-                    desc += f" ({target_str})"
-                last_err = ""
-                if n_steps and not ih.get("completed"):
-                    last_step = ih["steps"][-1]
-                    last_err = (last_step.get("error_message") or "")[:80]
-                lines.append(f"  {desc}: {status}, {n_steps} step(s)" + (f" — {last_err}" if last_err else ""))
+        # ── Inject pending dedup constraint from a previous 2-occurrence warning ──
+        if self._pending_dedup_constraint:
+            lines.append(f"\nHARD CONSTRAINT: {self._pending_dedup_constraint}")
+            self._pending_dedup_constraint = None
+
+        # ── Inject pending trail warning (Spike 006: area visited 3+ times) ──
+        if self._pending_trail_warning:
+            lines.append(f"\nTRAIL NOTE: {self._pending_trail_warning}")
+            self._pending_trail_warning = None
+
+        # ── Inject pending curiosity warning (Spike 003: low-score target blocked) ──
+        if self._pending_curiosity_warning:
+            lines.append(f"\nCURIOSITY WARNING: {self._pending_curiosity_warning}")
+            self._pending_curiosity_warning = None
+
+        # ── Trail summary (Spike 006: search-trail-cost) ──
+        if trail_text:
             lines.append("")
+            lines.append(trail_text)
+            lines.append("")
+
+        # Unified intent tree — replaces both "Intent history" and "Full EB history"
+        if intent_history:
+            tree_text = render_intent_tree(intent_history, action_history)
+            if tree_text:
+                lines.append(tree_text)
+                lines.append("")
+        elif action_history:
+            # Fallback: show recent raw actions if no intent history yet
+            recent_raw = action_history[-3:] if len(action_history) > 3 else action_history
+            if recent_raw:
+                lines.append("\nRecent actions:")
+                lines.append(build_eb_history_context(recent_raw))
 
         visible = [o for o in visible_objects if o.get("visibleBounds2D")]
         if visible:
@@ -479,7 +838,7 @@ class EBAgent:
                 tag = f" ({','.join(extra)})" if extra else ""
                 d = ""
                 if agent_pos and o.get("position"):
-                    d = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
+                    d = " <- " + _direction_for_obj(agent_pos, agent_rot_y, o)
                 lines.append(f"  {o['objectType']}{tag}{d}")
         else:
             lines.append("\n(No objects in view — you may be facing a wall. Rotate or MoveBack.)")
@@ -487,21 +846,663 @@ class EBAgent:
         if last_error:
             lines.append(f"\nLast error: {last_error}")
 
-        # Recent steps — show raw actions from last few steps for spatial context
-        recent_raw = action_history[-3:] if len(action_history) > 3 else action_history
-        if recent_raw:
-            lines.append("\nRecent actions:")
-            lines.append(build_eb_history_context(recent_raw))
-
         lines.append("\nPropose the next intent. Be specific. Output JSON only.")
         prompt = "\n".join(lines)
 
-        return self.client.chat_with_image_json(
+        result = self.client.chat_with_image_json(
             system_prompt=PLANNER_SYSTEM,
             user_text=prompt,
             image=image,
             required_fields=("intent", "target", "reasoning"),
         )
+
+        # ── Intent deduplication — check the proposed intent against history ──
+        if self.enable_intent_dedup and intent_history and memory is not None:
+            intent = result.get("intent", "")
+            target = result.get("target", "")
+            blocked, warning, fallback_intent = self._check_intent_dedup(
+                intent, target, intent_history, memory, task_goal,
+            )
+            if blocked:
+                result["intent"] = fallback_intent
+                result["target"] = ""
+                original_reasoning = result.get("reasoning", "")
+                result["reasoning"] = (
+                    f"[DEDUP OVERRIDE] Original intent '{intent} {target}' blocked "
+                    f"after repeated failures. Fallback: {fallback_intent}. "
+                    f"{original_reasoning}"
+                )
+                result["dedup_blocked"] = True
+                result["dedup_original_intent"] = intent
+                result["dedup_original_target"] = target
+            elif warning:
+                # Store for next prompt — the current proposal passes but next
+                # time the Planner will see a hard constraint.
+                self._pending_dedup_constraint = warning
+                result["dedup_warning"] = warning
+
+        # ── Spike 003: Curiosity Scoreboard post-hoc check ──
+        # After the VLM returns, check whether the proposed target has a reasonable
+        # curiosity score. Unlike dedup (which only blocks exact repeats), this
+        # checks ALL locations against the multi-dimensional score.
+        if self.enable_curiosity_scoreboard and memory is not None and not result.get("dedup_blocked"):
+            intent = result.get("intent", "")
+            target = result.get("target", "")
+            # Only check approach/open/check intents that target a receptacle
+            if target and any(kw in intent.lower() for kw in ("approach", "open", "check", "search")):
+                curiosity_check = _check_curiosity_posthoc(
+                    task_goal, target, memory, self.curiosity_stats
+                )
+                if curiosity_check.get("blocked"):
+                    # Hard guard: score too low, force fallback
+                    fallback = curiosity_check.get("fallback", "scan room")
+                    result["intent"] = fallback
+                    result["target"] = ""
+                    original_reasoning = result.get("reasoning", "")
+                    result["reasoning"] = (
+                        f"[CURIOSITY OVERRIDE] '{target}' curiosity score "
+                        f"({curiosity_check.get('score', 0):.2f}) too low. "
+                        f"Fallback: {fallback}. {original_reasoning}"
+                    )
+                    result["curiosity_blocked"] = True
+                    result["curiosity_original_target"] = target
+                elif curiosity_check.get("warning"):
+                    self._pending_curiosity_warning = curiosity_check["warning"]
+                    result["curiosity_warning"] = curiosity_check["warning"]
+
+        result["phase"] = getattr(self, "_current_phase", None)
+        return result
+
+    # ------------------------------------------------------------------
+    # Intent deduplication (hard mechanism, not prompt-based)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_intent_verb(intent: str) -> str:
+        """Normalize intent verb to canonical form for dedup matching.
+
+        LLM variants like "go to X", "move to X", "walk to X" all mean
+        "approach X". Normalize them so dedup sees them as the same intent.
+        """
+        if not intent:
+            return ""
+        lower = intent.strip().lower()
+        # Common approach synonyms
+        for prefix in ("go to ", "move to ", "walk to ", "head to ",
+                       "navigate to ", "proceed to "):
+            if lower.startswith(prefix):
+                return "approach"
+        # For other intents, use the first word as the verb
+        return lower.split()[0] if lower.split() else lower
+
+    @staticmethod
+    def _normalize_target(target: str, memory) -> str:
+        """Normalize an LLM-generated target string to its canonical objectType.
+
+        Checks against all known object types in spatial memory using
+        case-insensitive exact match and substring containment. Returns
+        the canonical casing if a match is found, otherwise the original.
+        """
+        if not target or memory is None:
+            return target.strip() if target else ""
+        target_clean = target.strip()
+        target_lower = target_clean.lower()
+
+        all_types = memory.get_all_object_types()
+
+        # 1. Case-insensitive exact match
+        for otype in all_types:
+            if otype.lower() == target_lower:
+                return otype
+
+        # 2. Substring containment (e.g. "Counter" -> "CounterTop",
+        #    "desk" -> "DeskLamp")
+        for otype in all_types:
+            otype_lower = otype.lower()
+            if target_lower in otype_lower or otype_lower in target_lower:
+                return otype
+
+        return target_clean
+
+    def _check_intent_dedup(
+        self,
+        intent: str,
+        target: str,
+        intent_history: list[dict],
+        memory=None,
+        task_goal: str = "",
+    ) -> tuple[bool, str | None, str | None]:
+        """Check whether the proposed (intent, target) pair has been tried too many
+        times without success.
+
+        Uses semantic normalization: intent verbs are normalized ("go to" ->
+        "approach") and targets are normalized to canonical objectTypes from
+        spatial memory. This prevents LLM synonym variants from bypassing dedup.
+
+        Returns (blocked, warning_message, fallback_intent):
+        - blocked=False, warning=str:  2 prior INCOMPLETE occurrences -> inject
+          hard constraint into the NEXT prompt.
+        - blocked=True, warning=None:  3+ prior INCOMPLETE occurrences -> force
+          override with fallback_intent.
+        - blocked=False, warning=None: normal, no dedup action.
+        """
+        if not intent_history:
+            return (False, None, None)
+
+        # ── Semantic normalization (C5 fix) ──
+        norm_verb = self._normalize_intent_verb(intent)
+        norm_target = self._normalize_target(target, memory)
+        key = (norm_verb, norm_target)
+
+        # Only look at the most recent 5 intent history entries
+        recent = intent_history[-5:] if len(intent_history) > 5 else intent_history
+
+        # Match against history using normalized keys
+        matches: list[dict] = []
+        for ih in recent:
+            ih_verb = self._normalize_intent_verb(ih.get("intent", ""))
+            ih_target = self._normalize_target(ih.get("target", ""), memory)
+            if (ih_verb, ih_target) == key:
+                matches.append(ih)
+
+        if len(matches) == 0:
+            return (False, None, None)
+
+        # Check if ALL prior matches were INCOMPLETE
+        all_incomplete = all(not m.get("completed", False) for m in matches)
+
+        if not all_incomplete:
+            # If any prior attempt completed, dedup is not triggered
+            return (False, None, None)
+
+        count = len(matches)
+
+        # ── Level 2: 3+ prior occurrences -> FORCE override ──
+        if count >= 3:
+            fallback_intent = self._generate_fallback_intent(
+                intent, target, memory, intent_history, task_goal,
+            )
+            self.dedup_stats["forced"] += 1
+            self.dedup_stats["fallbacks"].append({
+                "original_intent": intent,
+                "original_target": target,
+                "fallback_intent": fallback_intent,
+                "prior_attempts": count,
+            })
+            self.dedup_stats["blocked_intents"].append({
+                "intent": intent,
+                "target": target,
+                "prior_attempts": count,
+            })
+            return (True, None, fallback_intent)
+
+        # ── Level 1: 2 prior occurrences -> warning -> hard constraint next call ──
+        if count >= 2:
+            self.dedup_stats["warnings"] += 1
+            desc = intent if target and target in intent else f"{intent} {target}".strip()
+            warning = (
+                f"You have already tried '{desc}' {count} times "
+                f"without finding the target. Choose a DIFFERENT approach. "
+                f"Do NOT propose '{desc}' again."
+            )
+            return (False, warning, None)
+
+        return (False, None, None)
+
+    # ------------------------------------------------------------------
+    # Task-aware fallback helpers (C3 fix)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_pick_two_task(task_goal: str) -> bool:
+        """Detect whether task_goal describes a pick-two / multi-object task."""
+        if not task_goal:
+            return False
+        lower = task_goal.lower()
+        return ("pick two" in lower or "pick 2" in lower
+                or " both " in lower or "and the " in lower)
+
+    @staticmethod
+    def _extract_parent_target(task_goal: str) -> str:
+        """Extract the task's target receptacle from a task_goal string.
+
+        Examples:
+          "Pick up the Apple and put it on the Table."   -> "Table"
+          "Pick up the Apple and put it in the Fridge."   -> "Fridge"
+          "Heat the Apple and put it in the Microwave."   -> "Microwave"
+        """
+        if not task_goal:
+            return ""
+        m = re.search(r'(?:on|in|into)\s+the\s+([A-Z][a-zA-Z]+)', task_goal)
+        if m:
+            return m.group(1)
+        return ""
+
+    @staticmethod
+    def _extract_object_target(task_goal: str) -> str:
+        """Extract the primary object to pick from a task_goal string.
+
+        Examples:
+          "Pick up the Apple and put it on the Table."    -> "Apple"
+          "Clean the Potato and put it in the Fridge."    -> "Potato"
+        """
+        if not task_goal:
+            return ""
+        m = re.search(r'(?:Pick up|Clean|Heat|Cool|Slice)\s+the\s+([A-Z][a-zA-Z]+)', task_goal)
+        if m:
+            return m.group(1)
+        return ""
+
+    def _generate_fallback_intent(
+        self,
+        intent: str,
+        target: str,
+        memory=None,
+        intent_history: list[dict] | None = None,
+        task_goal: str = "",
+    ) -> str:
+        """Generate a fallback exploration intent when the Planner is stuck in a
+        repeated-intent loop. Uses spatial memory to find alternative targets.
+
+        Task-aware (C3 fix):
+        - NEVER blocks or deprioritises the task's TARGET receptacle (parent_target).
+        - For pick_two tasks: the same source receptacle may need to be visited
+          twice, so previously-approached receptacles are not penalised.
+
+        Priority:
+        1. Task target receptacle (parent_target) if visible or remembered
+        2. Unvisited receptacles from spatial memory (excluding approached,
+           but never excluding the task's parent_target)
+        3. Visible receptacles not yet approached
+        4. "scan room" -- ultimate fallback
+        """
+        # ── Parse task info (C3) ──
+        parent_target = self._extract_parent_target(task_goal)
+        object_target = self._extract_object_target(task_goal)
+        is_pick_two = self._is_pick_two_task(task_goal)
+
+        # Collect object types that have been repeatedly targeted (approached),
+        # but NEVER include the task's parent_target.
+        approached_types: set[str] = set()
+        if intent_history:
+            for ih in intent_history:
+                ih_intent = ih.get("intent", "")
+                ih_target = ih.get("target", "")
+                norm_verb = self._normalize_intent_verb(ih_intent)
+                if norm_verb == "approach" and ih_target:
+                    norm_t = self._normalize_target(ih_target, memory)
+                    # Guard: never block the task's target receptacle
+                    if parent_target and norm_t.lower() == parent_target.lower():
+                        continue
+                    approached_types.add(norm_t)
+
+        if memory is not None:
+            # ── Priority 1: task target receptacle ──
+            if parent_target:
+                # Check if parent_target is visible right now
+                visible_rec = memory.get_visible_receptacles()
+                for rec in visible_rec:
+                    if rec.lower() == parent_target.lower():
+                        return f"approach {rec}"
+                # Check if parent_target is remembered
+                remembered = memory.get_remembered_receptacles()
+                for rec in remembered:
+                    if rec.lower() == parent_target.lower():
+                        return f"approach {rec}"
+
+            # ── Priority 2: unvisited receptacles (never block parent_target) ──
+            unvisited = memory.get_unvisited_receptacles(approached_types)
+            if unvisited:
+                return f"approach {unvisited[0]}"
+
+            # ── Priority 3: visible receptacles ──
+            visible_rec = memory.get_visible_receptacles()
+            if visible_rec:
+                for rec in visible_rec:
+                    # For pick_two, allow previously-approached receptacles
+                    # (the second object may be on the same surface)
+                    if is_pick_two:
+                        return f"approach {rec}"
+                    if rec not in approached_types:
+                        return f"approach {rec}"
+                # All visible receptacles approached -- still try the nearest
+                return f"approach {visible_rec[0]}"
+
+        # ── Ultimate fallback ──
+        return "scan room"
+
+    # ------------------------------------------------------------------
+    # Phase detection for progress-gating (Spike 005)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_targets(task_goal: str) -> list[str]:
+        """Extract object type names from a task goal string.
+
+        Task goals follow ALFRED conventions like:
+          "Pick up the Apple and put it on the CounterTop."
+          "Clean the Apple and put it in the Fridge."
+        We extract CamelCase words that follow "the ".
+        """
+        import re
+        targets = re.findall(r'\bthe\s+([A-Z][a-zA-Z]+)', task_goal)
+        # Remove duplicates while preserving order
+        seen: set[str] = set()
+        unique: list[str] = []
+        for t in targets:
+            if t not in seen:
+                seen.add(t)
+                unique.append(t)
+        return unique
+
+    def _detect_phase(
+        self,
+        task_goal: str,
+        visible_objects: list[dict],
+        memory,
+        last_error: str | None,
+        intent_history: list[dict] | None,
+        agent_pos: dict | None = None,
+        agent_rot_y: float = 0.0,
+    ) -> str:
+        """Detect the current task phase from state heuristics.
+
+        Priority order (first match wins):
+          1. recovery  — last action failed
+          2. exploration — target NEVER seen in spatial memory
+          3. navigation — target seen but not currently visible
+          4. approach — target visible, distance > 0.5m
+          5. interaction — target visible, distance <= 0.5m
+        Falls back to exploration if no target can be extracted.
+        """
+        targets = self._extract_targets(task_goal)
+        primary = targets[0] if targets else None
+
+        # Check for recent failure (recovery)
+        recent_failure = False
+        if last_error:
+            recent_failure = True
+        elif intent_history:
+            recent = intent_history[-3:] if len(intent_history) > 3 else intent_history
+            for ih in recent:
+                if not ih.get("completed", False):
+                    recent_failure = True
+                    break
+
+        # Query spatial memory for target status
+        target_seen = False
+        target_visible = False
+        target_distance: float | None = None
+
+        if primary and memory is not None:
+            target_seen = memory.has_type(primary)
+            target_visible = memory.is_type_visible(primary)
+            if target_visible:
+                target_distance = memory.get_type_distance(primary)
+            elif target_seen:
+                target_distance = memory.get_remembered_type_distance(primary)
+
+        # Fallback: check visible_objects when memory unavailable
+        if primary and not target_seen and memory is None:
+            for obj in visible_objects:
+                if obj.get("visibleBounds2D") and obj.get("objectType") == primary:
+                    target_visible = True
+                    target_seen = True
+                    surf = _surface_position(agent_pos, obj) if agent_pos else None
+                    if surf and agent_pos:
+                        dx = surf["x"] - agent_pos["x"]
+                        dz = surf["z"] - agent_pos["z"]
+                        target_distance = math.sqrt(dx * dx + dz * dz)
+                    break
+
+        # Also check visible_objects even when memory exists (may not be updated yet)
+        if primary and not target_visible and memory is not None:
+            for obj in visible_objects:
+                if obj.get("visibleBounds2D") and obj.get("objectType") == primary:
+                    target_visible = True
+                    if target_distance is None:
+                        surf = _surface_position(agent_pos, obj) if agent_pos else None
+                        if surf and agent_pos:
+                            dx = surf["x"] - agent_pos["x"]
+                            dz = surf["z"] - agent_pos["z"]
+                            target_distance = math.sqrt(dx * dx + dz * dz)
+                    break
+
+        # Phase decision
+        if recent_failure:
+            return "recovery"
+
+        if primary is None:
+            return "exploration"
+
+        if not target_seen:
+            return "exploration"
+
+        if target_visible and target_distance is not None and target_distance <= 0.5:
+            return "interaction"
+
+        if target_visible and target_distance is not None and target_distance > 0.5:
+            return "approach"
+
+        if target_seen and not target_visible:
+            return "navigation"
+
+        return "exploration"
+
+    def _get_phase_block(self, phase: str) -> str:
+        """Return the phase-specific guardrail text to inject into the prompt."""
+        return PHASE_RULES.get(phase, "")
+
+    # ------------------------------------------------------------------
+    # Contrastive Planner (Spike 004): explore-biased intent proposal
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _should_activate_contrastive(intent_history: list[dict] | None) -> bool:
+        """Gating condition for contrastive dual-planner.
+
+        Only activate when the Planner appears stuck in a fixation loop:
+        the last 3 intent history entries all targeted the same location type.
+
+        This avoids doubling API calls on every step — based on the Dynamic
+        Self-Consistency (RASC, 2024) insight that extra samples are only
+        needed when the model is uncertain/stuck.
+        """
+        if not intent_history or len(intent_history) < 3:
+            return False
+        recent = intent_history[-3:]
+        targets = [ih.get("target", "") for ih in recent]
+        # All 3 must have a non-empty target AND all be the same
+        if not all(targets):
+            return False
+        if len(set(targets)) != 1:
+            return False
+        # All 3 must be incomplete (failed or abandoned)
+        if all(ih.get("completed", False) for ih in recent):
+            return False
+        return True
+
+    def plan_intent_explore(
+        self,
+        task_goal: str,
+        image: np.ndarray,
+        visible_objects: list[dict],
+        action_history: list[dict],
+        last_error: str | None,
+        agent_pos: dict = None,
+        agent_rot_y: float = 0.0,
+        inventory_objects: list[dict] | None = None,
+        hand_status: str = "",
+        task_criteria: str = "",
+        memory_text: str = "",
+        intent_history: list[dict] | None = None,
+        memory=None,
+    ) -> dict:
+        """Propose an explore-biased intent. Same context as plan_intent() but:
+        - Uses EXPLORE_BIAS_SYSTEM instead of PLANNER_SYSTEM
+        - Injects explicit "avoid these recently targeted locations" warning
+        - Prioritizes unvisited receptacles from spatial memory
+
+        Based on the DiscussNav (ICRA 2024) principle: diverse expert
+        perspectives produce better navigation decisions than a single view.
+        """
+        lines = [f"Task goal: {task_goal}\n"]
+
+        if memory_text:
+            lines.append(memory_text)
+            lines.append("")
+        if hand_status:
+            lines.append(f"HAND STATUS: {hand_status}")
+        if task_criteria:
+            lines.append(f"\nTASK COMPLETION CRITERIA:\n{task_criteria}")
+
+        # ── Exploration bias: list recently targeted locations to AVOID ──
+        if intent_history:
+            # Collect unique targets from recent incomplete intents
+            recent_targets: list[str] = []
+            for ih in reversed(intent_history[-10:]):
+                t = ih.get("target", "")
+                if t and t not in recent_targets:
+                    recent_targets.append(t)
+                if len(recent_targets) >= 5:
+                    break
+
+            if recent_targets:
+                lines.append("\n" + "=" * 50)
+                lines.append("EXPLORATION MODE — AVOID THESE RECENTLY TARGETED LOCATIONS:")
+                for t in recent_targets:
+                    lines.append(f"  - {t}")
+                lines.append("Choose a DIFFERENT location. Prioritize ones you have NOT yet visited.")
+                lines.append("=" * 50)
+
+            # Unified intent tree — replaces both "Intent history" and "Full EB history"
+            tree_text = render_intent_tree(intent_history, action_history)
+            if tree_text:
+                lines.append(tree_text)
+                lines.append("")
+
+        visible = [o for o in visible_objects if o.get("visibleBounds2D")]
+        if visible:
+            lines.append("\nObjects in view — direction relative to your facing:")
+            for o in visible[:12]:
+                extra = []
+                if o.get("isPickedUp"): extra.append("held")
+                if o.get("receptacle"): extra.append("receptacle")
+                if o.get("openable"): extra.append("open")
+                if o.get("toggleable"): extra.append("on" if o.get("isToggled") else "off")
+                tag = f" ({','.join(extra)})" if extra else ""
+                d = ""
+                if agent_pos and o.get("position"):
+                    d = " <- " + _direction_for_obj(agent_pos, agent_rot_y, o)
+                lines.append(f"  {o['objectType']}{tag}{d}")
+        else:
+            lines.append("\n(No objects in view — you may be facing a wall. Rotate or MoveBack.)")
+
+        if last_error:
+            lines.append(f"\nLast error: {last_error}")
+
+        lines.append("\nPropose the next intent. EXPLORATION MODE: prioritize unvisited locations.")
+        lines.append("Be specific. Output JSON only.")
+        prompt = "\n".join(lines)
+
+        result = self.client.chat_with_image_json(
+            system_prompt=EXPLORE_BIAS_SYSTEM,
+            user_text=prompt,
+            image=image,
+            required_fields=("intent", "target", "reasoning"),
+        )
+
+        # ── Still apply dedup check to explore intents ──
+        if self.enable_intent_dedup and intent_history and memory is not None:
+            intent = result.get("intent", "")
+            target = result.get("target", "")
+            blocked, warning, fallback_intent = self._check_intent_dedup(
+                intent, target, intent_history, memory, task_goal,
+            )
+            if blocked:
+                result["intent"] = fallback_intent
+                result["target"] = ""
+                original_reasoning = result.get("reasoning", "")
+                result["reasoning"] = (
+                    f"[DEDUP OVERRIDE] Original explore intent '{intent} {target}' "
+                    f"blocked after repeated failures. Fallback: {fallback_intent}. "
+                    f"{original_reasoning}"
+                )
+                result["dedup_blocked"] = True
+                result["dedup_original_intent"] = intent
+                result["dedup_original_target"] = target
+            elif warning:
+                self._pending_dedup_constraint = warning
+                result["dedup_warning"] = warning
+
+        return result
+
+    # ==================================================================
+    # Contrastive Selector (Spike 004): pick between exploit (A) and explore (B)
+    # ==================================================================
+
+    @staticmethod
+    def select_intent(
+        intent_a: dict,
+        intent_b: dict,
+        intent_history: list[dict] | None = None,
+    ) -> tuple[dict, str, str]:
+        """Select between two Planner proposals: A (exploit, standard) and B (explore).
+
+        Selection heuristics (in priority order):
+        1. If A matches a previously-tried-and-failed intent AND B does not -> pick B
+        2. If A's (intent, target) pair appears 2+ times in recent history -> pick B
+        3. If B's intent is identical to A's -> pick A (B added no diversity)
+        4. Default: pick A (exploit is more efficient when not stuck)
+
+        Returns (selected_intent_dict, chosen_label, reason_string).
+
+        Grounded in:
+        - Self-Consistency (Wang et al. 2022): majority-vote among diverse samples.
+          Here, with only 2 samples, we use heuristic selection instead of voting.
+        - DiscussNav (ICRA 2024): the "Decision Testing Expert" evaluates competing
+          proposals and picks the best one using task-specific criteria.
+        """
+        intent_history = intent_history or []
+
+        a_intent = intent_a.get("intent", "")
+        a_target = intent_a.get("target", "")
+        b_intent = intent_b.get("intent", "")
+        b_target = intent_b.get("target", "")
+
+        # ── Heuristic 1: A repeats a known-failed intent ──
+        a_failed_before = False
+        b_failed_before = False
+        for ih in intent_history:
+            if not ih.get("completed", False):
+                if (ih.get("intent"), ih.get("target")) == (a_intent, a_target):
+                    a_failed_before = True
+                if (ih.get("intent"), ih.get("target")) == (b_intent, b_target):
+                    b_failed_before = True
+        if a_failed_before and not b_failed_before:
+            return intent_b, "B", "A_intent_matches_known_failure"
+
+        # ── Heuristic 2: A has been tried 2+ times recently ──
+        recent = intent_history[-5:] if len(intent_history) > 5 else intent_history
+        a_count = sum(
+            1 for ih in recent
+            if (ih.get("intent"), ih.get("target")) == (a_intent, a_target)
+        )
+        if a_count >= 2:
+            return intent_b, "B", f"A_intent_tried_{a_count}_times"
+
+        # ── Heuristic 3: B added no diversity (same as A) ──
+        if (a_intent, a_target) == (b_intent, b_target):
+            return intent_a, "A", "intents_identical"
+
+        # ── Heuristic 4: B targets a SEARCHED receptacle → pick A ──
+        # (B is wasting time revisiting a known-empty location)
+        b_has_searched = "[SEARCHED]" in intent_b.get("reasoning", "")
+        if b_has_searched:
+            return intent_a, "A", "B_targets_searched_receptacle"
+
+        # ── Default: prefer A (exploit is more efficient) ──
+        return intent_a, "A", "default_prefer_exploit"
 
     # ------------------------------------------------------------------
     # Planner: review Executor's action sequence
@@ -542,7 +1543,7 @@ class EBAgent:
                 tag = f" ({','.join(extra)})" if extra else ""
                 d = ""
                 if agent_pos and o.get("position"):
-                    d = " <- " + _direction(agent_pos, agent_rot_y, o["position"])
+                    d = " <- " + _direction_for_obj(agent_pos, agent_rot_y, o)
                 lines.append(f"  {o['objectType']}{tag}{d}")
         else:
             lines.append("(No objects in view)")
@@ -722,7 +1723,6 @@ OUTPUT — valid JSON only:
             images=look_images,
             required_fields=("face_direction", "intent", "target", "reasoning"),
         )
-        return result
         return result
 
     def diagnose_failure(

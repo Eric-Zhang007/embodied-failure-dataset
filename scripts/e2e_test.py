@@ -38,14 +38,29 @@ def run_one(args, task_type, traj_path, n, total):
     prefix = f"[{n}/{total}]" if total > 1 else ""
 
     # Each worker creates its own agents (VLMClient is not thread-safe across models)
-    eb_client = VLMClient.siliconflow(args.eb_model, args.api_key)
-    oracle_client = VLMClient.siliconflow(args.oracle_model, args.api_key)
-    executor_client = VLMClient.siliconflow(args.executor_model, args.api_key)
-    eb_agent = EBAgent(eb_client)
+    planner_client = VLMClient.openai(
+        args.planner_model, args.api_key,
+        base_url=args.api_base_url,
+        reasoning_effort=args.planner_reasoning_effort,
+    )
+    executor_client = VLMClient.openai(
+        args.executor_model, args.api_key,
+        base_url=args.api_base_url,
+        reasoning_effort=args.executor_reasoning_effort,
+    )
+    oracle_client = VLMClient.openai(
+        args.oracle_model, args.api_key,
+        base_url=args.api_base_url,
+        reasoning_effort=args.oracle_reasoning_effort,
+    )
+    eb_agent = EBAgent(planner_client)
     oracle_agent = OracleAgent(oracle_client)
     executor_agent = ExecutorAgent(executor_client)
 
     trap_planner = None if args.no_traps else TrapPlanner()
+
+    # Compute ablation flags: --ablation includes spikes to DISABLE
+    ablation_set = set(args.ablation)
     result = run_single_branch(
         traj_path=traj_path,
         eb_agent=eb_agent,
@@ -55,6 +70,13 @@ def run_one(args, task_type, traj_path, n, total):
         enable_fork=False,
         step_limit_multiplier=2,
         executor_agent=executor_agent,
+        enable_searched_markers="001" not in ablation_set,
+        enable_intent_dedup="002a" not in ablation_set,
+        enable_critic_guard="002b" in ablation_set,  # 002b is off by default; --ablation 002b ENABLES it
+        enable_curiosity_scoreboard="003" not in ablation_set,
+        enable_contrastive_planner="004" not in ablation_set,
+        enable_progress_gating="005" not in ablation_set,
+        enable_search_trail="006" not in ablation_set,
     )
     print(f"{prefix} {task_type}: {ep_id} -> {result.termination_reason} ({result.total_steps} steps)")
     return task_type, ep_id, result
@@ -62,10 +84,17 @@ def run_one(args, task_type, traj_path, n, total):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--api-key", required=True)
-    parser.add_argument("--eb-model", default="Qwen/Qwen3-VL-32B-Instruct")
-    parser.add_argument("--oracle-model", default="Qwen/Qwen3-VL-32B-Instruct")
-    parser.add_argument("--executor-model", default="Qwen/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--api-key", required=True, help="OpenAI API key")
+    parser.add_argument("--api-base-url", default="https://api.fullcupai.com", help="OpenAI-compatible API base URL")
+    parser.add_argument("--planner-model", default="gpt-5.5")
+    parser.add_argument("--oracle-model", default="gpt-5.5")
+    parser.add_argument("--executor-model", default="gpt-5.5")
+    parser.add_argument("--planner-reasoning-effort", default="xhigh",
+                        choices=["low", "medium", "high", "xhigh", "max"])
+    parser.add_argument("--executor-reasoning-effort", default="medium",
+                        choices=["low", "medium", "high", "xhigh", "max"])
+    parser.add_argument("--oracle-reasoning-effort", default="xhigh",
+                        choices=["low", "medium", "high", "xhigh", "max"])
     parser.add_argument("--task", default="", help="Single ALFRED task_type")
     parser.add_argument("--all", action="store_true", help="Run all 7 task types in parallel")
     parser.add_argument("--data-dir", default="data/json_2.1.0")
@@ -73,6 +102,9 @@ def main():
     parser.add_argument("--no-traps", action="store_true")
     parser.add_argument("--random", action="store_true")
     parser.add_argument("--parallel", type=int, default=3, help="Max parallel workers for --all")
+    parser.add_argument("--ablation", nargs="*", default=[],
+                        choices=["001", "002a", "002b", "003", "004", "005", "006"],
+                        help="Disable specific spikes for ablation testing (e.g. --ablation 003 006)")
     args = parser.parse_args()
 
     if not args.output:
@@ -110,7 +142,11 @@ def main():
         sys.exit(1)
 
     # Warmup: send a single request to warm the API
-    warmup_client = VLMClient.siliconflow(args.eb_model, args.api_key)
+    warmup_client = VLMClient.openai(
+        args.planner_model, args.api_key,
+        base_url=args.api_base_url,
+        reasoning_effort=args.planner_reasoning_effort,
+    )
     print("Warming up API...", end=" ", flush=True)
     _t0 = _time.time()
     try:

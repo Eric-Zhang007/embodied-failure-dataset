@@ -18,7 +18,8 @@ from src.episode_manager import EpisodeManager
 from src.action_adapter import adapt, resolve_object_ids, _OBJECT_ACTIONS
 from src.task_conditions import check_task_complete, check_unrecoverable, detect_dead_loop, get_completion_criteria_text
 from src.context_builder import build_branch_history
-from src.egocentric_memory import EgocentricMemory
+from src.egocentric_memory import EgocentricMemory, SearchTrail
+from src.critic_guard import CriticGuard
 
 _VALID_ACTIONS = {
     "MoveAhead", "MoveBack", "MoveLeft", "MoveRight", "RotateLeft", "RotateRight", "LookUp", "LookDown",
@@ -61,6 +62,15 @@ class BranchRunner:
         enable_fork: bool = True,
         enable_phase2: bool = True,
         executor_agent=None,
+        enable_critic: bool = False,
+        critic_llm: bool = False,
+        enable_searched_markers: bool = True,
+        enable_intent_dedup: bool = True,
+        enable_critic_guard: bool = False,
+        enable_curiosity_scoreboard: bool = True,
+        enable_contrastive_planner: bool = True,
+        enable_progress_gating: bool = True,
+        enable_search_trail: bool = True,
     ):
         self.eb_agent = eb_agent
         self.oracle_agent = oracle_agent
@@ -71,6 +81,46 @@ class BranchRunner:
         self.enable_fork = enable_fork
         self.recorder = StepRecorder()
         self._last_scan_step = -100
+        self.enable_critic = enable_critic
+        # CriticGuard (002b): validates Planner intents before Executor execution
+        self.critic_guard = CriticGuard(
+            use_llm=critic_llm,
+            vlm_client=eb_agent.client if critic_llm else None,
+            max_regen_attempts=1,
+        )
+        # ── Ablation experiment flags ──
+        # Each controls whether a specific navigation spike is active.
+        # All default to True (enabled) to preserve current behavior,
+        # except 002b (CriticGuard) which defaults off (adds latency).
+        self.enable_searched_markers: bool = True     # 001 — mark receptacles as SEARCHED
+        self.enable_intent_dedup: bool = True          # 002a — block repeated failed intents
+        self.enable_critic_guard: bool = False         # 002b — pre-execution intent validation (default off)
+        self.enable_curiosity_scoreboard: bool = True   # 003 — multi-dim exploration priority table
+        self.enable_contrastive_planner: bool = True    # 004 — dual-intent (exploit vs explore) selection
+        self.enable_progress_gating: bool = True        # 005 — phase-aware guardrail injection
+        self.enable_search_trail: bool = True           # 006 — trail-based soft scoring of revisited areas
+
+    # ------------------------------------------------------------------
+    # Trail helper (Spike 006: search-trail-cost)
+    # ------------------------------------------------------------------
+
+    def _record_trail(self, trail: SearchTrail, metadata: dict) -> None:
+        """Record agent position in the trail grid after a successful step.
+        Guarded by enable_search_trail ablation flag (Spike 006)."""
+        if not self.enable_search_trail:
+            return
+        agent = metadata.get("agent", {})
+        pos = agent.get("position", {})
+        trail.record(pos.get("x", 0.0), pos.get("z", 0.0))
+
+    @staticmethod
+    def _render_trail(trail: SearchTrail, metadata: dict) -> str:
+        """Build trail text for Planner/Executor prompts."""
+        objects = metadata.get("objects", [])
+        receptacles = [o for o in objects if o.get("receptacle")]
+        if not receptacles:
+            return ""
+        return trail.render_summary(receptacles)
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -89,6 +139,23 @@ class BranchRunner:
         fork_source_ids: list[str] = []
         last_error: Optional[str] = None
 
+        # ── Propagate ablation flags to eb_agent ──
+        self.eb_agent.enable_intent_dedup = self.enable_intent_dedup
+        self.eb_agent.enable_curiosity_scoreboard = self.enable_curiosity_scoreboard
+        self.eb_agent.enable_progress_gating = self.enable_progress_gating
+
+        # ── Log ablation config to episode JSON for post-hoc analysis ──
+        ep.data["ablation_config"] = {
+            "001_searched_markers": self.enable_searched_markers,
+            "002a_intent_dedup": self.enable_intent_dedup,
+            "002b_critic_guard": self.enable_critic_guard,
+            "003_curiosity_scoreboard": self.enable_curiosity_scoreboard,
+            "004_contrastive_planner": self.enable_contrastive_planner,
+            "005_progress_gating": self.enable_progress_gating,
+            "006_search_trail": self.enable_search_trail,
+        }
+        ep._flush()
+
         failure_log_path = os.path.join(
             self.output_dir, ep.episode_id,
             f"failures_{config.branch_id}.jsonl",
@@ -104,6 +171,7 @@ class BranchRunner:
 
         failed_object_ids: set[str] = set()
         memory = EgocentricMemory()
+        trail = SearchTrail(resolution=0.5)
         intent_history: list[dict] = []  # completed/failed intent summaries
         current_intent = {"intent": "", "target": "", "steps": [], "start_step": 0}
         phase2_injection_count = 0
@@ -151,6 +219,7 @@ class BranchRunner:
                 ep.data.get("pddl_params", {}),
             )
             memory.update(metadata0, metadata0.get("objects", []), "LookAround", True, None, tc0)
+            self._record_trail(trail, metadata0)
             step_index = 1
             # Use new scan analysis to get direction + intent (not old propose_action)
             scan_result = self.eb_agent.analyze_scan_room(
@@ -229,18 +298,124 @@ class BranchRunner:
                     task_criteria=task_criteria,
                     memory_text=memory.render(),
                     intent_history=intent_history,
+                    memory=memory,
+                    trail_text=self._render_trail(trail, metadata) if self.enable_search_trail else "",
                 )
+                # ── Contrastive Planner (Spike 004): dual-intent selection ──
+                # Only activate when the Planner appears stuck (last 3 intents
+                # target the same location). Based on Dynamic Self-Consistency
+                # (RASC, 2024): extra samples only needed when uncertain.
+                if self.enable_contrastive_planner and EBAgent._should_activate_contrastive(intent_history):
+                    planner_intent_b = self.eb_agent.plan_intent_explore(
+                        task_goal=ep.data["task_goal"],
+                        image=image,
+                        visible_objects=metadata.get("objects", []),
+                        action_history=eb_history[-3:] if len(eb_history) > 3 else eb_history,
+                        last_error=last_error,
+                        agent_pos=agent_pose.get("position"),
+                        agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
+                        inventory_objects=inventory_objects,
+                        hand_status=hand_status,
+                        task_criteria=task_criteria,
+                        memory_text=memory.render(),
+                        intent_history=intent_history,
+                        memory=memory,
+                    )
+                    # Select between A (exploit) and B (explore)
+                    chosen, chosen_label, reason = EBAgent.select_intent(
+                        intent_a=planner_intent,
+                        intent_b=planner_intent_b,
+                        intent_history=intent_history,
+                    )
+                    self.eb_agent.contrastive_stats["activations"] += 1
+                    if chosen_label == "A":
+                        self.eb_agent.contrastive_stats["a_selected"] += 1
+                    else:
+                        self.eb_agent.contrastive_stats["b_selected"] += 1
+                    self.eb_agent.contrastive_stats["selections"].append({
+                        "step": step_index,
+                        "chosen": chosen_label,
+                        "a_intent": f"{planner_intent.get('intent','')} ({planner_intent.get('target','')})",
+                        "b_intent": f"{planner_intent_b.get('intent','')} ({planner_intent_b.get('target','')})",
+                        "reason": reason,
+                    })
+                    # Log the selection to failure log for later analysis
+                    self._write_failure_log(failure_log_path, {
+                        "step_index": step_index,
+                        "branch_id": config.branch_id,
+                        "failure_type": "contrastive_selection",
+                        "chosen": chosen_label,
+                        "reason": reason,
+                        "intent_a": {
+                            "intent": planner_intent.get("intent"),
+                            "target": planner_intent.get("target"),
+                            "reasoning": planner_intent.get("reasoning", "")[:200],
+                        },
+                        "intent_b": {
+                            "intent": planner_intent_b.get("intent"),
+                            "target": planner_intent_b.get("target"),
+                            "reasoning": planner_intent_b.get("reasoning", "")[:200],
+                        },
+                    })
+                    planner_intent = chosen
+
                 intent = planner_intent["intent"]
                 intent_target = planner_intent.get("target", "")
 
-                # Track intent — if intent changed, close previous and start new
+                # ── Meta-intent: UNMARK ──
+                # The Planner can explicitly undo a SEARCHED mark on a receptacle
+                # when it suspects the target was missed (occlusion, angle, etc.).
+                if intent.startswith("unmark "):
+                    receptacle_type = intent_target
+                    if not receptacle_type:
+                        receptacle_type = intent.split("unmark ", 1)[1].strip()
+                    count = memory.unmark_searched(object_type=receptacle_type)
+                    import logging
+                    if count > 0:
+                        logging.info(
+                            "UNMARK intent: unmarked %d instance(s) of '%s'",
+                            count, receptacle_type,
+                        )
+                    else:
+                        logging.debug(
+                            "UNMARK intent: no searched instances found for '%s'",
+                            receptacle_type,
+                        )
+                    last_error = None
+                    continue
+
+                # Trail soft scoring (Spike 006): warn if target area visited 3+ times
+                if self.enable_search_trail:
+                    _RECEPTACLE_INTENT_KW = ("approach", "open", "close", "check", "search", "look")
+                    if intent_target and any(kw in intent.lower() for kw in _RECEPTACLE_INTENT_KW):
+                        trail_score = _check_trail_revisit(trail, intent_target, metadata.get("objects", []))
+                        if trail_score >= 3:
+                            self.eb_agent._pending_trail_warning = (
+                                f"You have already visited the {intent_target} area "
+                                f"{int(trail_score)} times. Consider whether this is "
+                                f"productive -- are there unvisited areas to explore first?"
+                            )
+
+                # Track intent -- if intent changed, close previous and start new
                 prev_intent_key = (current_intent.get("intent", ""), current_intent.get("target", ""))
                 new_intent_key = (intent, intent_target)
                 if new_intent_key != prev_intent_key:
                     if current_intent.get("steps"):
                         current_intent["completed"] = current_intent["steps"][-1].get("success", False)
                         current_intent["end_step"] = step_index
+                        if not current_intent["completed"]:
+                            last_step = current_intent["steps"][-1]
+                            diag = last_step.get("eb_diagnosis", "")
+                            recovery = last_step.get("eb_recovery_reasoning", "")
+                            if diag:
+                                current_intent["eb_diagnosis"] = diag
+                            if recovery:
+                                current_intent["eb_recovery_reasoning"] = recovery
                         intent_history.append(dict(current_intent))
+                        # Mark receptacles as searched when agent moves on (Spike 001)
+                        if self.enable_searched_markers:
+                            _check_and_mark_searched(current_intent, intent_target, memory,
+                                                     enable_curiosity=self.enable_curiosity_scoreboard)
                     current_intent = {"intent": intent, "target": intent_target,
                                       "steps": [], "start_step": step_index}
 
@@ -302,7 +477,8 @@ class BranchRunner:
                     step_index += 1
                     memory.update(metadata, metadata.get("objects", []),
                                   "LookAround", True, None, task_criteria)
-                    # 32B multi-image analysis → direction + intent
+                    self._record_trail(trail, metadata)
+                    # 32B multi-image analysis -> direction + intent
                     scan_result = self.eb_agent.analyze_scan_room(
                         task_goal=ep.data["task_goal"],
                         look_images=look_images,
@@ -324,10 +500,63 @@ class BranchRunner:
                     metadata = snap["metadata"]
                     memory.update(metadata, metadata.get("objects", []),
                                   "LookAround", True, None, task_criteria)
+                    self._record_trail(trail, metadata)
                     # Use the new intent for Executor
                     intent = scan_result.get("intent", intent)
                     intent_target = scan_result.get("target", intent_target)
                     # Falls through to Executor below with the new intent
+
+                # -- CriticGuard (002b): validate intent before Executor --
+                if (self.enable_critic_guard or self.enable_critic) and intent not in ("Done", "scan room"):
+                    critic_result = self.critic_guard.check(
+                        intent=intent,
+                        target=intent_target,
+                        intent_history=intent_history,
+                        visible_objects=metadata.get("objects", []),
+                        memory_text=memory.render(),
+                        action_history=eb_history,
+                    )
+                    if not critic_result.get("approved"):
+                        self.critic_guard.stats.regen_attempted += 1
+                        feedback = self.critic_guard.feedback_for_planner(
+                            critic_result.get("reason", ""),
+                            critic_result.get("suggestion", ""),
+                        )
+                        regen_intent = self.eb_agent.plan_intent(
+                            task_goal=ep.data["task_goal"],
+                            image=image,
+                            visible_objects=metadata.get("objects", []),
+                            action_history=eb_history[-3:] if len(eb_history) > 3 else eb_history,
+                            last_error=last_error,
+                            agent_pos=agent_pose.get("position"),
+                            agent_rot_y=agent_pose.get("rotation", {}).get("y", 0.0),
+                            inventory_objects=inventory_objects,
+                            hand_status=hand_status,
+                            task_criteria=task_criteria,
+                            memory_text=memory.render(),
+                            intent_history=intent_history,
+                            critic_feedback=feedback,
+                            memory=memory,
+                        )
+                        intent = regen_intent.get("intent", intent)
+                        intent_target = regen_intent.get("target", intent_target)
+                        regen_critic = self.critic_guard.check(
+                            intent=intent,
+                            target=intent_target,
+                            intent_history=intent_history,
+                            visible_objects=metadata.get("objects", []),
+                            memory_text=memory.render(),
+                            action_history=eb_history,
+                        )
+                        if not regen_critic.get("approved"):
+                            self.critic_guard.stats.regen_rejected += 1
+                            # B13: Force hardcoded exploration fallback instead of
+                            # letting the second rejection through to the Executor.
+                            # Avoids wasting a Planner re-gen call on a third attempt.
+                            intent = "explore area"
+                            intent_target = ""
+                        else:
+                            self.critic_guard.stats.regen_approved += 1
 
                 # 2. Executor proposes actions (sees only current-intent history)
                 exec_result = self.executor_agent.execute_intent(
@@ -344,6 +573,8 @@ class BranchRunner:
                     memory_text=memory.render(),
                     failed_object_ids=failed_object_ids,
                     camera_horizon=agent_pose.get("cameraHorizon", 0.0),
+                    trail_text=self._render_trail(trail, metadata) if self.enable_search_trail else "",
+                    planner_reasoning=planner_intent.get("reasoning", ""),
                 )
 
                 # 3. Planner reviews — if rejected, Planner provides corrected actions
@@ -569,6 +800,7 @@ class BranchRunner:
                 step_index += 1
                 nonexecuted_retry_count = 0
                 memory.update(metadata, metadata.get("objects", []), "LookAround", True, None, task_criteria)
+                self._record_trail(trail, metadata)
 
                 eb_phase1 = self.eb_agent.propose_action_lookaround(
                     task_goal=ep.data["task_goal"],
@@ -647,8 +879,10 @@ class BranchRunner:
                     current_intent["steps"].append(step_entry)
                     step_index += 1
                     nonexecuted_retry_count = 0
-                    memory.update(metadata, metadata.get("objects", []),
+                    memory.update(seq_result["metadata"], seq_result["metadata"].get("objects", []),
                                   "MoveSequence", True, None, task_criteria)
+                    self._record_trail(trail, seq_result["metadata"])
+                    self._track_searched_receptacles(proposed_params)
                     # Restore image/metadata from final state
                     image = seq_result["frame"]
                     metadata = seq_result["metadata"]
@@ -672,7 +906,7 @@ class BranchRunner:
                     pending_step["error_type"] = "environment_failure"
                     diagnosis_history = eb_history + [pending_step]
                     # Track failed objectIds from the sequence
-                    obj_id = proposed_params.get("steps", [{}])[-1].get("objectId") if proposed_params.get("steps") else None
+                    obj_id = seq_result.get("failed_params", {}).get("objectId")
                     if obj_id:
                         failed_object_ids.add(obj_id)
                     # Phase 3: Planner diagnoses
@@ -689,6 +923,12 @@ class BranchRunner:
                         task_criteria=task_criteria,
                         memory_text=memory.render(),
                         current_intent=f"{current_intent.get('intent', '')} ({current_intent.get('target', '')})",
+                    )
+                    # C2: occlusion-aware unmark based on Phase-3 diagnosis
+                    _check_occlusion_unmark(
+                        eb_phase3.get("diagnosis", ""),
+                        current_intent.get("target", ""),
+                        memory,
                     )
                     # Phase 4: Oracle evaluates
                     oracle_phase4 = self.oracle_agent.evaluate_failure(
@@ -742,7 +982,7 @@ class BranchRunner:
                             rec_result = env.step(rec_act, **rec_adapt_params)
                             if rec_result.get("frame") is None:
                                 rec_result["frame"] = image
-                            memory.update(metadata, metadata.get("objects", []),
+                            memory.update(rec_result.get("metadata", metadata), rec_result.get("metadata", metadata).get("objects", []),
                                           rec_act, rec_result["success"],
                                           rec_result.get("error"), task_criteria)
                             # Build a dedicated recovery step entry
@@ -763,6 +1003,7 @@ class BranchRunner:
                                 last_error = None
                                 image = rec_result["frame"]
                                 metadata = rec_result["metadata"]
+                                self._record_trail(trail, metadata)
                             else:
                                 cascade_level += 1
                                 last_error = f"Recovery {rec_name} failed: {rec_result.get('error', '')}"
@@ -842,7 +1083,13 @@ class BranchRunner:
                 eb_history.append(step_entry)
                 step_index += 1
                 nonexecuted_retry_count = 0
-                memory.update(metadata, metadata.get("objects", []), act, True, None, task_criteria)
+                memory.update(result["metadata"], result["metadata"].get("objects", []), act, True, None, task_criteria)
+                self._record_trail(trail, result["metadata"])
+                if act == "OpenObject" and params.get("objectId"):
+                    for obj in result["metadata"].get("objects", []):
+                        if obj.get("objectId") == params["objectId"]:
+                            self.critic_guard.mark_receptacle_searched(obj.get("objectType", ""))
+                            break
                 continue
 
             # --- 环境失败 ---
@@ -852,7 +1099,7 @@ class BranchRunner:
             # --- 环境失败 → Phase 3 + Phase 4 (写 JSON) ---
             cascade_level += 1
             last_error = result["error"]
-            memory.update(metadata, metadata.get("objects", []), act, False, result["error"], task_criteria)
+            memory.update(result.get("metadata", metadata), result.get("metadata", metadata).get("objects", []), act, False, result["error"], task_criteria)
 
             # 追踪失败的 objectId
             obj_id = params.get("objectId")
@@ -879,6 +1126,13 @@ class BranchRunner:
                 task_criteria=task_criteria,
                 memory_text=memory.render(),
                 current_intent=f"{current_intent.get('intent', '')} ({current_intent.get('target', '')})",
+            )
+
+            # C2: occlusion-aware unmark based on Phase-3 diagnosis
+            _check_occlusion_unmark(
+                eb_phase3.get("diagnosis", ""),
+                current_intent.get("target", ""),
+                memory,
             )
 
             oracle_phase4 = self.oracle_agent.evaluate_failure(
@@ -1031,6 +1285,19 @@ class BranchRunner:
             "Re-think from the current image and output a valid JSON action."
         )
 
+    def _track_searched_receptacles(self, proposed_params: dict):
+        """Track receptacles opened/searched in a MoveSequence for CriticGuard."""
+        if not self.enable_critic:
+            return
+        steps = proposed_params.get("steps", [])
+        for step in steps:
+            action = step.get("action", "")
+            if action == "OpenObject":
+                sp = step.get("params", {})
+                obj_type = sp.get("objectType", "")
+                if obj_type:
+                    self.critic_guard.mark_receptacle_searched(obj_type)
+
     def _execute_move_sequence(self, params, env, metadata, failure_log_path,
                                 branch_id, step_index, episode_id,
                                 eb_reasoning, injection_decision):
@@ -1070,7 +1337,8 @@ class BranchRunner:
                 return (
                     {"success": False, "all_succeeded": False,
                      "error": msg,
-                     "executed": executed, "frame": final_frame, "metadata": final_metadata},
+                     "executed": executed, "frame": final_frame, "metadata": final_metadata,
+                     "failed_params": step.get("params", {})},
                     msg,
                 )
 
@@ -1087,7 +1355,8 @@ class BranchRunner:
                     msg = f"MoveSequence: {desc} succeeded, then invalid action '{action}' at step {i+1}."
                     return (
                         {"success": False, "error": msg, "partial": True,
-                         "executed": executed, "frame": final_frame, "metadata": final_metadata},
+                         "executed": executed, "frame": final_frame, "metadata": final_metadata,
+                         "failed_params": step_params},
                         msg,
                     )
                 current_objs = (final_metadata or metadata).get("objects", [])
@@ -1097,7 +1366,8 @@ class BranchRunner:
                     msg = f"MoveSequence partially executed: {desc}, then {action} failed — {warn}"
                     return (
                         {"success": False, "error": msg, "partial": True,
-                         "executed": executed, "frame": final_frame, "metadata": final_metadata},
+                         "executed": executed, "frame": final_frame, "metadata": final_metadata,
+                         "failed_params": resolved},
                         msg,
                     )
                 act, params = adapt(action, resolved)
@@ -1109,7 +1379,8 @@ class BranchRunner:
                 msg = f"MoveSequence: {desc} succeeded, then unknown action '{action}' at step {i+1}."
                 return (
                     {"success": False, "error": msg, "partial": True,
-                     "executed": executed, "frame": final_frame, "metadata": final_metadata},
+                     "executed": executed, "frame": final_frame, "metadata": final_metadata,
+                     "failed_params": step_params},
                     msg,
                 )
 
@@ -1146,6 +1417,7 @@ class BranchRunner:
                              "executed": executed,
                              "failed_action": action,
                              "failed_at_repeat": succeeded,
+                             "failed_params": params,
                              "frame": (final_frame if final_frame is not None else result["frame"]),
                              "metadata": (final_metadata if final_metadata is not None else result["metadata"])},
                             msg,
@@ -1157,6 +1429,7 @@ class BranchRunner:
                         )
                         return (
                             {"success": False, "error": msg, "partial": False,
+                             "failed_params": params,
                              "frame": result["frame"], "metadata": result["metadata"]},
                             msg,
                         )
@@ -1271,6 +1544,8 @@ class BranchRunner:
         }
         if result.branch_id == "main":
             outcome["main_branch"] = branch_entry
+            # Include dedup statistics in episode outcome for analysis
+            outcome["dedup_stats"] = dict(self.eb_agent.dedup_stats)
         else:
             branch_entry["fork_source_step_id"] = (
                 fork_source_ids[0] if fork_source_ids else
@@ -1281,6 +1556,172 @@ class BranchRunner:
             )
             outcome["forks"].append(branch_entry)
         ep.set_final_outcome(outcome)
+
+
+# ======================================================================
+# Searched-markers / occlusion-unmark helpers
+# ======================================================================
+
+
+# C2: Phrases in Phase 3 diagnosis that suggest the target might be occluded
+# inside a previously-searched receptacle. When detected, the searched flag
+# on that receptacle is cleared so the agent can re-check it.
+_OCCLUSION_DIAGNOSIS_PHRASES: tuple[str, ...] = (
+    "might be occluded", "could be behind", "possibly missed",
+    "may be hidden", "might be inside", "could be blocked",
+    "not visible but might be", "possibly inside",
+)
+
+
+def _check_occlusion_unmark(
+    diagnosis: str,
+    target: str,
+    memory: "EgocentricMemory",
+) -> bool:
+    """If the Phase-3 diagnosis suggests the target might be occluded inside a
+    previously-searched receptacle, unmark that receptacle so it can be
+    re-checked. Returns True if any entry was unmarked."""
+    if not diagnosis or not target:
+        return False
+    diag_lower = diagnosis.lower()
+    if any(phrase in diag_lower for phrase in _OCCLUSION_DIAGNOSIS_PHRASES):
+        count = memory.unmark_searched(object_type=target)
+        if count > 0:
+            import logging
+            logging.info(
+                "C2 occlusion-unmark: unmarked %d instance(s) of '%s' "
+                "based on diagnosis",
+                count, target,
+            )
+            return True
+    return False
+
+
+def _check_trail_revisit(
+    trail: "SearchTrail",
+    target_type: str,
+    visible_objects: list[dict],
+) -> float:
+    """Check how many times the grid cell around a receptacle type has been visited.
+
+    Args:
+        trail: SearchTrail instance.
+        target_type: objectType to look up (e.g. "Fridge").
+        visible_objects: current frame's objects with position data.
+
+    Returns:
+        Max revisit score among all objects of that type (0.0 = never visited).
+    """
+    max_score = 0.0
+    for obj in visible_objects:
+        if obj.get("objectType") == target_type:
+            pos = obj.get("position", {})
+            score = trail.revisit_score(pos.get("x", 0), pos.get("z", 0))
+            if score > max_score:
+                max_score = score
+    return max_score
+
+
+def _extract_object_id_from_intent(completed_intent: dict) -> str | None:
+    """Try to extract a specific objectId from a completed intent's step history.
+
+    For single-action steps (non-MoveSequence), action_params carries the
+    resolved objectId.  For MoveSequence, sub-step params may carry objectType
+    (original Executor output, not yet resolved) — in that case we return None
+    so the caller can fall back to type-level marking.
+    """
+    for step in completed_intent.get("steps", []):
+        action = step.get("action", "")
+        if action == "MoveSequence":
+            for sub in step.get("action_params", {}).get("steps", []):
+                if sub.get("action") in ("OpenObject", "CloseObject"):
+                    oid = sub.get("params", {}).get("objectId")
+                    if oid:
+                        return oid
+        elif action in ("OpenObject", "CloseObject"):
+            oid = step.get("action_params", {}).get("objectId")
+            if oid:
+                return oid
+    return None
+
+
+def _check_and_mark_searched(
+    completed_intent: dict,
+    new_target: str,
+    memory: "EgocentricMemory",
+    enable_curiosity: bool = True,
+) -> None:
+    """Mark receptacles as searched when the Planner moves on.
+
+    Called at intent transition. Triggers when:
+    - Old intent had a target (old_target != "").
+    - New intent targets something different (old_target != new_target).
+    - The intent involved receptacle interaction (OpenObject/CloseObject)
+      OR the intent phrase suggests approach/check/open/close/search behaviour
+      AND the last step succeeded (prevents marking on failures).
+
+    C1 fix: resolves the specific objectId from the intent's step history
+    before marking, so that only the interacted-with instance is marked,
+    not every instance of that type in the scene.
+    """
+    import logging
+
+    old_target = completed_intent.get("target", "")
+    old_intent = completed_intent.get("intent", "")
+    completed_ok = completed_intent.get("completed", False)
+
+    if not old_target:
+        return
+    if old_target == new_target:
+        return
+
+    steps = completed_intent.get("steps", [])
+
+    # ----- detect explicit receptacle interaction -----
+    had_receptacle_interaction = False
+    for step in steps:
+        action = step.get("action", "")
+        if action == "MoveSequence":
+            for sub in step.get("action_params", {}).get("steps", []):
+                if sub.get("action") in ("OpenObject", "CloseObject"):
+                    had_receptacle_interaction = True
+                    break
+        elif action in ("OpenObject", "CloseObject"):
+            had_receptacle_interaction = True
+        if had_receptacle_interaction:
+            break
+
+    # ----- detect approach / already-open patterns -----
+    _RECEPTACLE_INTENT_KW = ("approach", "open", "close", "check", "search", "look")
+    is_receptacle_intent = any(
+        kw in old_intent.lower() for kw in _RECEPTACLE_INTENT_KW
+    )
+
+    if had_receptacle_interaction or (is_receptacle_intent and completed_ok):
+        # C1: resolve to specific objectId when possible
+        specific_id = _extract_object_id_from_intent(completed_intent)
+        if specific_id:
+            count = memory.mark_searched(object_id=specific_id)
+            if count > 0:
+                logging.debug(
+                    "marked objectId '%s' as SEARCHED "
+                    "(intent='%s' completed=%s interaction=%s)",
+                    specific_id, old_intent, completed_ok, had_receptacle_interaction,
+                )
+        else:
+            count = memory.mark_searched(object_type=old_target)
+            if count > 0:
+                logging.warning(
+                    "C1 fallback: no specific objectId found for intent '%s' "
+                    "target='%s' — marked %d instance(s) by objectType only",
+                    old_intent, old_target, count,
+                )
+
+        # ── Spike 003: Curiosity Scoreboard visitation tracking ──
+        if enable_curiosity:
+            memory.record_receptacle_visit(old_target)
+            if had_receptacle_interaction:
+                memory.record_receptacle_open(old_target)
 
 
 # ======================================================================
@@ -1430,6 +1871,15 @@ def run_single_branch(
     enable_fork: bool = False,
     step_limit_multiplier: int = 4,
     executor_agent=None,
+    enable_critic: bool = False,
+    critic_llm: bool = False,
+    enable_searched_markers: bool = True,
+    enable_intent_dedup: bool = True,
+    enable_critic_guard: bool = False,
+    enable_curiosity_scoreboard: bool = True,
+    enable_contrastive_planner: bool = True,
+    enable_progress_gating: bool = True,
+    enable_search_trail: bool = True,
 ) -> BranchResult:
     """
     一个 episode 的完整生命周期：加载数据 → 初始化环境 → 陷阱 → 跑分支。
@@ -1491,7 +1941,16 @@ def run_single_branch(
                               step_limit_multiplier=step_limit_multiplier,
                               enable_fork=enable_fork,
                               enable_phase2=(trap_planner is not False and trap_planner is not None),
-                              executor_agent=executor_agent)
+                              executor_agent=executor_agent,
+                              enable_critic=enable_critic,
+                              critic_llm=critic_llm,
+                              enable_searched_markers=enable_searched_markers,
+                              enable_intent_dedup=enable_intent_dedup,
+                              enable_critic_guard=enable_critic_guard,
+                              enable_curiosity_scoreboard=enable_curiosity_scoreboard,
+                              enable_contrastive_planner=enable_contrastive_planner,
+                              enable_progress_gating=enable_progress_gating,
+                              enable_search_trail=enable_search_trail)
 
         config = BranchConfig(
             episode_id=episode_id,

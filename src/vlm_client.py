@@ -73,11 +73,13 @@ class VLMClient:
         global _api_log_dir
         _api_log_dir = Path(log_dir) if log_dir else None
 
-    def __init__(self, backend: str, model: str, base_url: str = None, api_key: str = None):
+    def __init__(self, backend: str, model: str, base_url: str = None, api_key: str = None,
+                 reasoning_effort: str | None = None):
         self.backend = backend
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
+        self.reasoning_effort = reasoning_effort  # "low" | "medium" | "high" | "xhigh" | "max"
 
     # ------------------------------------------------------------------
     # 工厂方法
@@ -87,21 +89,27 @@ class VLMClient:
         return cls(backend="ollama", model=model, base_url=host)
 
     @classmethod
-    def openrouter(cls, model: str = "anthropic/claude-opus-4", api_key: str = None) -> "VLMClient":
+    def openrouter(cls, model: str = "anthropic/claude-opus-4", api_key: str = None,
+                   reasoning_effort: str | None = None) -> "VLMClient":
         key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         return cls(backend="openai", model=model,
-                   base_url="https://openrouter.ai/api/v1", api_key=key)
+                   base_url="https://openrouter.ai/api/v1", api_key=key,
+                   reasoning_effort=reasoning_effort)
 
     @classmethod
-    def openai(cls, model: str = "gpt-5", api_key: str = None, base_url: str = None) -> "VLMClient":
+    def openai(cls, model: str = "gpt-5", api_key: str = None, base_url: str = None,
+               reasoning_effort: str | None = None) -> "VLMClient":
         key = api_key or os.environ.get("OPENAI_API_KEY", "")
         url = base_url or "https://api.openai.com/v1"
-        return cls(backend="openai", model=model, base_url=url, api_key=key)
+        return cls(backend="openai", model=model, base_url=url, api_key=key,
+                   reasoning_effort=reasoning_effort)
 
     @classmethod
-    def siliconflow(cls, model: str, api_key: str) -> "VLMClient":
+    def siliconflow(cls, model: str, api_key: str,
+                    reasoning_effort: str | None = None) -> "VLMClient":
         return cls(backend="openai", model=model,
-                   base_url="https://api.siliconflow.cn/v1", api_key=api_key)
+                   base_url="https://api.siliconflow.cn/v1", api_key=api_key,
+                   reasoning_effort=reasoning_effort)
 
     # ------------------------------------------------------------------
     # 核心调用
@@ -311,6 +319,8 @@ class VLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
         if json_mode:
             body["response_format"] = {"type": "json_object"}
 
@@ -333,10 +343,13 @@ class VLMClient:
                 )
                 elapsed = time.time() - t_start
                 if resp.status_code == 200:
-                    content = resp.json()["choices"][0]["message"]["content"]
-                    logger.debug("RESP model=%s status=200 elapsed=%.1fs content_len=%d preview=%s",
-                                 self.model, elapsed, len(content), content[:500])
-                    self._write_api_exchange(body, 200, content, elapsed, attempt + 1)
+                    msg = resp.json()["choices"][0]["message"]
+                    content = msg["content"]
+                    reasoning = msg.get("reasoning_content", "")
+                    logger.debug("RESP model=%s status=200 elapsed=%.1fs content_len=%d reasoning_len=%d preview=%s",
+                                 self.model, elapsed, len(content), len(reasoning or ""), content[:500])
+                    self._write_api_exchange(body, 200, content, elapsed, attempt + 1,
+                                             reasoning_content=reasoning or None)
                     return content
                 # 429: rate limited - wait and retry
                 if resp.status_code == 429:
@@ -345,7 +358,19 @@ class VLMClient:
                     logger.warning("RATE_LIMIT retry %d/3 wait %ds", attempt + 1, wait)
                     time.sleep(wait)
                     continue
-                # Other errors: dump and raise
+                # 5xx: server errors (502/503/504/524) — transient, retry with backoff
+                if resp.status_code >= 500:
+                    self._write_api_exchange(body, resp.status_code, resp.text, elapsed, attempt + 1)
+                    if attempt < 2:
+                        wait = 2 ** attempt  # 1s, 2s
+                        logger.warning("SERVER_ERR retry %d/3 status=%d wait=%ds",
+                                       attempt + 1, resp.status_code, wait)
+                        time.sleep(wait)
+                        continue
+                    # All retries exhausted — dump and raise
+                    self._dump_failure(body, resp.status_code, resp.text, elapsed)
+                    resp.raise_for_status()
+                # Other errors (4xx client errors): dump and raise immediately
                 self._write_api_exchange(body, resp.status_code, resp.text, elapsed, attempt + 1)
                 self._dump_failure(body, resp.status_code, resp.text, elapsed)
                 resp.raise_for_status()
@@ -393,7 +418,8 @@ class VLMClient:
         logger.error("FAILURE_DUMP model=%s status=%s elapsed=%.1fs dump=%s",
                      self.model, status, elapsed, dump_path)
 
-    def _write_api_exchange(self, body: dict, status, response_text: str, elapsed: float, attempt: int):
+    def _write_api_exchange(self, body: dict, status, response_text: str, elapsed: float, attempt: int,
+                            reasoning_content: str | None = None):
         if not LOG_FULL_API:
             return
         entry = {
@@ -406,6 +432,8 @@ class VLMClient:
             "request_body": _sanitize_for_log(body),
             "response": response_text,
         }
+        if reasoning_content:
+            entry["reasoning_content"] = reasoning_content
         log_path = _get_api_log_path()
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
