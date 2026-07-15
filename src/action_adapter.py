@@ -76,7 +76,11 @@ def resolve_object_ids(action: str, params: dict, visible_objects: list[dict]):
         if not candidates:
             candidates = [o for o in visible_objects
                       if o["objectType"] == ot and o.get("pickupable")]
-        if not candidates:
+        # Priority 4 (any match): only for non-pickup actions like open/close/toggle
+        # FOR PICKUP: do NOT fall through to invisible objects — they may be inside
+        # containers or otherwise unreachable, and the model may be confusing them
+        # with a similar-looking visible object (e.g. Tomato vs Apple)
+        if not candidates and action not in ("PickupObject",):
             candidates = [o for o in visible_objects
                       if o["objectType"] == ot]
         if candidates:

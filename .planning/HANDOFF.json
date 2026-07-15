@@ -1,0 +1,77 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-07-15T15:00:00.000Z",
+  "phase": "runtime-debug",
+  "phase_name": "real E2E and parallel pipeline debugging",
+  "phase_dir": ".planning",
+  "plan": 1,
+  "task": 6,
+  "total_tasks": 6,
+  "status": "complete",
+  "completed_tasks": [
+    {
+      "id": 1,
+      "name": "Validate strict Executor and action boundaries",
+      "status": "done",
+      "progress": "Focused 13/13, full 35/35, and py_compile passed in WSL."
+    },
+    {
+      "id": 2,
+      "name": "Run real no-trap E2E",
+      "status": "done",
+      "progress": "Correct /v1 endpoint produced task_complete, exposed restoration bug."
+    },
+    {
+      "id": 3,
+      "name": "Fix ALFRED pose restoration across runtime suffix changes",
+      "status": "done",
+      "progress": "Type-plus-nearest-position fallback implemented and regression added."
+    },
+    {
+      "id": 4,
+      "name": "Harden HTTP-200 OpenAI-compatible response parsing",
+      "status": "done",
+      "progress": "_extract_content_from_200 with 5-stage validation. 3x retry. reasoning_effort fallback. 12 tests."
+    },
+    {
+      "id": 5,
+      "name": "Fix and exercise run_pipeline.py / Scheduler parallel orchestration",
+      "status": "done",
+      "progress": "Per-worker agent isolation via _create_agents(). Fixed accounting. 9 scheduler tests. 58/58 suite."
+    },
+    {
+      "id": 6,
+      "name": "Run action-path no-trap E2E and inspect API, episode, failure logs, and images",
+      "status": "done",
+      "progress": "pick_and_place_simple (SoapBottle→Toilet): task_complete in 6 steps. Full pipeline: scan→plan_intent→execute_intent→review→MoveSequence→Phase3 recovery→Phase4 Oracle→put→Done. Executor output valid move sequences with repeat. Phase 3 correctly diagnosed cabinet collision. All images captured."
+    }
+  ],
+  "remaining_tasks": [],
+  "blockers": [],
+  "async_jobs": [],
+  "human_actions_pending": [],
+  "decisions": [
+    {
+      "decision": "Default reasoning_effort to medium (not xhigh) for image-based gpt-5.5 calls.",
+      "rationale": "Multi-image xhigh returns reasoning_content only (no content). 1-image no-reasoning also returns None. Medium works for both text and images. Affects planner/oracle defaults in all scripts + config.toml.",
+      "phase": "runtime-debug"
+    },
+    {
+      "decision": "Add reasoning_effort auto-strip fallback in _chat_openai.",
+      "rationale": "When content is None but reasoning_content present, 2nd retry strips reasoning_effort to try without thinking mode. Third retry keeps original params.",
+      "phase": "runtime-debug"
+    },
+    {
+      "decision": "Create per-worker agents via _create_agents factory.",
+      "rationale": "EBAgent has dedup_stats, _current_phase, curiosity_stats. Sharing across threads is undefined behavior.",
+      "phase": "runtime-debug"
+    },
+    {
+      "decision": "Add camera horizon epsilon tolerance.",
+      "rationale": "30.0 + 30.0 yields 60.00000000000001 from float addition, breaking <= 60.0 boundary check. Added 1e-9 epsilon.",
+      "phase": "runtime-debug"
+    }
+  ],
+  "next_action": "Runtime-debug phase complete. Pipeline is end-to-end validated on pick_and_place_simple. Ready for broader --all runs or next milestone phase.",
+  "context_notes": "E2E validated: Planner→Executor→Review→MoveSequence→Phase3→Phase4→Done loop works. Executor outputs repeat, reviewer approves, recovery works. 58/58 tests pass. Output at output_e2e_20260715_145733/."
+}

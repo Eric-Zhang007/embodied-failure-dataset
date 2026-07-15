@@ -1,176 +1,237 @@
-# Milestone M1 — 系统完善 · Session Summary (2026-07-13/14)
+# MILESTONE SUMMARY — vM1: System Stabilization & Semantic Memory
 
-**Generated:** 2026-07-14
-**Purpose:** Team onboarding and project review
-**Contributors:** Eric Zhang (@Eric-Zhang007), Claude, laoma9604-design (PR #2)
-
----
-
-## 1. Project Overview
-
-**Embodied Failure Dataset** — 在 AI2-THOR 5.0.0 中运行 ALFRED 7 种任务，通过 Oracle Agent 注入陷阱制造失败场景，记录完整诊断、恢复尝试和反事实标注。目标用户：具身 AI / 机器人学习研究者。
-
-**核心架构**: Planner(32B) → Executor(8B) → Review(32B) → Execute 四阶段循环。Oracle(32B) 在 Phase 2 注入陷阱，Phase 4 评估失败。
-
-**本次 Session 跨越的 Phase:**
-- P1 (系统稳定性 + 意图记忆): ✅ 已在前序 session 完成
-- P2 (空间记忆语义化): 部分推进 — 语义先验表已建
-- P3 (模糊 Intent 分解): 通过 curiosity scoreboard 间接实现
-- P4 (系统性探索 + scan→scan 修复): **本次核心突破** — 6 个导航 spike 形成纵深防御
+**Generated:** 2026-07-15 | **Status:** P1+P2 modules complete, Runtime-Debug complete  
+**Next milestone:** vM2 — Scaled Data Generation (target: >30% E2E pass rate)
 
 ---
 
-## 2. Architecture & Technical Decisions
+## 1. Overview
 
-### 本次 Session 新增
+**What, Why, How, For whom**
 
-- **AABB 表面距离**: 物体列表中的距离从"到物体中心"改为"到最近碰撞面"。用 `axisAlignedBoundingBox.cornerPoints` 计算。Fridge 距离从 1.1m（中心）→ 0.5m（表面），消除 Executor 的步数误判。
-  
-- **Intent Tree 历史**: Planner 看到的不是两个独立的 JSONL dump，而是一个统一的按 intent 组织的树状结构（`▼ approach Fridge — ▸ s1: MoveSequence [FAIL] — └─ diagnosed: ...`）。Executor 只看当前 intent 的历史。
+Embodied Failure Dataset generates cascading failure + counterfactual reasoning datasets for embodied AI research. An LLM-driven agent (Planner + Executor + Oracle) runs ALFRED household tasks in AI2-THOR 5.0.0 simulation, with an Oracle Agent injecting environmental traps to create failure scenarios. The system records complete diagnostics, recovery attempts, and counterfactual annotations.
 
-- **CoT 推理链保存**: 所有 API 调用的 `reasoning_content` 现在存入 `api_calls.jsonl`。默认开启，缺则回退。
+**Target users:** Embodied AI / robot learning researchers needing failure recovery training data and counterfactual reasoning benchmarks.
 
-- **StuckTracker** (来自 PR #2): 累计 intent 失败计数——切换 intent 不会重置。中性动作（RotateLeft 等）不重置连续失败计数。
+**M1 focused on:** Stabilizing the core Planner→Executor→Review→Execute loop, fixing critical runtime bugs (VLM reliability, scene restoration, parallel orchestration), and upgrading spatial memory from a flat geometric list to a receptacle-grouped semantic system with first-person perspective.
 
-- **Ablation 框架**: 每个 spike (001-006) 有 feature flag，`--ablation 003 006` 可关闭特定 spike 做消融实验。
-
-### 已有架构（前序 session）
-
-- **Planner+Executor 拆分**: Planner 管高层意图，Executor(8B) 做动作序列
-- **空间记忆**: 累积所有 `visibleBounds2D=True` 的物体，按 objectId 去重
-- **gridSize=0.125m**: 细粒度移动
-- **visibleBounds2D 修复**: AI2-THOR 5.0.0 的 bug 手动修正
+**Key outcomes:**
+- `pick_and_place_simple`: `task_complete` in 6 steps (SoapBottle→Toilet) and 19 steps (Book→Desk)
+- `pick_heat_then_place_in_recep`: partial progress (63 steps, Apple→Fridge navigation, object ID resolution issue identified)
+- All VLM calls reliable via HTTP-200 hardening, reasoning_effort fallback, and provider migration
+- Parallel scheduler per-worker isolation validated with 9 deterministic tests
+- Semantic memory module live and rendering receptacle-grouped output
+- 58-unit test suite passing
 
 ---
 
-## 3. Bugfixes Delivered (8)
+## 2. Architecture
 
-| # | Bug | 文件 | 影响 |
-|---|-----|------|------|
-| B1 | 5xx/524 API 错误不重试 | `vlm_client.py` | 服务端超时直接杀进程→现在自动重试 |
-| B2 | 距离标签误导（中心 vs 表面） | `eb_agent.py`, `executor.py`, `egocentric_memory.py` | Fridge 1.1m→0.5m |
-| B3 | CoT 推理链未保存 | `vlm_client.py` | 现在全部 API 调用保存 reasoning_content |
-| B4 | Sliced 命名 bug | `task_conditions.py` | "TomatoSliced"→"Tomato"，影响 904/6574 episodes |
-| B5 | Intent 历史缺失 Planner 诊断 | `branch_runner.py`, `eb_agent.py` | Planner 不知道自己的 Phase 3 诊断 |
-| B6 | 不完整的 criteria 文本 | `task_conditions.py` | 切片前提条件现在显示在 criteria 中 |
-| B7 | 移动后空间记忆位置过时 | `branch_runner.py` | 3 个调用点修正 |
-| B8 | MoveSequence 的 failed_object_ids 断裂 | `branch_runner.py` | 现在返回已解析的 params |
-
----
-
-## 4. Navigation Spikes (6) — 纵深防御
+**Planner→Executor→Review→Execute four-phase loop with Oracle supervision**
 
 ```
-Layer 1 (Proactive):  003 curiosity-scoreboard  →  3D 评分引导初始探索
-Layer 2 (Memory):     001 searched-markers      →  标记已搜索 + 遮挡感知 unmark
-                      006 search-trail-cost     →  路径重复惩罚
-Layer 3 (Prompt):     005 progress-gating        →  5 阶段动态提示词（零 API 成本）
-Layer 4 (Validation): 002b critic-guard          →  执行前多层验证
-                      004 contrastive-planner    →  双 Planner 辩论
-Layer 5 (Enforcement): 002a intent-dedup         →  硬阻断重复 intent
+s0: Initial LookAround → 4-direction scan → VLM analysis → rotate to target
+while True:
+  Planner (gpt-5.5) → high-level intent
+    ├── "scan room" → 4-view capture → VLM analysis → rotation
+    ├── "Done" → task_conditions hard verification → complete or reject
+    └── normal intent → Executor (gpt-5.5) → 1-5 action sequence with repeat
+         → Planner Review → approve or corrected_actions
+         → MoveSequence execution (sequential, stops on first failure)
+         ├── success → continue
+         └── failure → Phase 3 Planner diagnosis + Phase 4 Oracle evaluation
+              ├── unrecoverable → terminate
+              ├── recovered → continue
+              └── recoverable → execute recovery → continue
 ```
 
-| # | Spike | 类型 | 核心机制 | 成本 |
-|:--:|-------|------|----------|:--:|
-| 001 | searched-markers | 被动 | 实例级标记 + occlusion unmark + 显式 UNMARK intent | 零 |
-| 002a | intent-dedup | 被动 | 渐进升级（2 次警告→3 次阻断）+ 语义规范化 + 任务感知回退 | 零 |
-| 002b | critic-guard | 被动 | 3 层规则检查 + 可选 LLM 验证（默认关闭） | 零/低 |
-| 003 | curiosity-scoreboard | **主动** | 3D 评分（语义先验 40% + 新奇度 40% + 发现 20%）+ 静态先验表 | 零 |
-| 004 | contrastive-planner | 被动 | 双 Planner（exploit vs explore）+ 门控激活（仅连续 3 次同一目标） | 1 VLM call |
-| 005 | progress-gating | 主动 | 5 阶段检测 + 阶段特定规则注入 | 零 |
-| 006 | search-trail-cost | 被动 | 0.5m 网格追踪 + 软评分（不硬阻断） | 零 |
+### Core Modules (22 source files, ~4000 lines)
+
+| Module | Lines | Role |
+|--------|-------|------|
+| `branch_runner.py` | 2390 | Main 4-phase loop, MoveSequence, recovery, resume |
+| `eb_agent.py` | 1760 | Planner: plan_intent, review_actions, diagnose_failure |
+| `executor.py` | 178 | Executor: intent → action sequence with repeat |
+| `oracle_agent.py` | 288 | Oracle: Phase 2 injection + Phase 4 evaluation |
+| `vlm_client.py` | 719 | VLM API calls, HTTP-200 validation, retry logic |
+| `semantic_memory.py` | 403 | NEW: receptacle-grouped memory with task tracking |
+| `geometric_memory.py` | 871 | REFACTORED: flat-list geometric memory (backward compat) |
+| `memory_interface.py` | 93 | NEW: shared memory interface |
+| `scheduler.py` | 325 | Per-worker agent isolation, parallel main + serial fork |
+| `task_conditions.py` | 322 | 7 ALFRED task completion checkers |
+| `action_adapter.py` | 123 | objectType→objectId resolution, param cleanup |
+| `alfred_scene.py` | 192 | ALFRED scene restore, task state tracking |
+
+### Simulation Stack
+- **AI2-THOR 5.0.0**, gridSize=0.125m, visibilityDistance=100
+- WSL2 Ubuntu + WSLg/Xvfb for rendering
+- VLM: gpt-5.5 via www.9527code.com/v1 OpenAI-compatible API (reasoning_effort=medium)
+
+### Memory Architecture (new in vM1)
+```
+memory_interface.py (base API)
+├── geometric_memory.py  (flat list, "SPATIAL MEMORY — what you remember seeing")
+└── semantic_memory.py   (receptacle groups, "=== WHAT I SEE === / === WHAT I REMEMBER ===")
+```
+Selectable via `--memory semantic` (default) or `--memory geometric`. First-person "I" perspective throughout all prompts.
 
 ---
 
-## 5. 审计发现（14 项，已修 8 项）
+## 3. What Changed Per Phase
 
-来自上下文系统审计（agent a86f9）和回归审计（agent a49483）：
+### Phase 1: System Stability + Intent Memory ✅
 
-| 严重度 | 数量 | 关键发现 |
-|--------|:--:|------|
-| 🔴 Bug | 4 | 过期内存、断裂的 failed_object_ids、不完整的 criteria、扫描冷却未设置 |
-| 🟡 不一致 | 6 | Planner 看不到 failed_object_ids、Phase 3 缺上下文、Executor error 跨 intent 污染、Done 绕过 intent_history |
-| 🟢 次要 | 4 | 异常丢 episode 数据、死循环阈值太松、completed 语义粗糙、记忆方向过时 |
+| Change | Files |
+|--------|-------|
+| `_META_ACTIONS` blocks Done/LookAround in MoveSequence | branch_runner |
+| `detect_dead_loop` supports nested param hashing | task_conditions |
+| `analyze_scan_room` — 4-image VLM analysis → direction + intent | eb_agent |
+| Intent-level history — Planner sees intent tree, Executor sees current intent | branch_runner, eb_agent |
+| Executor `repeat` support — batch same-direction moves | executor |
+| Executor SOLID obstacle labels — furniture marked "do NOT walk through" | executor |
+| Recovery execution — Phase 3 recovery actions actually executed | branch_runner |
+| `replay_steps` supports MoveSequence/LookAround replay | branch_runner |
+| `resume` supports executor_agent + correct replay | branch_runner |
 
-回归审计发现 B5 的诊断提取实际从未生效——intent dict 没有 eb_diagnosis 字段。已修复。
+### Runtime-Debug Phase ✅ (this session)
+
+| Task | What | Status |
+|------|------|--------|
+| T1 | Validate strict Executor/action boundaries | 35/35 tests |
+| T2 | Real no-trap E2E | Exposed /v1 + restoration bugs |
+| T3 | Fix ALFRED pose restoration | Type+nearest-position fallback |
+| T4 | **HTTP-200 response hardening** | 5-stage validation, reasoning_effort auto-strip fallback, 400 retry, 12 tests |
+| T5 | **Scheduler parallel isolation** | Per-worker `_create_agents()`, fixed accounting, 9 tests |
+| T6 | **Action-path E2E probe** | task_complete (SoapBottle→Toilet, 6 steps) |
+
+### Key runtime fixes:
+- **Provider migration**: `api.fullcupai.com` → `www.9527code.com/v1` (eliminated intermittent 400 errors)
+- **Reasoning_effort**: xhigh→medium default (xhigh multi-image returns content=None on gpt-5.5)
+- **Camera horizon epsilon**: `30.0 + 30.0 = 60.00000000000001` exceeded boundary check, fixed with 0.01 epsilon
+- **Object ID resolution**: Priority 4 fallback removed for PickupObject (prevents resolving to invisible objects inside containers)
+- **4-direction scan metadata**: Previously only stored ahead-view objects in memory; now captures objects from all 4 scan directions
+
+### P2: Semantic Memory (partial — core module complete)
+
+| Change | Files |
+|--------|-------|
+| `memory_interface.py` — shared base API | NEW |
+| `geometric_memory.py` — renamed from egocentric, `GeometricMemory(MemoryInterface)` | REFACTORED |
+| `semantic_memory.py` — receptacle-grouped, freshness-aware, task-tracking, first-person "I" | NEW |
+| `egocentric_memory.py` — backward-compat shim (`EgocentricMemory` → `GeometricMemory`) | REFACTORED |
+| System prompts shifted to first-person: "I am an embodied agent" | eb_agent, executor |
+| `--memory` CLI flag added to all scripts + SchedulerConfig | e2e_test, run_pipeline, resume_episode, scheduler |
 
 ---
 
-## 6. 已知待解决问题
+## 4. Key Technical Decisions
 
-| # | 问题 | 状态 |
-|---|------|------|
-| 1 | Executor 空 actions 死循环（已到目标 → 输出 `[]` → Phase 3 → 又空） | 未修 |
-| 2 | Camera pitch 耗竭（反复 LookDown 到 -60° 后不知道 LookUp） | 未修 |
-| 3 | 语义先验表弱（HandTowel 评分低于 Floor，99 条覆盖不全） | 待扩充 |
-| 4 | intent-dedup 滑动窗口被 interleaved intent 绕过 | StuckTracker 部分修复 |
-| 5 | FloorPlan22 等场景的 teleport 位置把 agent 困在角落 | ALFRED 已知问题 |
-| 6 | 无成功完成的任务——所有 spike 无法量化评估 | 需持续 E2E 测试 |
+1. **Planner+Executor split**: Planner handles high-level intent (WHAT), Executor handles concrete actions (HOW). Reduces 32B model call frequency. Both share same spatial memory context.
 
----
+2. **Oracle-blinded architecture**: Oracle sees unified EB history only, unaware of Planner/Executor internal split. EB never knows fork/injection exist.
 
-## 7. 文件变更统计
+3. **Per-worker VLM isolation**: Each thread creates its own VLMClient + EBAgent + ExecutorAgent + OracleAgent via factory pattern. Prevents mutable state sharing across parallel workers.
 
-| 文件 | 变更 |
-|------|------|
-| `src/branch_runner.py` | +3,465 / -2,317 (最重) |
-| `src/eb_agent.py` | +2,518 / -2,333 |
-| `src/egocentric_memory.py` | +463 / -12 (含 StuckTracker + SearchTrail) |
-| `src/context_builder.py` | +214 (intent tree 渲染) |
-| `src/vlm_client.py` | +54 (5xx retry + CoT) |
-| `src/executor.py` | +36 (AABB + trail) |
-| `src/task_conditions.py` | +27 (Sliced + criteria) |
-| `src/critic_guard.py` | **NEW** 432 行 |
-| `src/curiosity_scorer.py` | **NEW** 549 行 |
-| `scripts/analyze_ablation.py` | **NEW** 消融分析脚本 |
-| `.planning/spikes/*/` | **NEW** 7 个 README + MANIFEST |
+4. **Semantic memory with receptacle grouping**: Objects grouped by parent receptacle (e.g., "On CounterTop: Tomato, Egg"). Target tracking shows "WHERE MY TARGET IS" with freshness hints. Disambiguation warns when a remembered target may be confused with a similar-looking visible object.
 
-**总计**: 13 文件, +5,796 / -2,317 行 (~3,500 净增)
+5. **First-person "I" perspective**: Consistent egocentric narrative — "I saw the Apple inside the Fridge", "I should MoveLeft". Replaces inconsistent "you"/3rd-person mix.
+
+6. **Reasoning_effort auto-strip fallback**: When gpt-5.5 returns reasoning_content with null content, retry without reasoning_effort parameter (fallback to non-thinking mode).
+
+7. **Four-directional scan metadata**: Objects visible from left/behind/right during LookAround are now recorded in memory, not just ahead view.
+
+8. **Strict failure semantics**: Model/API contract errors are logged, retried (up to 5× validation + 3× transport = 15 total), then raised. Never become simulator failures or fallback actions.
 
 ---
 
-## 8. Getting Started
+## 5. Requirements Coverage
 
+| Req | Description | Status |
+|-----|-------------|--------|
+| R1 | Execute precision (repeat, SOLID, LookAround/Done filtering, recovery) | ✅ |
+| R2 | Spatial memory semanticization (parent receptacles, freshness, task tracking) | 🟡 Core module done; task-level integration pending |
+| R3 | Fuzzy intent decomposition (locate X → approach <location>) | ⬜ Depends on R2 |
+| R4 | Systematic exploration (quadrant search, scan→scan fix) | ⬜ Depends on R2 |
+| R5 | scan→scan loop fix | ✅ Initial LookAround interception done |
+| R6 | Fork validation | ⬜ Code exists; never E2E tested |
+
+---
+
+## 6. Known Gaps & Tech Debt
+
+**Untested paths:**
+- Fork mechanism never end-to-end tested (code exists but defaults to `enable_fork=False`)
+- heat/cool/clean task types not E2E validated
+- Phase 2 trap injection not exercised in recent runs
+
+**Known bugs (carried forward):**
+- 8B Executor under-counts repeat values and ignores SOLID labels (mitigated: now using 32B gpt-5.5 for all roles)
+- Phase 3 Planner occasionally hallucinates task completion after navigation failure
+- Object ID resolution for PickupObject can resolve to invisible objects inside containers (partially fixed: Priority 4 removed for PickupObject)
+
+**Performance:**
+- ~3-4 VLM calls per step (~$0.50-1.00 per episode at ~20 steps)
+- Serial fork processing despite `max_parallel` for main branches
+
+**Infrastructure:**
+- No CI/CD pipeline
+- No type checking (mypy/pyright)
+- Hardcoded limits distributed across codebase (step limit, retry counts, aging thresholds)
+
+---
+
+## 7. Getting Started
+
+### Quick start
 ```bash
-# 进入 WSL2
-wsl
+# In WSL2 Ubuntu:
 cd ~/embodied-failure-dataset
 export PATH="$HOME/.local/bin:$PATH"
 
-# 单任务测试
+# Single-task E2E test (semantic memory, default)
 uv run python scripts/e2e_test.py \
-  --api-key sk-f26... \
-  --api-base-url https://api.fullcupai.com/v1 \
+  --api-key sk-IxXjSiRZ3IhCd4hxMajweiXamF0R1U1cHmNECBrRbIz8v0hy \
   --task pick_and_place_simple --random --no-traps
 
-# 消融实验（关闭 003 curiosity + 006 trail）
-uv run python scripts/e2e_test.py \
-  --api-key sk-f26... \
-  --api-base-url https://api.fullcupai.com/v1 \
-  --task pick_heat_then_place_in_recep --random --no-traps \
-  --ablation 003 006
+# With geometric (legacy) memory
+uv run python scripts/e2e_test.py ... --memory geometric
 
-# 分析消融结果
-uv run python scripts/analyze_ablation.py output_e2e_*/
+# Parallel pipeline (2 workers)
+uv run python scripts/run_pipeline.py \
+  --api-key sk-xxx --max 2 --parallel 2 --no-fork
 
-# 查看 API 调用日志（含 CoT）
-python3 -c "
-import json
-with open('output_e2e_*/api_calls.jsonl') as f:
-    for line in f:
-        r = json.loads(line)
-        print(f'status={r[\"status\"]} cot={len(r.get(\"reasoning_content\",\"\"))}chars')
-"
+# Resume a crashed episode
+uv run python scripts/resume_episode.py <episode.json> --api-key sk-xxx --no-traps
 ```
 
-**关键目录**: `src/` (核心代码), `.planning/spikes/` (实验文档), `data/json_2.1.0/` (ALFRED 轨迹)
+### Prerequisites
+- WSL2 with WSLg (for AI2-THOR GPU rendering)
+- Python 3.10 via `uv`
+- AI2-THOR 5.0.0
+- API key for OpenAI-compatible endpoint (9527code.com)
+- ALFRED json_2.1.0 data in `data/json_2.1.0/`
+
+### Key files to read first
+1. `CLAUDE.md` — environment setup, architecture overview
+2. `src/branch_runner.py` — main orchestration (lines 141-900)
+3. `src/semantic_memory.py` — new memory format
+4. `src/vlm_client.py` — VLM client with retry/validation
+5. `.planning/STATE.md` — project status
+6. `.planning/ROADMAP.md` — remaining phases
 
 ---
 
-## Stats
+## 8. Next Milestone Preview (vM2)
 
-- **Timeline**: 2026-06 → 2026-07-14
-- **Session commits**: 2 (+ 5 prior)
-- **Session 变更**: 13 files, +5,796 / -2,317
-- **新文件**: 3 (critic_guard.py, curiosity_scorer.py, analyze_ablation.py)
-- **Contributors**: Eric Zhang, Claude, laoma9604-design
+**Target:** Scaled data generation with >30% E2E pass rate
+
+**Prerequisites from M1:**
+- [ ] P2: Full semantic memory integration with task-aware Planner prompting
+- [ ] P3: Fuzzy intent decomposition (leverage semantic memory for locate→approach)
+- [ ] P4: Systematic exploration strategy + scan→scan fix
+- [ ] P5: Fork validation with E2E tests
+- [ ] P6: 7-task baseline (5 episodes each)
+
+---
+
+*Milestone summary: 2026-07-15*

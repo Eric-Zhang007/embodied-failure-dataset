@@ -31,9 +31,17 @@ def ep_to_traj(ep):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--api-key", required=True)
-    parser.add_argument("--eb-model", default="Qwen/Qwen3-VL-32B-Instruct")
-    parser.add_argument("--oracle-model", default="Qwen/Qwen3-VL-32B-Instruct")
+    parser.add_argument("--api-key", required=True, help="OpenAI API key")
+    parser.add_argument("--api-base-url", default="https://www.9527code.com/v1", help="OpenAI-compatible API base URL")
+    parser.add_argument("--planner-model", default="gpt-5.5")
+    parser.add_argument("--oracle-model", default="gpt-5.5")
+    parser.add_argument("--executor-model", default="gpt-5.5")
+    parser.add_argument("--planner-reasoning-effort", default="medium",
+                        choices=["low", "medium", "high", "xhigh", "max"])
+    parser.add_argument("--executor-reasoning-effort", default="medium",
+                        choices=["low", "medium", "high", "xhigh", "max"])
+    parser.add_argument("--oracle-reasoning-effort", default="medium",
+                        choices=["low", "medium", "high", "xhigh", "max"])
     parser.add_argument("--task", default="pick_and_place_simple")
     parser.add_argument("--output", default="output_e2e")
     parser.add_argument("--no-traps", action="store_true")
@@ -69,15 +77,23 @@ def main():
     _orig_load = ap.load_traj
     ap.load_traj = lambda p: ep_to_traj(json.load(open(p)))
 
-    # EB agent: support local model
-    if args.eb_model == "local":
-        print(f"Using local EB model at {LOCAL_EB_URL}")
-        eb_client = VLMClient("openai", model="local", base_url=LOCAL_EB_URL, api_key="none")
+    # Planner: support local model
+    if args.planner_model == "local":
+        print(f"Using local Planner model at {LOCAL_EB_URL}")
+        planner_client = VLMClient("openai", model="local", base_url=LOCAL_EB_URL, api_key="none")
     else:
-        eb_client = VLMClient.siliconflow(args.eb_model, args.api_key)
+        planner_client = VLMClient.openai(
+            args.planner_model, args.api_key,
+            base_url=args.api_base_url,
+            reasoning_effort=args.planner_reasoning_effort,
+        )
 
-    oracle_client = VLMClient.siliconflow(args.oracle_model, args.api_key)
-    eb_agent = EBAgent(eb_client)
+    oracle_client = VLMClient.openai(
+        args.oracle_model, args.api_key,
+        base_url=args.api_base_url,
+        reasoning_effort=args.oracle_reasoning_effort,
+    )
+    eb_agent = EBAgent(planner_client)
     oracle_agent = OracleAgent(oracle_client)
 
     import time as _time

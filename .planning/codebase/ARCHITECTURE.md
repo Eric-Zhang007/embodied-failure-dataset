@@ -1,4 +1,4 @@
-<!-- refreshed: 2026-06-12 -->
+<!-- refreshed: 2026-07-15 -->
 # Architecture
 
 **Analysis Date:** 2026-06-12
@@ -87,17 +87,19 @@
 
 | Component | Responsibility | File | Lines |
 |-----------|---------------|------|-------|
-| BranchRunner | Main Phase 1-4 loop, MoveSequence, recovery, resume | `src/branch_runner.py` | 1486 |
-| EBAgent | Planner: plan_intent, review_actions, diagnose_failure, analyze_scan_room | `src/eb_agent.py` | 759 |
-| ExecutorAgent | Executor: intent -> concrete action chunk | `src/executor.py` | 214 |
+| BranchRunner | Main Phase 1-4 loop, MoveSequence, recovery, resume | `src/branch_runner.py` | 2390 |
+| EBAgent | Planner: plan_intent, review_actions, diagnose_failure, analyze_scan_room | `src/eb_agent.py` | 1760 |
+| ExecutorAgent | Executor: intent -> concrete action chunk | `src/executor.py` | 178 |
 | OracleAgent | Phase 2 injection, Phase 4 evaluation | `src/oracle_agent.py` | 288 |
-| VLMClient | API calls, JSON retry, image encoding, logging | `src/vlm_client.py` | 512 |
-| EgocentricMemory | Spatial memory, visibleBounds2D, obstacles | `src/egocentric_memory.py` | 397 |
+| VLMClient | API calls, HTTP-200 5-stage validation, JSON retry, logging | `src/vlm_client.py` | 719 |
+| SemanticMemory | Receptacle-grouped memory, freshness, task tracking (DEFAULT) | `src/semantic_memory.py` | 403 |
+| GeometricMemory | Flat-list geometric memory (legacy fallback) | `src/geometric_memory.py` | 871 |
+| MemoryInterface | Shared memory API base | `src/memory_interface.py` | 93 |
+| EgocentricMemory | Backward-compat shim | `src/egocentric_memory.py` | 7 |
 | EnvController | AI2-THOR wrapper, Xvfb, visibleBounds2D fix | `src/env_controller.py` | 124 |
-| EnvInjector | 6 injection methods + task-critical guards | `src/env_injector.py` | 217 |
+| Scheduler | Parallel main branches (per-worker agents), serial forks | `src/scheduler.py` | 325 |
 | TaskConditions | 7 task completion checkers, dead_loop, unrecoverable | `src/task_conditions.py` | 322 |
-| Scheduler | Parallel main branches, serial forks, warmup | `src/scheduler.py` | 309 |
-| ActionAdapter | objectType->objectId resolution, param cleanup | `src/action_adapter.py` | 123 |
+| ActionAdapter | objectType->objectId resolution, PickupObject invisible-object guard | `src/action_adapter.py` | 123 |
 | ContextBuilder | EB/Oracle history rendering (field permissions) | `src/context_builder.py` | 125 |
 | EpisodeManager | Episode JSON incremental flush | `src/episode_manager.py` | 82 |
 | TrapPlanner | Trap selection from failure_type_library.json | `src/trap_planner.py` | 160 |

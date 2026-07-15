@@ -77,6 +77,7 @@ def run_one(args, task_type, traj_path, n, total):
         enable_contrastive_planner="004" not in ablation_set,
         enable_progress_gating="005" not in ablation_set,
         enable_search_trail="006" not in ablation_set,
+        memory_mode=args.memory,
     )
     print(f"{prefix} {task_type}: {ep_id} -> {result.termination_reason} ({result.total_steps} steps)")
     return task_type, ep_id, result
@@ -85,15 +86,15 @@ def run_one(args, task_type, traj_path, n, total):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--api-key", required=True, help="OpenAI API key")
-    parser.add_argument("--api-base-url", default="https://api.fullcupai.com", help="OpenAI-compatible API base URL")
+    parser.add_argument("--api-base-url", default="https://www.9527code.com/v1", help="OpenAI-compatible API base URL")
     parser.add_argument("--planner-model", default="gpt-5.5")
     parser.add_argument("--oracle-model", default="gpt-5.5")
     parser.add_argument("--executor-model", default="gpt-5.5")
-    parser.add_argument("--planner-reasoning-effort", default="xhigh",
+    parser.add_argument("--planner-reasoning-effort", default="medium",
                         choices=["low", "medium", "high", "xhigh", "max"])
     parser.add_argument("--executor-reasoning-effort", default="medium",
                         choices=["low", "medium", "high", "xhigh", "max"])
-    parser.add_argument("--oracle-reasoning-effort", default="xhigh",
+    parser.add_argument("--oracle-reasoning-effort", default="medium",
                         choices=["low", "medium", "high", "xhigh", "max"])
     parser.add_argument("--task", default="", help="Single ALFRED task_type")
     parser.add_argument("--all", action="store_true", help="Run all 7 task types in parallel")
@@ -105,6 +106,8 @@ def main():
     parser.add_argument("--ablation", nargs="*", default=[],
                         choices=["001", "002a", "002b", "003", "004", "005", "006"],
                         help="Disable specific spikes for ablation testing (e.g. --ablation 003 006)")
+    parser.add_argument("--memory", default="semantic", choices=["semantic", "geometric"],
+                        help="Memory mode: semantic (receptacle-grouped, freshness-aware) or geometric (flat list)")
     args = parser.parse_args()
 
     if not args.output:

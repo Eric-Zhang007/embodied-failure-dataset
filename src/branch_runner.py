@@ -19,6 +19,7 @@ from src.action_adapter import adapt, resolve_object_ids, _OBJECT_ACTIONS
 from src.task_conditions import check_task_complete, check_unrecoverable, detect_dead_loop, get_completion_criteria_text
 from src.context_builder import build_branch_history
 from src.egocentric_memory import EgocentricMemory, SearchTrail
+from src.semantic_memory import SemanticMemory
 from src.critic_guard import CriticGuard
 
 _VALID_ACTIONS = {
@@ -31,6 +32,18 @@ _VALID_ACTIONS = {
 # Meta-actions: handled by Planner / branch_runner, must never reach AI2-THOR.
 # Executor and Phase 3 recovery are forbidden from outputting these.
 _META_ACTIONS = {"Done", "LookAround"}
+_EXECUTABLE_SEQUENCE_ACTIONS = _VALID_ACTIONS - _META_ACTIONS - {"MoveSequence"}
+_REPEATABLE_ACTIONS = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight"}
+_MAX_SEQUENCE_ACTIONS = 12
+_MAX_ACTION_REPEAT = 200
+
+# AI2-THOR cameraHorizon uses positive degrees down from level: LookDown adds
+# 30 degrees and LookUp subtracts 30. Controller.plan_horizons explicitly
+# enumerates 330° (-30° up), 0°, 30°, and 60° as supported horizons.
+_CAMERA_HORIZON_MIN = -30.0
+_CAMERA_HORIZON_MAX = 60.0
+_CAMERA_HORIZON_EPSILON = 0.01
+_CAMERA_LOOK_STEP_DEGREES = 30.0
 
 
 @dataclass
@@ -71,6 +84,7 @@ class BranchRunner:
         enable_contrastive_planner: bool = True,
         enable_progress_gating: bool = True,
         enable_search_trail: bool = True,
+        memory_mode: str = "semantic",  # "semantic" | "geometric"
     ):
         self.eb_agent = eb_agent
         self.oracle_agent = oracle_agent
@@ -81,6 +95,7 @@ class BranchRunner:
         self.enable_fork = enable_fork
         self.recorder = StepRecorder()
         self._last_scan_step = -100
+        self.memory_mode = memory_mode
         self.enable_critic = enable_critic
         # CriticGuard (002b): validates Planner intents before Executor execution
         self.critic_guard = CriticGuard(
@@ -89,16 +104,15 @@ class BranchRunner:
             max_regen_attempts=1,
         )
         # ── Ablation experiment flags ──
-        # Each controls whether a specific navigation spike is active.
-        # All default to True (enabled) to preserve current behavior,
-        # except 002b (CriticGuard) which defaults off (adds latency).
-        self.enable_searched_markers: bool = True     # 001 — mark receptacles as SEARCHED
-        self.enable_intent_dedup: bool = True          # 002a — block repeated failed intents
-        self.enable_critic_guard: bool = False         # 002b — pre-execution intent validation (default off)
-        self.enable_curiosity_scoreboard: bool = True   # 003 — multi-dim exploration priority table
-        self.enable_contrastive_planner: bool = True    # 004 — dual-intent (exploit vs explore) selection
-        self.enable_progress_gating: bool = True        # 005 — phase-aware guardrail injection
-        self.enable_search_trail: bool = True           # 006 — trail-based soft scoring of revisited areas
+        # Preserve the constructor values so CLI ablation selections reach both
+        # the runtime behavior and the persisted experiment configuration.
+        self.enable_searched_markers: bool = enable_searched_markers     # 001 — mark receptacles as SEARCHED
+        self.enable_intent_dedup: bool = enable_intent_dedup              # 002a — block repeated failed intents
+        self.enable_critic_guard: bool = enable_critic_guard              # 002b — pre-execution intent validation
+        self.enable_curiosity_scoreboard: bool = enable_curiosity_scoreboard  # 003 — exploration priority table
+        self.enable_contrastive_planner: bool = enable_contrastive_planner  # 004 — dual-intent selection
+        self.enable_progress_gating: bool = enable_progress_gating        # 005 — phase-aware guardrail injection
+        self.enable_search_trail: bool = enable_search_trail              # 006 — trail-based revisit scoring
 
     # ------------------------------------------------------------------
     # Trail helper (Spike 006: search-trail-cost)
@@ -170,7 +184,10 @@ class BranchRunner:
         )
 
         failed_object_ids: set[str] = set()
-        memory = EgocentricMemory()
+        if self.memory_mode == "geometric":
+            memory = EgocentricMemory()
+        else:
+            memory = SemanticMemory()
         trail = SearchTrail(resolution=0.5)
         intent_history: list[dict] = []  # completed/failed intent summaries
         current_intent = {"intent": "", "target": "", "steps": [], "start_step": 0}
@@ -178,6 +195,7 @@ class BranchRunner:
         phase2_max_injections = 3
         nonexecuted_retry_count = 0
         max_nonexecuted_retries = 3
+        zero_step_completion_steps: dict[tuple[str, str], int] = {}
 
         # ==========================================================
         # Initial LookAround: 开局强制四向扫描
@@ -187,15 +205,19 @@ class BranchRunner:
             image0 = state0["frame"]
             metadata0 = state0["metadata"]
             look_images = []
+            look_metas = []  # accumulate metadata from each direction for memory
             for d in ["ahead", "left", "behind", "right"]:
                 if d == "ahead":
                     snap = image0
+                    meta = metadata0
                 else:
                     r = env.step("RotateLeft")
                     if not r["success"]:
                         raise RuntimeError(f"Init LookAround RotateLeft failed: {r['error']}")
                     snap = r["frame"]
+                    meta = r["metadata"]
                 look_images.append((d, snap))
+                look_metas.append((d, meta))
             restore_result = env.step("RotateLeft")
             if not restore_result["success"]:
                 raise RuntimeError(f"Init LookAround restore RotateLeft failed: {restore_result['error']}")
@@ -219,6 +241,9 @@ class BranchRunner:
                 ep.data.get("pddl_params", {}),
             )
             memory.update(metadata0, metadata0.get("objects", []), "LookAround", True, None, tc0)
+            # Also feed metadata from left/behind/right directions into memory
+            for _d_label, _d_meta in look_metas[1:]:  # skip ahead (already done)
+                memory.update(_d_meta, _d_meta.get("objects", []), "LookAround", True, None, tc0)
             self._record_trail(trail, metadata0)
             step_index = 1
             # Use new scan analysis to get direction + intent (not old propose_action)
@@ -448,15 +473,19 @@ class BranchRunner:
                     self._last_scan_step = step_index
                     look_images = []
                     look_dirs = ["ahead", "left", "behind", "right"]
+                    scan_metas = []  # accumulate metadata from each direction
                     for d in look_dirs:
                         if d == "ahead":
                             snap = image
+                            meta = metadata
                         else:
                             r = env.step("RotateLeft")
                             if not r["success"]:
                                 raise RuntimeError(f"Scan room RotateLeft failed: {r['error']}")
                             snap = r["frame"]
+                            meta = r["metadata"]
                         look_images.append((d, snap))
+                        scan_metas.append((d, meta))
                     env.step("RotateLeft")  # restore original facing
                     # Record LookAround step
                     look_result = {"success": True, "error": None, "frame": image, "metadata": metadata}
@@ -577,11 +606,98 @@ class BranchRunner:
                     planner_reasoning=planner_intent.get("reasoning", ""),
                 )
 
+                executor_actions = exec_result.get("actions")
+                executor_status = exec_result.get("status")
+
+                # An already-satisfied intent is the sole valid zero-action
+                # contract. Complete it without inventing an environment failure.
+                if executor_status == "done" and executor_actions == []:
+                    completed_intent_key = (intent, intent_target)
+                    if zero_step_completion_steps.get(completed_intent_key) == step_index:
+                        repeat_error = (
+                            f"Intent {intent!r} targeting {intent_target!r} was already completed "
+                            "without actions on the previous Planner cycle. Choose the next distinct "
+                            "intent instead of repeating it."
+                        )
+                        nonexecuted_retry_count += 1
+                        self._write_failure_log(failure_log_path, {
+                            "step_index": step_index,
+                            "branch_id": config.branch_id,
+                            "failure_type": "model_repeated_completed_intent",
+                            "intent": intent,
+                            "intent_target": intent_target,
+                            "executor_status": executor_status,
+                            "executor_status_reason": exec_result.get("status_reason", ""),
+                            "error_message": repeat_error,
+                            "retry_attempt": nonexecuted_retry_count,
+                        })
+                        if nonexecuted_retry_count >= max_nonexecuted_retries:
+                            raise RuntimeError(repeat_error)
+                        last_error = repeat_error
+                        continue
+
+                    current_intent["intent"] = intent
+                    current_intent["target"] = intent_target
+                    current_intent["completed"] = True
+                    current_intent["end_step"] = step_index
+                    current_intent["completion_reason"] = exec_result.get("status_reason", "")
+                    intent_history.append(dict(current_intent))
+                    current_intent = {
+                        "intent": "",
+                        "target": "",
+                        "steps": [],
+                        "start_step": step_index,
+                    }
+                    zero_step_completion_steps[completed_intent_key] = step_index
+                    last_error = None
+                    nonexecuted_retry_count = 0
+                    continue
+
+                executor_contract_error = self._validate_executor_output_shape(
+                    executor_actions, "executor"
+                )
+                if executor_contract_error:
+                    nonexecuted_retry_count += 1
+                    self._write_failure_log(failure_log_path, {
+                        "step_index": step_index,
+                        "branch_id": config.branch_id,
+                        "failure_type": "model_invalid_action_sequence",
+                        "proposal_source": "executor",
+                        "executor_status": executor_status,
+                        "proposed_steps": executor_actions,
+                        "error_message": executor_contract_error,
+                        "retry_attempt": nonexecuted_retry_count,
+                    })
+                    if nonexecuted_retry_count >= max_nonexecuted_retries:
+                        raise RuntimeError(executor_contract_error)
+                    last_error = executor_contract_error
+                    continue
+
+                executor_sequence_error = self._validate_action_sequence(
+                    executor_actions, "executor action sequence"
+                )
+                if executor_sequence_error:
+                    nonexecuted_retry_count += 1
+                    self._write_failure_log(failure_log_path, {
+                        "step_index": step_index,
+                        "branch_id": config.branch_id,
+                        "failure_type": "model_invalid_action_sequence",
+                        "proposal_source": "executor",
+                        "executor_status": executor_status,
+                        "proposed_steps": executor_actions,
+                        "error_message": executor_sequence_error,
+                        "retry_attempt": nonexecuted_retry_count,
+                    })
+                    if nonexecuted_retry_count >= max_nonexecuted_retries:
+                        raise RuntimeError(executor_sequence_error)
+                    last_error = executor_sequence_error
+                    continue
+
                 # 3. Planner reviews — if rejected, Planner provides corrected actions
                 review = self.eb_agent.review_actions(
                     intent=intent,
                     target=intent_target,
-                    proposed_actions=exec_result.get("actions", []),
+                    proposed_actions=executor_actions,
                     executor_reasoning=exec_result.get("reasoning", ""),
                     image=image,
                     visible_objects=metadata.get("objects", []),
@@ -593,13 +709,37 @@ class BranchRunner:
                 )
 
                 if review.get("approved"):
-                    proposed_action = "MoveSequence"
-                    proposed_params = {"steps": exec_result.get("actions", [])}
+                    selected_steps = exec_result.get("actions")
+                    proposal_source = "executor"
                     eb_reasoning = exec_result.get("reasoning", "")
                 else:
-                    proposed_action = "MoveSequence"
-                    proposed_params = {"steps": review.get("corrected_actions", exec_result.get("actions", []))}
+                    selected_steps = review.get("corrected_actions")
+                    proposal_source = "reviewer correction"
                     eb_reasoning = review.get("reason", "")
+
+                sequence_error = self._validate_executor_result(
+                    selected_steps, exec_result.get("status"), proposal_source
+                )
+                if sequence_error:
+                    nonexecuted_retry_count += 1
+                    self._write_failure_log(failure_log_path, {
+                        "step_index": step_index,
+                        "branch_id": config.branch_id,
+                        "failure_type": "model_invalid_action_sequence",
+                        "proposal_source": proposal_source,
+                        "executor_status": exec_result.get("status"),
+                        "proposed_steps": selected_steps,
+                        "eb_reasoning": eb_reasoning,
+                        "error_message": sequence_error,
+                        "retry_attempt": nonexecuted_retry_count,
+                    })
+                    if nonexecuted_retry_count >= max_nonexecuted_retries:
+                        raise RuntimeError(sequence_error)
+                    last_error = sequence_error
+                    continue
+
+                proposed_action = "MoveSequence"
+                proposed_params = {"steps": selected_steps}
             else:
                 # ── Original single-agent path (no executor) ──
                 eb_phase1 = self.eb_agent.propose_action(
@@ -636,6 +776,76 @@ class BranchRunner:
                     raise RuntimeError(error_msg)
                 last_error = error_msg
                 continue
+
+            if proposed_action not in _META_ACTIONS and proposed_action != "MoveSequence":
+                action_error = self._validate_standalone_action(
+                    proposed_action,
+                    proposed_params,
+                    metadata.get("agent", {}).get("cameraHorizon", 0.0),
+                )
+                if action_error:
+                    nonexecuted_retry_count += 1
+                    failure_type = (
+                        "model_camera_horizon_violation"
+                        if proposed_action in {"LookUp", "LookDown"}
+                        else "model_invalid_action_params"
+                    )
+                    self._write_failure_log(failure_log_path, {
+                        "step_index": step_index,
+                        "branch_id": config.branch_id,
+                        "failure_type": failure_type,
+                        "proposed_action": proposed_action,
+                        "proposed_params": proposed_params,
+                        "eb_reasoning": eb_reasoning,
+                        "error_message": action_error,
+                        "retry_attempt": nonexecuted_retry_count,
+                    })
+                    if nonexecuted_retry_count >= max_nonexecuted_retries:
+                        raise RuntimeError(action_error)
+                    last_error = action_error
+                    continue
+
+            # Validate MoveSequence before Phase 2, including the legacy path.
+            if proposed_action == "MoveSequence":
+                sequence_error = self._validate_action_sequence(
+                    proposed_params.get("steps") if isinstance(proposed_params, dict) else None,
+                    "action sequence",
+                )
+                if sequence_error:
+                    nonexecuted_retry_count += 1
+                    self._write_failure_log(failure_log_path, {
+                        "step_index": step_index,
+                        "branch_id": config.branch_id,
+                        "failure_type": "model_invalid_action_sequence",
+                        "proposed_action": proposed_action,
+                        "proposed_params": proposed_params,
+                        "eb_reasoning": eb_reasoning,
+                        "error_message": sequence_error,
+                        "retry_attempt": nonexecuted_retry_count,
+                    })
+                    if nonexecuted_retry_count >= max_nonexecuted_retries:
+                        raise RuntimeError(sequence_error)
+                    last_error = sequence_error
+                    continue
+                horizon_error = self._validate_camera_horizon_sequence(
+                    proposed_params["steps"], metadata.get("agent", {}).get("cameraHorizon", 0.0)
+                )
+                if horizon_error:
+                    nonexecuted_retry_count += 1
+                    self._write_failure_log(failure_log_path, {
+                        "step_index": step_index,
+                        "branch_id": config.branch_id,
+                        "failure_type": "model_camera_horizon_violation",
+                        "proposed_action": proposed_action,
+                        "proposed_params": proposed_params,
+                        "eb_reasoning": eb_reasoning,
+                        "error_message": horizon_error,
+                        "retry_attempt": nonexecuted_retry_count,
+                    })
+                    if nonexecuted_retry_count >= max_nonexecuted_retries:
+                        raise RuntimeError(horizon_error)
+                    last_error = horizon_error
+                    continue
 
             # Done 检测：仅在成功步之后检查，避免初始空手状态误判
             if proposed_action == "Done":
@@ -764,16 +974,20 @@ class BranchRunner:
             if proposed_action == "LookAround":
                 lookaround_reasoning = eb_reasoning
                 look_images = []
+                look_metas_legacy = []
                 look_dirs = ["ahead", "left", "behind", "right"]
                 for d in look_dirs:
                     if d == "ahead":
                         snap = image
+                        meta = metadata
                     else:
                         rotate_result = env.step("RotateLeft")
                         if not rotate_result["success"]:
                             raise RuntimeError(f"LookAround internal RotateLeft failed: {rotate_result['error']}")
                         snap = rotate_result["frame"]
+                        meta = rotate_result["metadata"]
                     look_images.append((d, snap))
+                    look_metas_legacy.append((d, meta))
                 rotate_result = env.step("RotateLeft")  # back to original facing
                 if not rotate_result["success"]:
                     raise RuntimeError(f"LookAround restore RotateLeft failed: {rotate_result['error']}")
@@ -799,9 +1013,12 @@ class BranchRunner:
                 parent_id = f"s{step_index}"
                 step_index += 1
                 nonexecuted_retry_count = 0
-                memory.update(metadata, metadata.get("objects", []), "LookAround", True, None, task_criteria)
+                memory.update(metadata, metadata.get("objects", []),
+                              "LookAround", True, None, task_criteria)
+                for _d_label, _d_meta in look_metas_legacy[1:]:
+                    memory.update(_d_meta, _d_meta.get("objects", []),
+                                  "LookAround", True, None, task_criteria)
                 self._record_trail(trail, metadata)
-
                 eb_phase1 = self.eb_agent.propose_action_lookaround(
                     task_goal=ep.data["task_goal"],
                     look_images=look_images,
@@ -838,29 +1055,69 @@ class BranchRunner:
                     last_error = error_msg
                     continue
 
-                if proposed_action not in _VALID_ACTIONS:
-                    error_msg = self._invalid_action_message(proposed_action)
-                    nonexecuted_retry_count += 1
-                    self._write_failure_log(failure_log_path, {
-                        "step_index": step_index,
-                        "branch_id": config.branch_id,
-                        "failure_type": "model_invalid_action",
-                        "proposed_action": proposed_action,
-                        "proposed_params": proposed_params,
-                        "eb_reasoning": eb_reasoning,
-                        "error_message": error_msg,
-                        "retry_attempt": nonexecuted_retry_count,
-                    })
-                    if nonexecuted_retry_count >= max_nonexecuted_retries:
-                        raise RuntimeError(error_msg)
-                    last_error = error_msg
+                if proposed_action == "Done":
+                    task_complete_done, done_reason = check_task_complete(
+                        metadata, ep.data, task_state
+                    )
+                    if task_complete_done:
+                        self._write_success_step(
+                            ep, config.branch_id, step_index, parent_id,
+                            "Done", {},
+                            {"success": True, "error": None, "frame": image, "metadata": metadata},
+                            eb_reasoning=eb_reasoning,
+                        )
+                        return self._make_result(
+                            config, "task_complete", step_index + 1,
+                            fork_tasks, fork_source_ids, ep,
+                        )
+                    last_error = (
+                        f"Done rejected: {done_reason}. Fix the unmet criteria before calling Done again."
+                    )
                     continue
+
+                if proposed_action != "MoveSequence":
+                    standalone_error = self._validate_standalone_action(
+                        proposed_action,
+                        proposed_params,
+                        metadata.get("agent", {}).get("cameraHorizon", 0.0),
+                    )
+                    if standalone_error:
+                        nonexecuted_retry_count += 1
+                        self._write_failure_log(failure_log_path, {
+                            "step_index": step_index,
+                            "branch_id": config.branch_id,
+                            "failure_type": "model_invalid_action",
+                            "proposed_action": proposed_action,
+                            "proposed_params": proposed_params,
+                            "eb_reasoning": eb_reasoning,
+                            "error_message": standalone_error,
+                            "retry_attempt": nonexecuted_retry_count,
+                        })
+                        if nonexecuted_retry_count >= max_nonexecuted_retries:
+                            raise RuntimeError(standalone_error)
+                        last_error = standalone_error
+                        continue
 
             # ==========================================================
             # MoveSequence: execute a chain of movement steps sequentially.
             # Stops on first failure, reports what actually succeeded.
             # ==========================================================
             if proposed_action == "MoveSequence":
+                # Post-LookAround output is produced after the pre-Phase-2
+                # boundary, so defend this final dispatch boundary as well.
+                sequence_error = self._validate_action_sequence(
+                    proposed_params.get("steps") if isinstance(proposed_params, dict) else None,
+                    "action sequence",
+                )
+                if sequence_error:
+                    raise RuntimeError(sequence_error)
+                horizon_error = self._validate_camera_horizon_sequence(
+                    proposed_params["steps"],
+                    metadata.get("agent", {}).get("cameraHorizon", 0.0),
+                )
+                if horizon_error:
+                    raise RuntimeError(horizon_error)
+
                 seq_result, seq_msg = self._execute_move_sequence(
                     proposed_params, env, metadata, failure_log_path,
                     config.branch_id, step_index, ep.episode_id,
@@ -975,54 +1232,67 @@ class BranchRunner:
                         rec_action = eb_phase3.get("proposed_recovery_action") or {}
                         rec_name = rec_action.get("action", "")
                         rec_params = rec_action.get("params", {})
-                        if rec_name and rec_name in _VALID_ACTIONS and rec_name not in _META_ACTIONS:
-                            resolved, warn = resolve_object_ids(rec_name, rec_params,
-                                                                metadata.get("objects", []))
-                            rec_act, rec_adapt_params = adapt(rec_name, resolved)
-                            rec_result = env.step(rec_act, **rec_adapt_params)
-                            if rec_result.get("frame") is None:
-                                rec_result["frame"] = image
-                            memory.update(rec_result.get("metadata", metadata), rec_result.get("metadata", metadata).get("objects", []),
-                                          rec_act, rec_result["success"],
-                                          rec_result.get("error"), task_criteria)
-                            # Build a dedicated recovery step entry
-                            rec_step = self._build_step_entry(
-                                ep.episode_id, config.branch_id, step_index, parent_id,
-                                rec_act, rec_adapt_params, rec_result,
-                                f"[recovery] {eb_phase3.get('recovery_reasoning', '')}",
-                                injection_decision,
-                            )
-                            rec_step["recovery_step"] = True
-                            rec_step["eb_diagnosis"] = eb_phase3.get("diagnosis")
-                            self._write_success_step_direct(ep, rec_step)
-                            eb_history.append(rec_step)
-                            current_intent["steps"].append(rec_step)
-                            step_index += 1
-                            if rec_result["success"]:
-                                cascade_level = 0
-                                last_error = None
-                                image = rec_result["frame"]
-                                metadata = rec_result["metadata"]
-                                self._record_trail(trail, metadata)
-                            else:
-                                cascade_level += 1
-                                last_error = f"Recovery {rec_name} failed: {rec_result.get('error', '')}"
-                                image = rec_result.get("frame", image)
-                                metadata = rec_result.get("metadata", metadata)
-                        else:
+                        recovery_error = self._validate_standalone_action(
+                            rec_name,
+                            rec_params,
+                            metadata.get("agent", {}).get("cameraHorizon", 0.0),
+                        )
+                        if recovery_error:
                             self._write_failure_log(failure_log_path, {
                                 "step_index": step_index,
                                 "branch_id": config.branch_id,
-                                "failure_type": "recovery_skipped",
+                                "failure_type": "model_invalid_recovery_action",
                                 "proposed_recovery": rec_action,
-                                "error_message": f"Recovery action '{rec_name}' is invalid or meta-action, skipped",
+                                "error_message": recovery_error,
                             })
-                            last_error = (
-                                f"Your proposed recovery action '{rec_name}' is a meta-action "
-                                f"(Done/LookAround). Propose a physical movement or object "
-                                f"interaction instead (MoveAhead, RotateLeft, PickupObject, etc.)."
-                            )
-                        # continue to next Planner cycle
+                            raise RuntimeError(recovery_error)
+
+                        resolved, warn = resolve_object_ids(
+                            rec_name, rec_params, metadata.get("objects", [])
+                        )
+                        if warn and rec_name in _OBJECT_ACTIONS:
+                            recovery_error = "Your recovery action was not executed. " + warn
+                            self._write_failure_log(failure_log_path, {
+                                "step_index": step_index,
+                                "branch_id": config.branch_id,
+                                "failure_type": "model_unresolved_recovery_object",
+                                "proposed_recovery": rec_action,
+                                "error_message": recovery_error,
+                            })
+                            raise RuntimeError(recovery_error)
+
+                        rec_act, rec_adapt_params = adapt(rec_name, resolved)
+                        rec_result = env.step(rec_act, **rec_adapt_params)
+                        if rec_result.get("frame") is None:
+                            rec_result["frame"] = image
+                        rec_metadata = rec_result.get("metadata", metadata)
+                        memory.update(
+                            rec_metadata, rec_metadata.get("objects", []), rec_act,
+                            rec_result["success"], rec_result.get("error"), task_criteria,
+                        )
+                        rec_step = self._build_step_entry(
+                            ep.episode_id, config.branch_id, step_index, parent_id,
+                            rec_act, rec_adapt_params, rec_result,
+                            f"[recovery] {eb_phase3.get('recovery_reasoning', '')}",
+                            injection_decision,
+                        )
+                        rec_step["recovery_step"] = True
+                        rec_step["eb_diagnosis"] = eb_phase3.get("diagnosis")
+                        self._write_success_step_direct(ep, rec_step)
+                        eb_history.append(rec_step)
+                        current_intent["steps"].append(rec_step)
+                        step_index += 1
+                        if rec_result["success"]:
+                            cascade_level = 0
+                            last_error = None
+                            image = rec_result["frame"]
+                            metadata = rec_metadata
+                            self._record_trail(trail, metadata)
+                        else:
+                            cascade_level += 1
+                            last_error = f"Recovery {rec_name} failed: {rec_result.get('error', '')}"
+                            image = rec_result.get("frame", image)
+                            metadata = rec_metadata
                     continue
 
             # ==========================================================
@@ -1218,6 +1488,8 @@ class BranchRunner:
         output_dir: str = "",
         step_limit_multiplier: int = 4,
         enable_fork: bool = False,
+        enable_phase2: bool = True,
+        memory_mode: str = "semantic",
     ) -> BranchResult:
         ep = EpisodeManager.load(episode_path)
         branch_steps = ep.get_steps_for_branch(branch_id)
@@ -1240,7 +1512,9 @@ class BranchRunner:
             output_dir = os.path.dirname(episode_path)
         runner = cls(eb_agent, oracle_agent, output_dir,
                      step_limit_multiplier=step_limit_multiplier,
-                     enable_fork=enable_fork)
+                     enable_fork=enable_fork,
+                     enable_phase2=enable_phase2,
+                     memory_mode=memory_mode)
         runner.executor_agent = executor_agent
         return runner.run(
             config=config, env=env, ep=ep,
@@ -1284,6 +1558,162 @@ class BranchRunner:
             f"Allowed actions are: {', '.join(sorted(_VALID_ACTIONS))}. "
             "Re-think from the current image and output a valid JSON action."
         )
+
+    @classmethod
+    def _validate_executor_result(cls, steps, status, source: str) -> str | None:
+        """Validate Executor status and actions before they become MoveSequence."""
+        if status not in {"done", "partial", "failed"}:
+            return (
+                f"Your Executor response was not executed because status {status!r} is invalid. "
+                "Use one of: done, partial, failed."
+            )
+        return cls._validate_action_sequence(steps, source)
+
+    @staticmethod
+    def _validate_executor_output_shape(actions, source: str) -> str | None:
+        """Reject malformed raw Executor output before Planner review."""
+        if not isinstance(actions, list):
+            return (
+                f"Your {source} response was not executed because actions must be a JSON list. "
+                "Re-think from the current image and provide concrete actions."
+            )
+        return None
+
+    @staticmethod
+    def _action_params(step: dict) -> dict:
+        """Read nested action params while retaining legacy flat-field output."""
+        nested = step.get("params")
+        if nested is not None:
+            return nested if isinstance(nested, dict) else nested
+        return {k: v for k, v in step.items() if k not in ("action", "repeat")}
+
+    @classmethod
+    def _validate_action_contract(cls, action, params, source: str) -> str | None:
+        """Validate one concrete action before resolution, adaptation, or stepping."""
+        if action not in _EXECUTABLE_SEQUENCE_ACTIONS:
+            return (
+                f"Your {source} was not executed because action {action!r} is invalid. "
+                "Use a concrete AI2-THOR action, not Done, LookAround, or MoveSequence."
+            )
+        if not isinstance(params, dict):
+            return f"Your {source} was not executed because params must be a JSON object."
+        if action in _OBJECT_ACTIONS:
+            object_type = params.get("objectType")
+            if not isinstance(object_type, str) or not object_type.strip():
+                return (
+                    f"Your {source} was not executed because {action} requires a non-empty "
+                    "objectType."
+                )
+            if action == "PutObject":
+                receptacle_type = params.get("receptacleType")
+                if not isinstance(receptacle_type, str) or not receptacle_type.strip():
+                    return (
+                        f"Your {source} was not executed because PutObject requires a non-empty "
+                        "receptacleType."
+                    )
+        return None
+
+    @classmethod
+    def _validate_standalone_action(
+        cls, action, params, camera_horizon, *, allow_meta: bool = False
+    ) -> str | None:
+        """Validate a legacy, recovery, or post-scan standalone action."""
+        if allow_meta and action in _META_ACTIONS:
+            return None if isinstance(params, dict) else "Your action params must be a JSON object."
+        error = cls._validate_action_contract(action, params, "action")
+        if error:
+            return error
+        if action in {"LookUp", "LookDown"}:
+            return cls._validate_camera_horizon_sequence(
+                [{"action": action}], camera_horizon
+            )
+        return None
+
+    @classmethod
+    def _validate_action_sequence(cls, steps, source: str) -> str | None:
+        """Return an actionable error when a proposed sequence cannot run.
+
+        Invalid sequences are model-output errors, not environment failures, so
+        callers must use the nonexecuted retry path rather than Phase 3.
+        """
+        if not isinstance(steps, list) or not steps:
+            return (
+                f"Your {source} action sequence was not executed because it must be "
+                "a non-empty JSON list of concrete actions. Re-think from the current "
+                "image and provide at least one executable action."
+            )
+        if len(steps) > _MAX_SEQUENCE_ACTIONS:
+            return (
+                f"Your {source} action sequence was not executed because it has {len(steps)} "
+                f"actions; the maximum is {_MAX_SEQUENCE_ACTIONS}. Use repeat for movement."
+            )
+        for index, step in enumerate(steps, start=1):
+            if not isinstance(step, dict):
+                return (
+                    f"Your {source} action sequence was not executed because step {index} "
+                    "must be a JSON object with an action field."
+                )
+            action = step.get("action")
+            params = cls._action_params(step)
+            action_error = cls._validate_action_contract(
+                action, params, f"{source} action sequence step {index}"
+            )
+            if action_error:
+                return action_error
+            if "repeat" in step:
+                repeat = step["repeat"]
+                if action not in _REPEATABLE_ACTIONS:
+                    return (
+                        f"Your {source} action sequence was not executed because step {index} "
+                        f"uses repeat with unsupported action {action!r}. Repeat is only valid "
+                        "for MoveAhead, MoveBack, MoveLeft, and MoveRight."
+                    )
+                if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
+                    return (
+                        f"Your {source} action sequence was not executed because step {index} "
+                        "has repeat that is not a positive integer."
+                    )
+                if repeat > _MAX_ACTION_REPEAT:
+                    return (
+                        f"Your {source} action sequence was not executed because step {index} "
+                        f"has repeat={repeat}; the maximum is {_MAX_ACTION_REPEAT}."
+                    )
+        return None
+
+    @staticmethod
+    def _normalize_camera_horizon(camera_horizon) -> float | None:
+        """Normalize the 330° encoding AI2-THOR also uses for -30° up."""
+        if isinstance(camera_horizon, bool):
+            return None
+        try:
+            horizon = float(camera_horizon)
+        except (TypeError, ValueError):
+            return None
+        return horizon - 360.0 if horizon > 180.0 else horizon
+
+    @classmethod
+    def _validate_camera_horizon_sequence(cls, steps: list[dict], camera_horizon) -> str | None:
+        """Reject LookUp/LookDown steps outside AI2-THOR's physical limits."""
+        horizon = cls._normalize_camera_horizon(camera_horizon)
+        if horizon is None or not (_CAMERA_HORIZON_MIN - _CAMERA_HORIZON_EPSILON) <= horizon <= (_CAMERA_HORIZON_MAX + _CAMERA_HORIZON_EPSILON):
+            return (
+                "Your action sequence was not executed because the current camera horizon "
+                f"{camera_horizon!r} is outside AI2-THOR's supported -30° to +60° range."
+            )
+        for index, step in enumerate(steps, start=1):
+            action = step["action"]
+            repeat = step.get("repeat", 1)
+            if action == "LookUp":
+                horizon -= _CAMERA_LOOK_STEP_DEGREES * repeat
+            elif action == "LookDown":
+                horizon += _CAMERA_LOOK_STEP_DEGREES * repeat
+            if not (_CAMERA_HORIZON_MIN - _CAMERA_HORIZON_EPSILON) <= horizon <= (_CAMERA_HORIZON_MAX + _CAMERA_HORIZON_EPSILON):
+                return (
+                    f"Your action sequence was not executed because {action} at step {index} "
+                    f"would move cameraHorizon to {horizon:.0f}°, outside AI2-THOR's "
+                    "supported -30° (up) to +60° (down) range."
+                )
+        return None
 
     def _track_searched_receptacles(self, proposed_params: dict):
         """Track receptacles opened/searched in a MoveSequence for CriticGuard."""
@@ -1384,8 +1814,7 @@ class BranchRunner:
                     msg,
                 )
 
-            repeat = max(1, int(step.get("repeat", 1)))
-            repeat = min(repeat, 200)
+            repeat = step.get("repeat", 1)
 
             succeeded = 0
             for r in range(repeat):
@@ -1880,6 +2309,7 @@ def run_single_branch(
     enable_contrastive_planner: bool = True,
     enable_progress_gating: bool = True,
     enable_search_trail: bool = True,
+    memory_mode: str = "semantic",  # "semantic" | "geometric"
 ) -> BranchResult:
     """
     一个 episode 的完整生命周期：加载数据 → 初始化环境 → 陷阱 → 跑分支。
@@ -1950,7 +2380,8 @@ def run_single_branch(
                               enable_curiosity_scoreboard=enable_curiosity_scoreboard,
                               enable_contrastive_planner=enable_contrastive_planner,
                               enable_progress_gating=enable_progress_gating,
-                              enable_search_trail=enable_search_trail)
+                              enable_search_trail=enable_search_trail,
+                              memory_mode=memory_mode)
 
         config = BranchConfig(
             episode_id=episode_id,

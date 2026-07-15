@@ -127,20 +127,44 @@ def _apply_dirty_and_empty(controller):
 
 def _merge_object_poses_for_current_scene(controller, alfred_object_poses: list[dict]) -> list[dict]:
     event = _step_or_raise(controller, "Pass")
-    alfred_by_name = {pose.get("objectName"): pose for pose in alfred_object_poses}
+    indexed_poses = list(enumerate(alfred_object_poses))
+    used_pose_indexes: set[int] = set()
     merged = []
 
     for obj in event.metadata.get("objects", []):
         if not (obj.get("pickupable") or obj.get("moveable")):
             continue
         object_name = _object_name(obj)
-        pose = alfred_by_name.get(object_name)
-        if pose is None:
+        pose_entry = next(
+            (
+                (index, pose) for index, pose in indexed_poses
+                if index not in used_pose_indexes and pose.get("objectName") == object_name
+            ),
+            None,
+        )
+        if pose_entry is None:
+            same_type = [
+                (index, pose) for index, pose in indexed_poses
+                if index not in used_pose_indexes
+                and _pose_object_type(pose) == obj.get("objectType")
+            ]
+            if same_type:
+                pose_entry = min(
+                    same_type,
+                    key=lambda entry: _position_distance(
+                        obj.get("position") or {}, entry[1].get("position") or {}
+                    ),
+                )
+
+        if pose_entry is None:
             pose = {
-                "objectName": object_name,
                 "position": obj["position"],
                 "rotation": obj["rotation"],
             }
+        else:
+            pose_index, pose = pose_entry
+            used_pose_indexes.add(pose_index)
+
         merged.append({
             "objectName": object_name,
             "position": pose["position"],
@@ -150,6 +174,14 @@ def _merge_object_poses_for_current_scene(controller, alfred_object_poses: list[
     if not merged:
         raise ValueError("No pickupable or moveable objects available for SetObjectPoses")
     return merged
+
+
+def _pose_object_type(pose: dict) -> str:
+    return (pose.get("objectName") or "").split("_", 1)[0]
+
+
+def _position_distance(left: dict, right: dict) -> float:
+    return math.sqrt(sum((left.get(axis, 0.0) - right.get(axis, 0.0)) ** 2 for axis in "xyz"))
 
 
 def _object_name(obj: dict) -> str:

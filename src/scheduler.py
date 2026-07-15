@@ -33,54 +33,59 @@ class SchedulerConfig:
     task_filter: str = ""
     splits: str = "train,valid_seen,valid_unseen"
     api_key: str = ""
-    api_base_url: str = "https://api.fullcupai.com"
+    api_base_url: str = "https://www.9527code.com/v1"
     planner_model: str = "gpt-5.5"
     executor_model: str = "gpt-5.5"
     oracle_model: str = "gpt-5.5"
-    planner_reasoning_effort: str = "xhigh"
+    planner_reasoning_effort: str = "medium"
     executor_reasoning_effort: str = "medium"
-    oracle_reasoning_effort: str = "xhigh"
+    oracle_reasoning_effort: str = "medium"
     enable_fork: bool = True
+    memory_mode: str = "semantic"  # "semantic" | "geometric"
 
 
 class Scheduler:
     def __init__(self, config: SchedulerConfig):
         self.config = config
-        planner_client = VLMClient.openai(
+        # Warmup: GPT-5.5 首次调用需加载，避免首次 Phase 超时
+        import time as _time
+        warmup_client = VLMClient.openai(
             config.planner_model, config.api_key,
             base_url=config.api_base_url,
             reasoning_effort=config.planner_reasoning_effort,
         )
-        executor_client = VLMClient.openai(
-            config.executor_model, config.api_key,
-            base_url=config.api_base_url,
-            reasoning_effort=config.executor_reasoning_effort,
-        )
-        oracle_client = VLMClient.openai(
-            config.oracle_model, config.api_key,
-            base_url=config.api_base_url,
-            reasoning_effort=config.oracle_reasoning_effort,
-        )
-        self.eb_agent = EBAgent(planner_client)
-        self.oracle_agent = OracleAgent(oracle_client)
-        self.executor_agent = ExecutorAgent(executor_client)
-        # Warmup: GPT-5.5 首次调用需加载，避免首次 Phase 超时
-        import time as _time
         _t0 = _time.time()
-        oracle_client.chat_text(system_prompt="Say OK.", user_text="OK", max_tokens=5)
+        warmup_client.chat_text(system_prompt="Say OK.", user_text="OK", max_tokens=5)
         print(f"Oracle warmup: {_time.time() - _t0:.1f}s")
-        self.branch_runner = BranchRunner(
-            self.eb_agent, self.oracle_agent, config.output_dir,
-            enable_fork=config.enable_fork,
-            executor_agent=self.executor_agent,
-        )
         self.fork_manager = ForkManager(
-            self.eb_agent, self.oracle_agent, self.branch_runner, config.output_dir,
+            None, None, None, config.output_dir,
         )
         self.queue: deque[dict] = deque()
         self.fork_queue: deque[dict] = deque()
-        self.stats = {"completed": 0, "skipped": 0, "failed": 0}
+        self._lock = threading.Lock()
         self.recorder = StepRecorder()
+
+    def _create_agents(self):
+        """Create fresh per-worker agents (VLMClient not thread-safe across models)."""
+        planner_client = VLMClient.openai(
+            self.config.planner_model, self.config.api_key,
+            base_url=self.config.api_base_url,
+            reasoning_effort=self.config.planner_reasoning_effort,
+        )
+        executor_client = VLMClient.openai(
+            self.config.executor_model, self.config.api_key,
+            base_url=self.config.api_base_url,
+            reasoning_effort=self.config.executor_reasoning_effort,
+        )
+        oracle_client = VLMClient.openai(
+            self.config.oracle_model, self.config.api_key,
+            base_url=self.config.api_base_url,
+            reasoning_effort=self.config.oracle_reasoning_effort,
+        )
+        eb_agent = EBAgent(planner_client)
+        oracle_agent = OracleAgent(oracle_client)
+        executor_agent = ExecutorAgent(executor_client)
+        return eb_agent, oracle_agent, executor_agent
 
     # ------------------------------------------------------------------
     # 任务加载
@@ -131,6 +136,7 @@ class Scheduler:
         self.load_tasks()
         total = len(self.queue)
         max_workers = max(1, self.config.max_parallel)
+        self.stats = {"completed": 0, "skipped": 0, "failed": 0}
         self._lock = threading.Lock()
 
         # Phase 1: parallel main branches
@@ -144,19 +150,22 @@ class Scheduler:
                 try:
                     result = future.result()
                 except Exception as e:
-                    result = BranchResult(
-                        branch_id=task["branch_config"].branch_id,
-                        termination_reason=f"worker_crash:{e}",
-                        total_steps=0, fork_tasks=[],
-                    )
                     with self._lock:
                         self.stats["failed"] += 1
-                if result:
-                    with self._lock:
+                    print(f"\n[{self.stats['completed'] + self.stats['failed'] + self.stats['skipped']}/{total}] "
+                          f"CRASH {task['episode_id']}: {e}")
+                    continue
+
+                with self._lock:
+                    if result.termination_reason == "skipped":
+                        self.stats["skipped"] += 1
+                    elif result.termination_reason.startswith("worker_crash"):
+                        self.stats["failed"] += 1
+                    else:
                         self.stats["completed"] += 1
                         for ft in result.fork_tasks:
                             self.fork_queue.append(self._fork_entry(task, ft))
-                        self._report(total)
+                    self._report(total)
 
         # Phase 2: serial fork branches (depends on parent completion)
         if self.fork_queue:
@@ -169,46 +178,29 @@ class Scheduler:
                 self.fork_queue.append(self._fork_entry(task, ft))
             self._report(total)
 
-        print(f"\n\nDone. {self.stats['completed']} branches, {self.stats['failed']} failed.")
+        print(f"\n\nDone. {self.stats['completed']} branches, {self.stats['failed']} failed, "
+              f"{self.stats['skipped']} skipped.")
 
     def _run_branch_worker(self, task: dict, n: int, total: int) -> BranchResult:
-        """Thread-safe wrapper around _run_branch."""
+        """Thread-safe worker: each thread creates its own agents and runner."""
         ep_id = task["episode_id"]
         out_file = os.path.join(self.config.output_dir, f"{ep_id}.json")
         if os.path.exists(out_file):
-            with self._lock:
-                self.stats["skipped"] += 1
             return BranchResult(branch_id="main", termination_reason="skipped",
                                 total_steps=0, fork_tasks=[], fork_source_step_ids=[])
         print(f"\n[{n}/{total}] Starting {ep_id}")
+        eb_agent, oracle_agent, executor_agent = self._create_agents()
         result = run_single_branch(
             traj_path=task["traj_path"],
-            eb_agent=self.eb_agent,
-            oracle_agent=self.oracle_agent,
+            eb_agent=eb_agent,
+            oracle_agent=oracle_agent,
             output_dir=self.config.output_dir,
             enable_fork=self.config.enable_fork,
-            executor_agent=self.executor_agent,
+            executor_agent=executor_agent,
+            memory_mode=self.config.memory_mode,
         )
         print(f"[{n}/{total}] Finished {ep_id}: {result.termination_reason} ({result.total_steps} steps)")
         return result
-
-    # ------------------------------------------------------------------
-    # Main 分支 → 委托 run_single_branch
-    # ------------------------------------------------------------------
-    def _run_branch(self, task: dict) -> BranchResult:
-        ep_id = task["episode_id"]
-        out_file = os.path.join(self.config.output_dir, f"{ep_id}.json")
-        if os.path.exists(out_file):
-            return BranchResult(branch_id="main", termination_reason="skipped",
-                                total_steps=0, fork_tasks=[], fork_source_step_ids=[])
-
-        return run_single_branch(
-            traj_path=task["traj_path"],
-            eb_agent=self.eb_agent,
-            oracle_agent=self.oracle_agent,
-            output_dir=self.config.output_dir,
-            enable_fork=self.config.enable_fork,
-        )
 
     # ------------------------------------------------------------------
     # Fork 分支 → replay + fork root + BranchRunner
@@ -273,8 +265,10 @@ class Scheduler:
                     total_steps=1, fork_tasks=[], fork_source_step_ids=[],
                 )
 
-            # 3. 重写推理 + 记录 fork root step（★ 统一 step_id 格式: s0）
-            rewritten = self.fork_manager._rewrite_reasoning(
+            # 3. 重写推理 + 记录 fork root step (fork phase is serial — create own agents)
+            eb_agent, oracle_agent, executor_agent = self._create_agents()
+            fm = ForkManager(eb_agent, oracle_agent, None, self.config.output_dir)
+            rewritten = fm._rewrite_reasoning(
                 shared_steps=shared_steps,
                 original_action="?",
                 original_reasoning="",
@@ -303,8 +297,13 @@ class Scheduler:
             }
             ep.add_step(fork_root)
 
-            # 4. 委托 BranchRunner 从 step_index=1 继续 ★ 链: s0(parent) ← s1
-            return self.branch_runner.run(
+            # 4. 委托 BranchRunner 从 step_index=1 继续
+            branch_runner = BranchRunner(
+                eb_agent, oracle_agent, self.config.output_dir,
+                enable_fork=self.config.enable_fork,
+                executor_agent=executor_agent,
+            )
+            return branch_runner.run(
                 config=config, env=env, ep=ep,
                 start_step_index=1,
             )
@@ -321,6 +320,7 @@ class Scheduler:
         }
 
     def _report(self, total: int):
-        remaining = len(self.queue) + len(self.fork_queue)
-        print(f"\r[{self.stats['completed']}/{total}] ok, {remaining} queued, "
-              f"{self.stats['failed']} failed", end="", flush=True)
+        done = self.stats["completed"] + self.stats["failed"] + self.stats["skipped"]
+        remaining = total - done
+        print(f"\r[{done}/{total}] {self.stats['completed']} ok, {remaining} remaining, "
+              f"{self.stats['failed']} failed, {self.stats['skipped']} skipped", end="", flush=True)

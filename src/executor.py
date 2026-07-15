@@ -10,7 +10,7 @@ import numpy as np
 from src.vlm_client import VLMClient
 from src.context_builder import render_current_intent_steps
 
-EXECUTOR_SYSTEM = """You are an embodied agent in a 3D household. The image is your FIRST-PERSON VIEW. You receive a high-level intent and must output 1-5 concrete actions to carry it out.
+EXECUTOR_SYSTEM = """I am an embodied agent in a 3D household. The image is my FIRST-PERSON VIEW. I receive a high-level intent and must output 1-5 concrete actions to carry it out.
 
 RULES:
 - Output at most 12 actions. Use "repeat" to batch same-direction movement. If you output more than 12, the entire sequence will be rejected.
@@ -28,7 +28,7 @@ RULES:
 ACTIONS:
   MoveAhead / MoveBack / MoveLeft / MoveRight (0.125m each, use "repeat": N to batch)
   RotateLeft / RotateRight (90deg)
-  LookUp / LookDown (tilt camera, max +30° up / -60° down from horizon)
+  LookUp / LookDown (tilt camera by 30°; cameraHorizon is positive down: valid range -30° up to +60° down)
   PickupObject(objectType)
   PutObject(objectType, receptacleType) — receptacleType from visible list, matching TASK TARGET
   OpenObject(objectType) / CloseObject(objectType)
@@ -155,8 +155,14 @@ class ExecutorAgent:
         if last_error:
             lines.append(f"\nLast error: {last_error}")
 
-        lines.append(f"\nCAMERA: tilt = {camera_horizon:.0f}° "
-                     f"(horizon=0°, max up=+30°, max down=-60°, remaining up={30-camera_horizon:.0f}° down={camera_horizon+60:.0f}°)")
+        normalized_horizon = camera_horizon - 360 if camera_horizon > 180 else camera_horizon
+        lines.append(
+            f"\nCAMERA: cameraHorizon = {normalized_horizon:.0f}° "
+            f"(0°=level; positive=down; valid up=-30°, down=+60°; "
+            f"remaining LookUp={normalized_horizon + 30:.0f}°, "
+            f"LookDown={60 - normalized_horizon:.0f}°). "
+            "Do not output LookUp or LookDown beyond these bounds."
+        )
 
         lines.append(f"\nGRID: 1 step = 0.125m. Use \\\"repeat\\\" to batch: distance / 0.125 = repeat count. E.g. 1.8m away → \\\"action\\\": \\\"MoveAhead\\\", \\\"repeat\\\": 15.")
         lines.append("Output your action sequence. USE REPEAT. Do NOT output individual steps.")
@@ -169,15 +175,4 @@ class ExecutorAgent:
             required_fields=("actions", "status", "reasoning", "status_reason"),
             max_tokens=16384,
         )
-        # Safety cap: reject excessive actions instead of silent truncation
-        actions = result.get("actions")
-        if actions is not None and len(actions) > 20:
-            import logging
-            logging.warning("Executor output %d actions — rejected as excessive", len(actions))
-            result["actions"] = []
-            result["status"] = "failed"
-            result["status_reason"] = (
-                f"Output {len(actions)} actions exceeds limit of 20. "
-                "Use at most 12 actions with 'repeat' for same-direction movement."
-            )
         return result

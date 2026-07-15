@@ -1,0 +1,16 @@
+# Embodied Failure Dataset — API Configuration
+# GPT-5.5 via OpenAI-compatible endpoint
+
+[api]
+base_url = "https://www.9527code.com/v1"
+api_key = "sk-IxXjSiRZ3IhCd4hxMajweiXamF0R1U1cHmNECBrRbIz8v0hy"
+
+[models]
+planner = "gpt-5.5"
+executor = "gpt-5.5"
+oracle = "gpt-5.5"
+
+[reasoning_effort]
+planner = "medium"
+executor = "medium"
+oracle = "medium"

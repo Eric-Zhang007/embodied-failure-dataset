@@ -306,8 +306,49 @@ class VLMClient:
     # ------------------------------------------------------------------
     # OpenAI 兼容后端（含日志）
     # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_content_from_200(resp_text: str) -> tuple[str, str | None, str | None]:
+        """Validate and extract content from an HTTP-200 response body.
+
+        Returns (content, reasoning_content_or_None, error_or_None).
+        If an error string is returned, content is empty and the caller should
+        log the malformed response and retry (or raise).
+        """
+        # Stage 1: valid JSON body
+        try:
+            body_data = json.loads(resp_text)
+        except json.JSONDecodeError as e:
+            return "", None, f"HTTP-200 body is not valid JSON: {e}"
+
+        # Stage 2: non-empty "choices" list
+        choices = body_data.get("choices")
+        if not isinstance(choices, list) or len(choices) == 0:
+            return "", None, f"HTTP-200 body missing non-empty 'choices' list; got: {type(choices).__name__}"
+
+        # Stage 3: dict "message" in first choice
+        msg = choices[0].get("message")
+        if not isinstance(msg, dict):
+            return "", None, f"HTTP-200 choices[0].message is not a dict; got: {type(msg).__name__}"
+
+        # Stage 4: non-empty string "content"
+        content = msg.get("content")
+        reasoning = msg.get("reasoning_content")
+
+        if content is not None and isinstance(content, str) and content.strip():
+            return content, reasoning or None, None
+
+        if content is None or (isinstance(content, str) and not content.strip()):
+            detail = f"HTTP-200 message.content is {repr(content)}"
+            if reasoning is not None and isinstance(reasoning, str) and reasoning.strip():
+                return "", reasoning, f"{detail} (reasoning_content present but no final content)"
+            return "", None, detail
+
+        return "", reasoning or None, f"HTTP-200 message.content is not a string; got: {type(content).__name__}"
+
     def _chat_openai(self, messages, json_mode, temperature, max_tokens):
         import requests
+
+        MAX_RESPONSE_RETRIES = 5  # bounded retries for malformed 200 responses
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -333,7 +374,10 @@ class VLMClient:
 
         last_conn_error = None
         timeout = 300
-        for attempt in range(3):  # 最多 3 次尝试（1 次正常 + 2 次重试）
+        tried_without_reasoning = False
+        transport_attempt = 0
+        while transport_attempt < 3:  # 最多 3 次传输尝试
+            transport_attempt += 1
             try:
                 resp = requests.post(
                     f"{self.base_url}/chat/completions",
@@ -343,52 +387,115 @@ class VLMClient:
                 )
                 elapsed = time.time() - t_start
                 if resp.status_code == 200:
-                    msg = resp.json()["choices"][0]["message"]
-                    content = msg["content"]
-                    reasoning = msg.get("reasoning_content", "")
-                    logger.debug("RESP model=%s status=200 elapsed=%.1fs content_len=%d reasoning_len=%d preview=%s",
-                                 self.model, elapsed, len(content), len(reasoning or ""), content[:500])
-                    self._write_api_exchange(body, 200, content, elapsed, attempt + 1,
-                                             reasoning_content=reasoning or None)
-                    return content
+                    content, reasoning, extract_error = self._extract_content_from_200(resp.text)
+                    if content:
+                        logger.debug("RESP model=%s status=200 elapsed=%.1fs content_len=%d reasoning_len=%d preview=%s",
+                                     self.model, elapsed, len(content), len(reasoning or ""), content[:500])
+                        self._write_api_exchange(body, 200, content, elapsed, transport_attempt,
+                                                 reasoning_content=reasoning or None)
+                        return content
+
+                    # Malformed 200: log and retry within the same transport connection
+                    for val_attempt in range(1, MAX_RESPONSE_RETRIES + 1):
+                        logger.warning("MALFORMED_200 model=%s attempt=%d/%d error=%s body_preview=%s",
+                                       self.model, val_attempt, MAX_RESPONSE_RETRIES, extract_error,
+                                       resp.text[:500])
+                        self._write_api_exchange(body, "200_MALFORMED", resp.text, elapsed, transport_attempt,
+                                                 reasoning_content=reasoning or None)
+
+                        # If reasoning-only response, next retry strips reasoning_effort
+                        if reasoning and not tried_without_reasoning and "reasoning_effort" in body:
+                            logger.warning("MALFORMED_200_FALLBACK model=%s retrying without reasoning_effort",
+                                           self.model)
+                            body.pop("reasoning_effort", None)
+                            tried_without_reasoning = True
+
+                        if val_attempt >= MAX_RESPONSE_RETRIES:
+                            break
+
+                        wait = 2 ** (val_attempt - 1)  # 1s, 2s, 4s, 8s backoff
+                        # On 4th+ attempt, double max_tokens
+                        if val_attempt >= 3 and body.get("max_tokens", 2048) < 8192:
+                            body["max_tokens"] = body["max_tokens"] * 2
+                            logger.warning("MALFORMED_200_RESCALE model=%s max_tokens=%d",
+                                           self.model, body["max_tokens"])
+                        time.sleep(wait)
+
+                        # Re-send the request (same transport connection loop)
+                        resp = requests.post(
+                            f"{self.base_url}/chat/completions",
+                            headers=headers,
+                            json=body,
+                            timeout=timeout,
+                        )
+                        elapsed = time.time() - t_start
+                        if resp.status_code != 200:
+                            break  # let outer transport logic handle non-200
+                        content, reasoning, extract_error = self._extract_content_from_200(resp.text)
+                        if content:
+                            logger.debug("RESP model=%s status=200 elapsed=%.1fs content_len=%d reasoning_len=%d preview=%s",
+                                         self.model, elapsed, len(content), len(reasoning or ""), content[:500])
+                            self._write_api_exchange(body, 200, content, elapsed, transport_attempt,
+                                                     reasoning_content=reasoning or None)
+                            return content
+
+                    # All validation attempts exhausted — fall through to next transport attempt
+                    self._dump_failure(body, "200_MALFORMED_EXHAUSTED",
+                                       f"{extract_error} (after {MAX_RESPONSE_RETRIES} validation attempts): {resp.text[:500]}",
+                                       elapsed)
+                    if transport_attempt < 3:
+                        logger.warning("MALFORMED_200_EXHAUSTED model=%s retrying transport attempt=%d/3",
+                                       self.model, transport_attempt + 1)
+                        time.sleep(2 ** (transport_attempt - 1))
+                        continue
+                    raise ValueError(
+                        f"VLM returned HTTP-200 but response was malformed after "
+                        f"{MAX_RESPONSE_RETRIES}×3 validation attempts: {extract_error}"
+                    )
                 # 429: rate limited - wait and retry
                 if resp.status_code == 429:
-                    self._write_api_exchange(body, 429, resp.text, elapsed, attempt + 1)
-                    wait = 5 * (attempt + 1)
-                    logger.warning("RATE_LIMIT retry %d/3 wait %ds", attempt + 1, wait)
+                    self._write_api_exchange(body, 429, resp.text, elapsed, transport_attempt)
+                    wait = 5 * transport_attempt
+                    logger.warning("RATE_LIMIT retry %d/3 wait %ds", transport_attempt, wait)
                     time.sleep(wait)
                     continue
                 # 5xx: server errors (502/503/504/524) — transient, retry with backoff
                 if resp.status_code >= 500:
-                    self._write_api_exchange(body, resp.status_code, resp.text, elapsed, attempt + 1)
-                    if attempt < 2:
-                        wait = 2 ** attempt  # 1s, 2s
+                    self._write_api_exchange(body, resp.status_code, resp.text, elapsed, transport_attempt)
+                    if transport_attempt < 3:
+                        wait = 2 ** (transport_attempt - 1)  # 1s, 2s
                         logger.warning("SERVER_ERR retry %d/3 status=%d wait=%ds",
-                                       attempt + 1, resp.status_code, wait)
+                                       transport_attempt, resp.status_code, wait)
                         time.sleep(wait)
                         continue
                     # All retries exhausted — dump and raise
                     self._dump_failure(body, resp.status_code, resp.text, elapsed)
                     resp.raise_for_status()
-                # Other errors (4xx client errors): dump and raise immediately
-                self._write_api_exchange(body, resp.status_code, resp.text, elapsed, attempt + 1)
+                # Other errors (4xx client errors / relay glitches): retry, then dump and raise
+                self._write_api_exchange(body, resp.status_code, resp.text, elapsed, transport_attempt)
+                if transport_attempt < 3:
+                    wait = 2 ** transport_attempt  # 1s, 2s, 4s
+                    logger.warning("CLIENT_ERR retry %d/3 status=%d wait=%ds",
+                                   transport_attempt, resp.status_code, wait)
+                    time.sleep(wait)
+                    continue
                 self._dump_failure(body, resp.status_code, resp.text, elapsed)
                 resp.raise_for_status()
 
             except requests.exceptions.ConnectionError as e:
                 last_conn_error = e
                 elapsed = time.time() - t_start
-                self._write_api_exchange(body, "CONNECTION_ERROR", str(e), elapsed, attempt + 1)
-                logger.warning("CONN_ERR model=%s attempt=%d/3 error=%s", self.model, attempt + 1, e)
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+                self._write_api_exchange(body, "CONNECTION_ERROR", str(e), elapsed, transport_attempt)
+                logger.warning("CONN_ERR model=%s attempt=%d/3 error=%s", self.model, transport_attempt, e)
+                if transport_attempt < 3:
+                    time.sleep(2 ** (transport_attempt - 1))
 
             except requests.exceptions.Timeout:
                 elapsed = time.time() - t_start
-                self._write_api_exchange(body, "TIMEOUT", f"timeout={timeout}s", elapsed, attempt + 1)
+                self._write_api_exchange(body, "TIMEOUT", f"timeout={timeout}s", elapsed, transport_attempt)
                 logger.warning("TIMEOUT model=%s attempt=%d/3 timeout=%ds elapsed=%.1fs",
-                              self.model, attempt + 1, timeout, elapsed)
-                if attempt < 2:
+                              self.model, transport_attempt, timeout, elapsed)
+                if transport_attempt < 3:
                     timeout += 100  # 300 → 400 → 500
                     continue
                 self._dump_failure(body, "TIMEOUT_EXHAUSTED",

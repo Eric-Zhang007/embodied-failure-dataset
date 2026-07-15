@@ -21,10 +21,20 @@ def main():
     parser.add_argument("--max", type=int, default=0)
     parser.add_argument("--task", type=str, default="")
     parser.add_argument("--splits", default="train,valid_seen,valid_unseen")
-    parser.add_argument("--eb-model", default="Qwen/Qwen3-VL-32B-Instruct")
-    parser.add_argument("--oracle-model", default="Qwen/Qwen3-VL-32B-Instruct")
-    parser.add_argument("--api-key", default="", help="SiliconFlow API key")
+    parser.add_argument("--api-key", default="", help="OpenAI API key")
+    parser.add_argument("--api-base-url", default="https://www.9527code.com/v1", help="OpenAI-compatible API base URL")
+    parser.add_argument("--planner-model", default="gpt-5.5")
+    parser.add_argument("--oracle-model", default="gpt-5.5")
+    parser.add_argument("--executor-model", default="gpt-5.5")
+    parser.add_argument("--planner-reasoning-effort", default="medium",
+                        choices=["low", "medium", "high", "xhigh", "max"])
+    parser.add_argument("--executor-reasoning-effort", default="medium",
+                        choices=["low", "medium", "high", "xhigh", "max"])
+    parser.add_argument("--oracle-reasoning-effort", default="medium",
+                        choices=["low", "medium", "high", "xhigh", "max"])
     parser.add_argument("--no-fork", action="store_true", help="Disable counterfactual forks")
+    parser.add_argument("--memory", default="semantic", choices=["semantic", "geometric"],
+                        help="Memory mode: semantic (receptacle-grouped) or geometric (flat list)")
     parser.add_argument("--parallel", type=int, default=1)
     args = parser.parse_args()
 
@@ -40,11 +50,17 @@ def main():
         max_episodes=args.max,
         task_filter=args.task,
         splits=args.splits,
-        eb_model=args.eb_model,
+        api_key=args.api_key,
+        api_base_url=args.api_base_url,
+        planner_model=args.planner_model,
         oracle_model=args.oracle_model,
-        siliconflow_key=args.api_key,
+        executor_model=args.executor_model,
+        planner_reasoning_effort=args.planner_reasoning_effort,
+        executor_reasoning_effort=args.executor_reasoning_effort,
+        oracle_reasoning_effort=args.oracle_reasoning_effort,
         enable_fork=not args.no_fork,
         max_parallel=args.parallel,
+        memory_mode=args.memory,
     )
 
     scheduler = Scheduler(config)

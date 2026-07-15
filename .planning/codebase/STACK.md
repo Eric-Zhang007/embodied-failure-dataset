@@ -1,6 +1,6 @@
 # Technology Stack
 
-**Analysis Date:** 2026-06-12
+**Analysis Date:** 2026-07-15
 
 ## Languages
 
@@ -70,29 +70,32 @@
 
 ## VLM Model Configuration
 
-Three models hosted via SiliconFlow API. All accessed through OpenAI-compatible `/chat/completions` endpoint:
+Single model accessed via OpenAI-compatible API (www.9527code.com/v1):
 
-| Role | Agent Class | Model | Context Window | Purpose |
-|------|-------------|-------|----------------|---------|
-| Planner (EB) | `EBAgent` in `src/eb_agent.py` | `Qwen/Qwen3-VL-32B-Instruct` | 32K+ | Phase 1 intent proposal, review, Phase 3 diagnosis, scan room analysis |
-| Executor | `ExecutorAgent` in `src/executor.py` | `Qwen/Qwen3-VL-8B-Instruct` | 8K+ | Intent-to-actions decomposition |
-| Oracle | `OracleAgent` in `src/oracle_agent.py` | `Qwen/Qwen3-VL-32B-Instruct` | 32K+ | Phase 2 injection decisions, Phase 4 evaluation |
+| Role | Agent Class | Model | Reasoning Effort | Purpose |
+|------|-------------|-------|-------------------|---------|
+| Planner (EB) | `EBAgent` in `src/eb_agent.py` | `gpt-5.5` | medium | Phase 1 intent, review, Phase 3 diagnosis, scan room analysis |
+| Executor | `ExecutorAgent` in `src/executor.py` | `gpt-5.5` | medium | Intent-to-actions decomposition |
+| Oracle | `OracleAgent` in `src/oracle_agent.py` | `gpt-5.5` | medium | Phase 2 injection decisions, Phase 4 evaluation |
 
-- Planner and Oracle share the same 32B model with completely different system prompts.
-- Executor (8B) is a lighter model. Falls back to single-agent mode (Planner proposes actions directly) when Executor is not configured.
-- Model names exposed via CLI args: `--eb-model`, `--oracle-model`, `--executor-model`.
+- All three roles use the same model with different system prompts.
+- Model default: `--planner-model gpt-5.5` / `--executor-model gpt-5.5` / `--oracle-model gpt-5.5`.
+- Reasoning effort default: `medium` (xhigh causes content=None on multi-image gpt-5.5).
 
 ## VLM Client Features
 
-**Network retry** (`src/vlm_client.py` `_chat_openai()`):
-- Connection errors: 3 attempts, exponential backoff (1s, 2s, 4s).
-- Timeout escalation: 300s → 400s → 500s (3 attempts).
-- Rate limiting (HTTP 429): waits 5s, 10s, 15s.
+**Response validation** (`src/vlm_client.py` `_chat_openai()`):
+- HTTP-200 5-stage validation: JSON parse → non-empty choices → dict message → non-empty string content
+- reasoning_effort auto-strip fallback: when reasoning_content present but content=None, retry without reasoning_effort
+- Malformed 200 retry: 5 attempts with exponential backoff (1s→2s→4s→8s), max_tokens doubling at attempt 3+ (→4096→8192)
+- Exhaustion falls through to transport retries (3×5=15 total)
+- 400 transport retry: 3 attempts with backoff (proxy glitch workaround)
 
-**JSON parse retry:**
-- Up to 2 retries with explicit error feedback injected into the prompt text.
-- Thinking model CoT support: `parse_json_response()` extracts JSON `{...}` from surrounding text (`src/vlm_client.py` lines 467-477).
-- `required_fields` validation catches missing keys after parsing.
+**Transport retry:**
+- Connection errors: 3 attempts, exponential backoff (1s, 2s, 4s)
+- Timeout escalation: 300s → 400s → 500s (3 attempts)
+- Rate limiting (HTTP 429): waits 5s, 10s, 15s
+- Server errors (5xx): 3 attempts with backoff
 
 **Image handling:**
 - Pipeline: numpy array (HWC uint8) → PIL → PNG bytes → base64 → inline `data:image/png;base64,...` URI.

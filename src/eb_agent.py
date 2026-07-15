@@ -24,7 +24,7 @@ from src.curiosity_scorer import (
 # Phase 1: 动作提议
 # ------------------------------------------------------------------
 
-PHASE1_SYSTEM = """You are an embodied agent in a 3D household. The image is your FIRST-PERSON VIEW. You occupy a physical body; every action moves or rotates you.
+PHASE1_SYSTEM = """I am an embodied agent in a 3D household. The image is my FIRST-PERSON VIEW. I occupy a physical body; every action moves or rotates me.
 
 RULES:
 - Interaction range is 0.5m. Check distance BEFORE PickupObject/PutObject/etc. If >0.5m, MoveAhead (0.125m/step) first. Never interact beyond 0.5m.
@@ -379,7 +379,7 @@ def build_phase3_prompt(
 # EB Agent 顶层
 # ------------------------------------------------------------------
 
-PLANNER_SYSTEM = """You are an embodied agent in a 3D household. The image is your FIRST-PERSON VIEW. Your job is HIGH-LEVEL PLANNING: you decide WHAT to do, not exactly HOW. Another part of you (Executor) will handle the detailed action steps.
+PLANNER_SYSTEM = """I am an embodied agent in a 3D household. The image is my FIRST-PERSON VIEW. My job is HIGH-LEVEL PLANNING: I decide WHAT to do, not exactly HOW. Another part of me (Executor) will handle the detailed action steps.
 
 Output a single high-level intent. Be specific about the target object. Use EXACT objectType names.
 
@@ -439,19 +439,19 @@ OUTPUT — valid JSON only. { first char, } last char. No markdown.
   "reasoning": "<1-3 sentences: why this intent now, first-person>"
 }"""
 
-PLANNER_REVIEW_SYSTEM = """You are an embodied agent reviewing your Executor's proposed action sequence. Default to APPROVE unless there is a CRITICAL error.
+PLANNER_REVIEW_SYSTEM = """I am an embodied agent reviewing my Executor's proposed action sequence. I should APPROVE unless there is a CRITICAL error.
 
 ONLY reject if:
 - PickupObject/PutObject proposed when target is clearly >0.5m away
 - MoveAhead proposed directly into a known blocked direction (check recent history!)
 - Actions would clearly move AWAY from the target
 
-STUCK DETECTION: if the last 2+ attempts in recent history all failed at their FIRST action, the agent is trapped at a navigable-area edge. In this case, MoveBack IS the correct action — approve it, or if the Executor didn't propose it, add it to corrected_actions.
+STUCK DETECTION: if the last 2+ attempts in recent history all failed at their FIRST action, I am trapped at a navigable-area edge. In this case, MoveBack IS the correct action — I should approve it, or if the Executor didn't propose it, add it to corrected_actions.
 
-Do NOT reject for:
+I should NOT reject for:
 - Minor inefficiency (extra steps are fine)
-- "Could be more direct" — the Executor sees the current view, trust it
-- Slightly different approach than what you would do
+- "Could be more direct" — the Executor sees the current view, I should trust it
+- Slightly different approach than what I would do
 
 OUTPUT — valid JSON only:
 
@@ -466,7 +466,7 @@ OUTPUT — valid JSON only:
 # Contrastive Planner (Spike 004): explore-bias system prompt
 # ------------------------------------------------------------------
 
-EXPLORE_BIAS_SYSTEM = """You are an embodied agent in EXPLORATION MODE. Your job is HIGH-LEVEL PLANNING with an exploration bias.
+EXPLORE_BIAS_SYSTEM = """I am an embodied agent in EXPLORATION MODE. My job is HIGH-LEVEL PLANNING with an exploration bias.
 
 CRITICAL — EXPLORATION DIRECTIVE:
 - You MUST choose a location / receptacle you have NOT yet visited or searched.

@@ -12,7 +12,7 @@
 | Phase | 名称 | 对应需求 | 状态 |
 |-------|------|---------|------|
 | P1 | 系统稳定性 + 意图记忆 | R1, R3, R4 | ✅ 完成 |
-| P2 | 空间记忆语义化 | R2 | ← 当前 |
+| P2 | 空间记忆语义化 | R2 | 🟡 模块完成，任务级待做 |
 | P3 | 模糊 Intent 分解 + 执行精度 | R3, R1 | 依赖 P2 |
 | P4 | 系统性探索 + scan→scan 修复 | R4, R5 | 依赖 P2 |
 | P5 | Fork 验证 | R6 | 依赖 P1-P4 |
@@ -22,16 +22,21 @@
 
 已完成。改动清单见 STATE.md。
 
-## Phase 2: 空间记忆语义化 ← 当前
+## Phase 2: 空间记忆语义化 🟡（模块完成，任务级待做）
 
 **目标**: 空间记忆从纯几何（方向+距离）升级为语义化（物体关系 + 位置描述 + 新鲜度）。
 
-**任务**:
-1. egocentric_memory 记录每个物体的 `last_seen_on`（在哪个 receptacle 上）、`last_seen_step`
-2. render 输出升级为自然语言
-3. 在 Executor/Planner prompt 中接入新记忆格式
+**已完成**:
+1. memory_interface.py — 统一记忆基类 API
+2. geometric_memory.py — 从 egocentric_memory 重构，GeometricMemory(interface)
+3. semantic_memory.py — receptacle 分组、新鲜度追踪、任务进度、"I" 视角
+4. egocentric_memory.py → backward-compat shim
+5. `--memory semantic/geometric` CLI 接入所有脚本
+6. 系统 prompt 全面切换为第一人称 "I"
 
-**验证**: 查看 E2E prompt 日志，确认记忆输出包含语义信息。
+**待做**:
+1. semantic_memory 任务级集成 — Planner prompt 注入 "WHERE MY TARGET IS" 等语义信息时自动触发正确的探索行为（如 "打开 Fridge 查找 Apple"）
+2. 同类型物体 disambiguation 增强（Tomato vs Apple 视觉混淆）
 
 ## Phase 3: 模糊 Intent 分解 + 执行精度
 

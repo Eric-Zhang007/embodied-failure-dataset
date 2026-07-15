@@ -141,6 +141,79 @@ class EnvironmentFailureAgent:
         }
 
 
+class EmptyPartialExecutor:
+    def __init__(self):
+        self.calls = 0
+
+    def execute_intent(self, **kwargs):
+        self.calls += 1
+        return {
+            "actions": [],
+            "status": "partial",
+            "reasoning": "I need another call.",
+            "status_reason": "No executable action was produced.",
+        }
+
+
+class EmptyDoneThenMoveExecutor:
+    def __init__(self):
+        self.calls = 0
+
+    def execute_intent(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "actions": [],
+                "status": "done",
+                "reasoning": "The current approach intent is already satisfied.",
+                "status_reason": "Already within approach range.",
+            }
+        return {
+            "actions": [{"action": "MoveAhead"}],
+            "status": "done",
+            "reasoning": "Move once to complete the next intent.",
+            "status_reason": "The next intent will be complete after this move.",
+        }
+
+
+class AlwaysEmptyDoneExecutor:
+    def __init__(self):
+        self.calls = 0
+
+    def execute_intent(self, **kwargs):
+        self.calls += 1
+        return {
+            "actions": [],
+            "status": "done",
+            "reasoning": "Already there.",
+            "status_reason": "No movement needed.",
+        }
+
+
+class EmptyDonePlanner:
+    def __init__(self, repeat_same_intent=False):
+        self.repeat_same_intent = repeat_same_intent
+        self.plan_calls = []
+        self.review_calls = 0
+        self.dedup_stats = {}
+
+    def plan_intent(self, **kwargs):
+        self.plan_calls.append(kwargs)
+        if self.repeat_same_intent or len(self.plan_calls) == 1:
+            return {"intent": "approach Table", "target": "Table", "reasoning": "test"}
+        return {"intent": "approach Apple", "target": "Apple", "reasoning": "next intent"}
+
+    def analyze_scan_room(self, **kwargs):
+        return {"face_direction": "ahead", "intent": "approach Table", "target": "Table", "reasoning": "test"}
+
+    def review_actions(self, **kwargs):
+        self.review_calls += 1
+        return {"approved": True, "reason": "ok", "corrected_actions": []}
+
+    def diagnose_failure(self, **kwargs):
+        raise AssertionError("empty done must not enter Phase 3")
+
+
 class NoopOracle:
     def decide_injection(self, **kwargs):
         return {"inject": False, "reasoning": "", "injection": None}
@@ -181,7 +254,8 @@ class CompletingAfterMoveEnv:
 
     def step(self, action, **params):
         self.step_calls.append((action, params))
-        self.moved = True
+        if action == "MoveAhead":
+            self.moved = True
         return {
             "success": True,
             "error": None,
@@ -379,9 +453,161 @@ class ErrorHandlingTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             replay_steps(RaisingReplayEnv(), steps, skip_failed=True)
 
-    # Tests for old single-agent error handling removed — the init LookAround
-    # rewrite changed the entry flow for the legacy code path. These error
-    # handling scenarios will be re-tested when the legacy path is retired.
+    def test_constructor_preserves_ablation_flags(self):
+        flags = {
+            "enable_searched_markers": False,
+            "enable_intent_dedup": False,
+            "enable_critic_guard": True,
+            "enable_curiosity_scoreboard": False,
+            "enable_contrastive_planner": False,
+            "enable_progress_gating": False,
+            "enable_search_trail": False,
+        }
+        runner = BranchRunner(object(), NoopOracle(), ".", **flags)
+
+        for name, expected in flags.items():
+            self.assertEqual(expected, getattr(runner, name))
+
+    def test_executor_empty_partial_is_nonexecuted_model_error(self):
+        message = BranchRunner._validate_executor_result([], "partial", "executor")
+
+        self.assertIsNotNone(message)
+        self.assertIn("was not executed", message)
+        self.assertIn("non-empty JSON list", message)
+
+    def test_empty_executor_result_retries_without_phase3_or_environment_step(self):
+        executor = EmptyPartialExecutor()
+        runner = BranchRunner(
+            EnvironmentFailureAgent(), NoopOracle(), ".", executor_agent=executor, enable_phase2=False
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.output_dir = tmp
+            with self.assertRaisesRegex(RuntimeError, "non-empty JSON list"):
+                runner.run(
+                    BranchConfig("ep", "main", None),
+                    FailingMoveEnv(),
+                    self._episode(tmp),
+                )
+            with open(f"{tmp}/ep/failures_main.jsonl", encoding="utf-8") as failure_file:
+                failures = [json.loads(line) for line in failure_file]
+
+        self.assertEqual(3, executor.calls)
+        self.assertTrue(all(f["failure_type"] == "model_invalid_action_sequence" for f in failures))
+
+    def test_executor_empty_done_completes_intent_without_review_or_phase3(self):
+        planner = EmptyDonePlanner()
+        executor = EmptyDoneThenMoveExecutor()
+        oracle = NoopOracle()
+        oracle.evaluate_failure = lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("empty done must not enter Phase 4")
+        )
+        runner = BranchRunner(
+            planner, oracle, ".", executor_agent=executor, enable_phase2=False
+        )
+        env = CompletingAfterMoveEnv()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.output_dir = tmp
+            result = runner.run(
+                BranchConfig("ep", "main", None),
+                env,
+                self._episode(tmp),
+            )
+
+        self.assertEqual("task_complete", result.termination_reason)
+        self.assertEqual(2, executor.calls)
+        self.assertEqual(1, planner.review_calls)
+        self.assertEqual(1, sum(action == "MoveAhead" for action, _ in env.step_calls))
+        completed = planner.plan_calls[1]["intent_history"][-1]
+        self.assertEqual("approach Table", completed["intent"])
+        self.assertEqual("Table", completed["target"])
+        self.assertTrue(completed["completed"])
+        self.assertEqual([], completed["steps"])
+        self.assertEqual("Already within approach range.", completed["completion_reason"])
+
+    def test_repeated_empty_done_intent_fails_without_review_or_environment_step(self):
+        planner = EmptyDonePlanner(repeat_same_intent=True)
+        executor = AlwaysEmptyDoneExecutor()
+        runner = BranchRunner(
+            planner, NoopOracle(), ".", executor_agent=executor, enable_phase2=False
+        )
+        env = FailingMoveEnv()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.output_dir = tmp
+            with self.assertRaisesRegex(RuntimeError, "already completed without actions"):
+                runner.run(
+                    BranchConfig("ep", "main", None),
+                    env,
+                    self._episode(tmp),
+                )
+            with open(f"{tmp}/ep/failures_main.jsonl", encoding="utf-8") as failure_file:
+                failures = [json.loads(line) for line in failure_file]
+
+        self.assertEqual(4, executor.calls)
+        self.assertEqual(0, planner.review_calls)
+        self.assertEqual(3, len(failures))
+        self.assertTrue(
+            all(f["failure_type"] == "model_repeated_completed_intent" for f in failures)
+        )
+
+    def test_executor_malformed_status_is_nonexecuted_model_error(self):
+        message = BranchRunner._validate_executor_result(
+            [{"action": "MoveAhead"}], "retry", "executor"
+        )
+
+        self.assertIsNotNone(message)
+        self.assertIn("status 'retry' is invalid", message)
+
+    def test_reviewer_malformed_correction_is_nonexecuted_model_error(self):
+        message = BranchRunner._validate_executor_result(
+            [{"action": "MoveAhead", "params": []}], "done", "reviewer correction"
+        )
+
+        self.assertIsNotNone(message)
+        self.assertIn("reviewer correction", message)
+        self.assertIn("params must be a JSON object", message)
+
+    def test_action_contract_rejects_missing_interaction_params_and_bad_repeat(self):
+        self.assertIn("objectType", BranchRunner._validate_standalone_action(
+            "PutObject", {}, 0
+        ))
+        self.assertIn("receptacleType", BranchRunner._validate_standalone_action(
+            "PutObject", {"objectType": "Apple"}, 0
+        ))
+        self.assertIn("unsupported action", BranchRunner._validate_action_sequence(
+            [{"action": "RotateLeft", "repeat": 2}], "sequence"
+        ))
+        self.assertIn("maximum is 200", BranchRunner._validate_action_sequence(
+            [{"action": "MoveAhead", "repeat": 201}], "sequence"
+        ))
+        self.assertIn("maximum is 12", BranchRunner._validate_action_sequence(
+            [{"action": "MoveAhead"}] * 13, "sequence"
+        ))
+
+    def test_camera_sequence_rejects_look_actions_outside_ai2thor_bounds(self):
+        self.assertIsNotNone(
+            BranchRunner._validate_camera_horizon_sequence(
+                [{"action": "LookDown"}], 60
+            )
+        )
+        self.assertIsNotNone(
+            BranchRunner._validate_camera_horizon_sequence(
+                [{"action": "LookUp"}], 330
+            )
+        )
+        self.assertIsNone(
+            BranchRunner._validate_camera_horizon_sequence(
+                [{"action": "LookDown"}], 30
+            )
+        )
+        self.assertIsNone(
+            BranchRunner._validate_camera_horizon_sequence(
+                [{"action": "LookUp"}], 0
+            )
+        )
+
+    def test_initial_trap_setup_failure_is_logged_and_raises(self):
         import src.alfred_parser as alfred_parser
 
         original_env = branch_runner_module.EnvController

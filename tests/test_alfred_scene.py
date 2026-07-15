@@ -121,6 +121,39 @@ class AlfredSceneTest(unittest.TestCase):
         self.assertEqual({"x": 1, "y": 1, "z": 1}, poses[0]["position"])
         self.assertEqual({"x": 9, "y": 9, "z": 9}, poses[1]["position"])
 
+    def test_restore_matches_alfred_pose_by_type_when_runtime_suffix_changes(self):
+        controller = FakeController({
+            "lastActionSuccess": True,
+            "objects": [
+                {
+                    "objectId": "Laptop|-00.80|+00.90|-01.38",
+                    "name": "Laptop_86a40811",
+                    "objectType": "Laptop",
+                    "pickupable": True,
+                    "position": {"x": -0.8, "y": 0.9, "z": -1.38},
+                    "rotation": {"x": 0, "y": 0, "z": 0},
+                },
+            ],
+        })
+        scene = {
+            "object_poses": [
+                {
+                    "objectName": "Laptop_b256e6c5",
+                    "position": {"x": 2.6, "y": 0.77, "z": -1.06},
+                    "rotation": {"x": 0, "y": 180, "z": 0},
+                },
+            ],
+            "object_toggles": [],
+            "dirty_and_empty": False,
+        }
+
+        restore_alfred_scene(controller, scene)
+
+        pose = controller.calls[-1]["objectPoses"][0]
+        self.assertEqual("Laptop_86a40811", pose["objectName"])
+        self.assertEqual({"x": 2.6, "y": 0.77, "z": -1.06}, pose["position"])
+        self.assertEqual({"x": 0, "y": 180, "z": 0}, pose["rotation"])
+
     def test_init_action_runs_after_restore(self):
         controller = FakeController()
         apply_init_action(

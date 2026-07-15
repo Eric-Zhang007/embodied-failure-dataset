@@ -1,15 +1,13 @@
 # Codebase Concerns
 
-**Analysis Date:** 2026-06-12
+**Analysis Date:** 2026-07-15
 
 ## Tech Debt
 
-### Zero Automated Tests
+### Zero Automated Tests — RESOLVED (2026-07)
 
-- **Issue:** No unit tests, integration tests, or CI pipeline exist. The `tests/` directory contains 8 test files (~1,200 lines) but they are script-style smoke tests not runnable via a test framework. `pyproject.toml` has no test dependency (no `pytest`). Core modules like `task_conditions.py`, `action_adapter.py`, `context_builder.py`, `episode_manager.py`, `trap_planner.py`, `alfred_parser.py` are pure logic with zero AI2-THOR dependency — all are unit-testable, none are tested.
-- **Files:** `tests/*.py`, `pyproject.toml`
-- **Impact:** Any refactoring risks silent regressions. No safety net.
-- **Fix approach:** Add `pytest` to dependencies. Write unit tests for all pure-logic modules. Add CI (GitHub Actions) to run tests on push.
+- **Resolution:** 58 unit tests across 8 test files runnable via `unittest discover`. Core modules tested: vlm_client (14), scheduler (9), error_handling (13), task_conditions (5), eb_agent_prompts (2), context_builder (5), alfred_scene (5), env_injector (3), training_prompt (2).
+- Still missing: No CI pipeline. No `pytest` integration (uses unittest).
 
 ### API Key Hardcoded in CLAUDE.md
 
@@ -173,12 +171,10 @@
 - **Impact:** Duplicate or incompatible injection methods cause agent confusion that's hard to debug.
 - **Fix approach:** Pass the list of previous injections to the Oracle so it can avoid duplicates.
 
-### EgocentricMemory Lacks Semantic Spatial Relationships
+### EgocentricMemory Lacks Semantic Spatial Relationships — RESOLVED (2026-07)
 
-- **Issue:** The memory tracks objects by direction + distance only. It stores no "on the table" or "inside the cabinet" parent-child relationships.
-- **Files:** `src/egocentric_memory.py:18-36` (_ObjectEntry fields: no parent receptacle)
-- **Impact:** When the Planner asks "find the knife," the memory says "ahead ~2.3m" but cannot say "on the DiningTable." The model has to re-derive spatial relationships from scratch.
-- **Fix approach:** Store parent receptacle information from `obj.get("parentReceptacles", [])` in `_ObjectEntry`, and surface it in `_render_object_line`.
+- **Resolution:** SemanticMemory module (`src/semantic_memory.py`) stores receptacle groups, freshness tracking, task progress. Objects grouped by parent receptacle. GeometricMemory preserved as `--memory geometric` fallback.
+- Remaining concern: Planner-level integration not yet complete.
 
 ### Agent Path Buffer (20 entries) is Small
 
