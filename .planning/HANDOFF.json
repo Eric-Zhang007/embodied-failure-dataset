@@ -1,71 +1,65 @@
 {
   "version": "1.0",
-  "timestamp": "2026-07-15T22:00:00.000Z",
-  "phase": "m1-runtime-debug",
-  "phase_name": "M1 System Stabilization + Semantic Memory",
+  "timestamp": "2026-07-17",
+  "phase": "m1-p2",
+  "phase_name": "M1 P2: Semantic Memory Integration + Executor Escape + Phase 3 Fixes",
   "phase_dir": ".planning",
   "plan": 1,
-  "task": 7,
-  "total_tasks": 7,
+  "task": 3,
+  "total_tasks": 6,
   "status": "paused",
   "completed_tasks": [
     {
       "id": 1,
-      "name": "Validate strict Executor and action boundaries",
+      "name": "P2 Planner-level memory integration (MEMORY OVER VISUAL GUESSING, CONTAINER-FIRST, DISAMBIGUATION)",
       "status": "done",
-      "progress": "35/35 tests"
+      "progress": "PLANNER_SYSTEM + EXPLORE_BIAS_SYSTEM updated. E2E shows Planner follows memory correctly."
     },
     {
       "id": 2,
-      "name": "Run real no-trap E2E",
+      "name": "Executor stuck escape + lateral cap fix",
       "status": "done",
-      "progress": "Exposed /v1 + restoration bugs"
+      "progress": "MoveBack x8 (was x4), no re-approach after escape, MoveRight/MoveLeft cap x4. Failure rate 50%->12%."
     },
     {
       "id": 3,
-      "name": "Fix ALFRED pose restoration",
+      "name": "Memory freshness pipeline (replay fidelity, inventory restore, intent tracking, failure-aware rendering, failure-aware phase)",
       "status": "done",
-      "progress": "Type+nearest-position fallback + test"
+      "progress": "5 sub-fixes across branch_runner.py + semantic_memory.py. 58/58 tests."
     },
     {
       "id": 4,
-      "name": "Harden HTTP-200 VLM response parsing",
+      "name": "Phase 3 collision-entity hallucination fix",
       "status": "done",
-      "progress": "5-stage validation, reasoning_effort fallback, 400 retry, 12 tests"
+      "progress": "PHASE3_SYSTEM now explicitly warns about Cube.001/OVENDOOR.001 as non-interactable. Prompt-only fix per user directive."
     },
     {
       "id": 5,
-      "name": "Fix Scheduler parallel orchestration",
-      "status": "done",
-      "progress": "Per-worker agent isolation, fixed accounting, 9 tests"
+      "name": "E2E test on pick_heat_then_place_in_recep (hardest task)",
+      "status": "in_progress",
+      "progress": "Agent reached heating phase (Egg in Microwave, Microwave toggled on) before API 524 timeout. 24 steps, 3 failures (12.5%)."
     },
     {
       "id": 6,
-      "name": "Run action-path E2E + semantic memory validation",
+      "name": "Cleanup stale test files",
       "status": "done",
-      "progress": "task_complete (6 steps + 19 steps resume). Semantic memory live."
-    },
-    {
-      "id": 7,
-      "name": "Refresh all planning docs + milestone summary + commit+push",
-      "status": "done",
-      "progress": "9 docs updated. e955475 pushed to main."
+      "progress": "Removed 15 one-off debug/inspect scripts from repo root + scripts/."
     }
   ],
   "remaining_tasks": [
     {
-      "id": "p2-integration",
-      "name": "Semantic memory Planner-level integration (WHERE MY TARGET IS → open Fridge)",
-      "status": "not_started"
+      "id": "p2-verify",
+      "name": "Complete E2E verification on pick_heat_then_place_in_recep — agent was at heating stage",
+      "status": "in_progress"
     },
     {
       "id": "p3",
-      "name": "Fuzzy intent decomposition (locate X → approach <location>)",
+      "name": "Fuzzy intent decomposition (locate X -> approach <location>)",
       "status": "not_started"
     },
     {
       "id": "p4",
-      "name": "Systematic exploration + scan→scan fix",
+      "name": "Systematic exploration + scan->scan fix",
       "status": "not_started"
     },
     {
@@ -81,46 +75,49 @@
   ],
   "blockers": [
     {
-      "description": "gpt-5.5 intermittently returns content=None with reasoning_content only. Mitigated with 5 retries + reasoning_effort auto-strip + token scaling, but still happens on ~10% of 1-image calls.",
+      "description": "gpt-5.5 intermittently returns content=None. Mitigated with retries + reasoning_effort fallback. ~10% of 1-image calls still exhaust.",
       "type": "technical",
-      "workaround": "Extended retry (5 validation + 3 transport = 15 total). Phase 4 Oracle recovers after 4-5 retries. plan_intent still occasionally exhausts."
+      "workaround": "Extended retry (5 validation + 3 transport = 15 total)."
     },
     {
-      "description": "Model visually confuses Tomato for Apple when both are red and round. Planner sees Tomato on CounterTop, assumes it's the Apple, tries PickupObject(Apple), fails because Apple is inside Fridge.",
+      "description": "9527code.com API returns 524 timeouts (~5-8 min into episodes). Two consecutive runs killed by upstream.",
+      "type": "external",
+      "workaround": "Retry. API recovers after a few minutes."
+    },
+    {
+      "description": "Model visually confuses Tomato for Apple — now mitigated by P2 memory rules (MEMORY OVER VISUAL GUESSING). Untested on actual Tomato/Apple episode.",
       "type": "technical",
-      "workaround": "Semantic memory's 'WHERE MY TARGET IS' section tells Planner the Apple was last seen inside Fridge. But Planner needs to actually USE this info."
+      "workaround": "P2 rules instruct Planner to prioritize memory over visual appearance. Needs E2E verification on an episode with both objects."
     }
   ],
-  "async_jobs": [],
-  "human_actions_pending": [],
   "decisions": [
     {
-      "decision": "Default reasoning_effort to medium for all gpt-5.5 calls",
-      "rationale": "xhigh multi-image returns content=None. Medium works for both text and images.",
-      "phase": "m1-runtime-debug"
+      "decision": "Phase 3 hallucination (CloseObject(Oven)) fixed purely via prompt rules, NOT fallback code",
+      "rationale": "User explicitly rejected the fallback approach. The prompt must teach the model that collision entities are non-interactable.",
+      "phase": "m1-p2"
     },
     {
-      "decision": "Split memory into 3-layer architecture (interface + geometric + semantic)",
-      "rationale": "Geometric preserves legacy behavior. Semantic adds receptacle grouping, freshness, task tracking. CLI --memory flag selects.",
-      "phase": "m1-runtime-debug"
+      "decision": "Executor stuck escape: MoveBack minimum increased from 4 to 8 steps (0.5m -> 1.0m)",
+      "rationale": "0.5m was insufficient to clear counter/cabinet geometry. 1.0m escape then rotate-only (no re-approach in same sequence).",
+      "phase": "m1-p2"
     },
     {
-      "decision": "Shift all system prompts to first-person 'I'",
-      "rationale": "Egocentric memory describes what the agent itself experienced. Consistent with semantic memory's 'I saw...' format.",
-      "phase": "m1-runtime-debug"
+      "decision": "Lateral strafe (MoveRight/MoveLeft) capped at repeat <= 4",
+      "rationale": "Strafe is riskier than forward movement in tight kitchens. MoveRight x8 was the primary cause of the dead_loop pattern.",
+      "phase": "m1-p2"
     },
     {
-      "decision": "Migrate API from api.fullcupai.com to www.9527code.com/v1",
-      "rationale": "fullcupai relay had intermittent 400 'max_output_tokens' errors and rate limiting. 9527code returns clean responses with reasoning_len=0.",
-      "phase": "m1-runtime-debug"
-    },
-    {
-      "decision": "Remove PickupObject Priority 4 fallback in action_adapter",
-      "rationale": "Resolving Apple to invisible container-interior objectId caused 'target not found' errors with confusing diagnostics.",
-      "phase": "m1-runtime-debug"
+      "decision": "Memory freshness: 5 fixes (replay logging, inventory restore, intent tracking, failure-aware rendering, failure-aware phase)",
+      "rationale": "Root cause analysis showed replay silently dropping PickupObject, stuck tracker starved of intent data, and memory encouraging retry loops.",
+      "phase": "m1-p2"
     }
   ],
-  "uncommitted_files": [],
-  "next_action": "Start P2 Planner-level integration: make the Planner actually USE semantic memory's 'WHERE MY TARGET IS' section — when memory says 'Apple last seen inside Fridge', the Planner should output 'open Fridge' not 'approach CounterTop'.",
-  "context_notes": "M1 core completed. 58/58 tests. E2E validated on pick_and_place_simple. Semantic memory module working end-to-end. All docs refreshed. Next: P2 task-level integration (Planner should leverage semantic memory to avoid Tomato/Apple confusion)."
+  "uncommitted_files": [
+    "src/branch_runner.py",
+    "src/eb_agent.py",
+    "src/executor.py",
+    "src/semantic_memory.py"
+  ],
+  "next_action": "Re-run E2E: uv run python scripts/e2e_test.py --api-key sk-xxx --task pick_heat_then_place_in_recep --random --no-traps --memory semantic — agent was at heating stage (Egg in Microwave, toggled on) when API died. Should finish in ~10-15 more steps.",
+  "context_notes": "P2 integration + executor escape + memory freshness + Phase 3 fix all implemented in one session. Failure rate dropped from 50% to 12.5%. Agent successfully navigates, picks up objects, and reaches heating phase. The Phase 3 hallucination fix (prompt-only) is untested. Stale test output dirs were accidentally deleted — re-running E2E will recreate them."
 }

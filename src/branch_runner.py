@@ -5,6 +5,7 @@
 
 import os
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -240,10 +241,10 @@ class BranchRunner:
                 ep.data.get("alfred_task_type") or ep.data.get("task_type", ""),
                 ep.data.get("pddl_params", {}),
             )
-            memory.update(metadata0, metadata0.get("objects", []), "LookAround", True, None, tc0)
+            memory.update(metadata0, metadata0.get("objects", []), "LookAround", True, None, tc0, "initial scan")
             # Also feed metadata from left/behind/right directions into memory
             for _d_label, _d_meta in look_metas[1:]:  # skip ahead (already done)
-                memory.update(_d_meta, _d_meta.get("objects", []), "LookAround", True, None, tc0)
+                memory.update(_d_meta, _d_meta.get("objects", []), "LookAround", True, None, tc0, "initial scan")
             self._record_trail(trail, metadata0)
             step_index = 1
             # Use new scan analysis to get direction + intent (not old propose_action)
@@ -528,9 +529,8 @@ class BranchRunner:
                     image = snap["frame"]
                     metadata = snap["metadata"]
                     memory.update(metadata, metadata.get("objects", []),
-                                  "LookAround", True, None, task_criteria)
-                    self._record_trail(trail, metadata)
-                    # Use the new intent for Executor
+                                  "LookAround", True, None, task_criteria,
+                                  f"{intent} {intent_target}".strip())
                     intent = scan_result.get("intent", intent)
                     intent_target = scan_result.get("target", intent_target)
                     # Falls through to Executor below with the new intent
@@ -1137,7 +1137,8 @@ class BranchRunner:
                     step_index += 1
                     nonexecuted_retry_count = 0
                     memory.update(seq_result["metadata"], seq_result["metadata"].get("objects", []),
-                                  "MoveSequence", True, None, task_criteria)
+                                  "MoveSequence", True, None, task_criteria,
+                                  f"{intent} {intent_target}".strip())
                     self._record_trail(trail, seq_result["metadata"])
                     self._track_searched_receptacles(proposed_params)
                     # Restore image/metadata from final state
@@ -1155,7 +1156,8 @@ class BranchRunner:
                     step_index += 1
                     nonexecuted_retry_count = 0
                     memory.update(metadata, metadata.get("objects", []),
-                                  "MoveSequence", False, seq_msg, task_criteria)
+                                  "MoveSequence", False, seq_msg, task_criteria,
+                                  f"{intent} {intent_target}".strip())
                     pending_step = self._build_step_entry(
                         ep.episode_id, config.branch_id, step_index - 1, parent_id,
                         "MoveSequence", proposed_params, result, eb_reasoning, injection_decision,
@@ -1269,6 +1271,7 @@ class BranchRunner:
                         memory.update(
                             rec_metadata, rec_metadata.get("objects", []), rec_act,
                             rec_result["success"], rec_result.get("error"), task_criteria,
+                            f"{intent} {intent_target}".strip(),
                         )
                         rec_step = self._build_step_entry(
                             ep.episode_id, config.branch_id, step_index, parent_id,
@@ -1353,7 +1356,7 @@ class BranchRunner:
                 eb_history.append(step_entry)
                 step_index += 1
                 nonexecuted_retry_count = 0
-                memory.update(result["metadata"], result["metadata"].get("objects", []), act, True, None, task_criteria)
+                memory.update(result["metadata"], result["metadata"].get("objects", []), act, True, None, task_criteria, f"{intent} {intent_target}".strip())
                 self._record_trail(trail, result["metadata"])
                 if act == "OpenObject" and params.get("objectId"):
                     for obj in result["metadata"].get("objects", []):
@@ -1369,7 +1372,7 @@ class BranchRunner:
             # --- 环境失败 → Phase 3 + Phase 4 (写 JSON) ---
             cascade_level += 1
             last_error = result["error"]
-            memory.update(result.get("metadata", metadata), result.get("metadata", metadata).get("objects", []), act, False, result["error"], task_criteria)
+            memory.update(result.get("metadata", metadata), result.get("metadata", metadata).get("objects", []), act, False, result["error"], task_criteria, f"{intent} {intent_target}".strip())
 
             # 追踪失败的 objectId
             obj_id = params.get("objectId")
@@ -1500,6 +1503,51 @@ class BranchRunner:
         env = EnvController(scene=scene)
         env.reset_to_alfred_scene(_require_alfred_scene(ep.data))
         replay_steps(env, branch_steps, skip_failed=True)
+
+        # ── Restore inventory: if the episode says the agent was holding
+        #     an object, try to pick it up in the resumed environment (replay
+        #     may have silently skipped the PickupObject step).
+        _s = env.get_state_snapshot()
+        _current_held = (_s["metadata"].get("inventoryObjects") or [])
+        if not _current_held:
+            _should_hold: str | None = None
+            _hold_actions = {"PickupObject"}
+            _drop_actions = {"PutObject", "DropHandObject"}
+            for _step in branch_steps:
+                _act = _step.get("action", "")
+                _ok = _step.get("success", False)
+                if not _ok:
+                    continue
+                if _act == "MoveSequence":
+                    for _sub in _step.get("action_params", {}).get("steps", []):
+                        _sa = _sub.get("action", "")
+                        if _sa in _hold_actions:
+                            _should_hold = _sub.get("params", {}).get("objectType")
+                        elif _sa in _drop_actions:
+                            _should_hold = None
+                elif _act in _hold_actions:
+                    _should_hold = _step.get("action_params", {}).get("objectType")
+                elif _act in _drop_actions:
+                    _should_hold = None
+            if _should_hold:
+                from src.action_adapter import resolve_object_ids, adapt
+                _objs = _s["metadata"].get("objects", [])
+                _resolved, _w = resolve_object_ids("PickupObject", {"objectType": _should_hold}, _objs)
+                if _w:
+                    logging.warning(
+                        "resume: cannot restore held object %s (not found in scene): %s",
+                        _should_hold, _w,
+                    )
+                else:
+                    _a, _p = adapt("PickupObject", _resolved)
+                    _r = env.step(_a, **_p)
+                    if _r["success"]:
+                        logging.info("resume: restored held object %s", _should_hold)
+                    else:
+                        logging.warning(
+                            "resume: failed to restore held object %s: %s",
+                            _should_hold, _r.get("error", "unknown"),
+                        )
 
         last_step = branch_steps[-1]
         start_idx = last_step["step_index_in_branch"] + 1
@@ -2210,11 +2258,19 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                 if a not in _MOVEMENT:
                     resolved, warn = resolve_object_ids(a, sp, objects)
                     if warn:
+                        logging.warning(
+                            "replay: MoveSequence step %s (%s) objectId resolution failed at %s: %s",
+                            a, sp.get("objectType", "?"), s.get("step_id"), warn,
+                        )
                         break  # object not found → stop, matches original behavior
                     a, sp = adapt(a, resolved)
                 r = env.step(a, **sp)
                 if not r["success"]:
                     if skip_failed:
+                        logging.warning(
+                            "replay: MoveSequence step %s skipped at %s: %s",
+                            a, s.get("step_id"), r.get("error", "unknown"),
+                        )
                         break  # partial execution accepted, stop here
                     raise RuntimeError(
                         f"Replay MoveSequence step {a} failed at {s.get('step_id')}: {r['error']}"
@@ -2230,12 +2286,20 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
             objects = env.controller.last_event.metadata.get("objects", [])
             resolved, warn = resolve_object_ids(action, params, objects)
             if warn and skip_failed:
+                logging.warning(
+                    "replay: single action %s (%s) objectId resolution failed at %s: %s",
+                    action, params.get("objectType", "?"), s.get("step_id"), warn,
+                )
                 continue
             act, p = adapt(action, resolved)
 
         r = env.step(act, **p)
         if not r["success"]:
             if skip_failed:
+                logging.warning(
+                    "replay: single action %s skipped at %s: %s",
+                    action, s.get("step_id"), r.get("error", "unknown"),
+                )
                 continue
             raise RuntimeError(
                 f"Replay failed at {s.get('step_id')}: {action}({s.get('action_params', {})}) "
