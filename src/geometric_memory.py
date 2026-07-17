@@ -60,6 +60,8 @@ class StuckTracker:
         self._intent_failure: dict[tuple[str, str], int] = {}
         self._intent_last_step: dict[tuple[str, str], int] = {}
         self._consecutive_failures = 0
+        self._same_error_count = 0  # same error type repeated
+        self._last_error_key: str = ""
         self._blocked_directions: dict[tuple[str, str], int] = {}
         self._block_dir_last_step: dict[tuple[str, str], int] = {}
         self._obstacle_intent_blocks: dict[tuple[str, str, str], int] = {}
@@ -79,8 +81,17 @@ class StuckTracker:
             pass
         elif success:
             self._consecutive_failures = 0
+            self._same_error_count = 0
+            self._last_error_key = ""
         else:
             self._consecutive_failures += 1
+            # Track same-error repetition (StuckTracker was too strict with intent matching)
+            error_key = f"{action}:{blocked_by or 'unknown'}"
+            if error_key == self._last_error_key:
+                self._same_error_count += 1
+            else:
+                self._same_error_count = 1
+                self._last_error_key = error_key
 
         if blocked_by and blocked_dir:
             dk = (blocked_dir, blocked_by)
@@ -109,6 +120,11 @@ class StuckTracker:
         if self._consecutive_failures >= 5:
             lines.append(
                 f"I have been stuck for {self._consecutive_failures} consecutive steps."
+            )
+        if self._same_error_count >= 3:
+            lines.append(
+                f"CRITICAL: Same error '{self._last_error_key}' repeated "
+                f"{self._same_error_count} times. STOP and try something completely different."
             )
         recent = {k: v for k, v in self._blocked_directions.items() if v >= 2}
         if recent:

@@ -43,9 +43,10 @@ class SchedulerConfig:
     executor_reasoning_effort: str = "medium"
     oracle_reasoning_effort: str = "medium"
     enable_fork: bool = True
-    memory_mode: str = "semantic"  # "semantic" | "geometric"
+    memory_mode: str = "semantic"
+    causal_traps_enabled: bool = True
 
-
+    # deprecated / removed:
 class Scheduler:
     def __init__(self, config: SchedulerConfig):
         self.config = config
@@ -234,6 +235,7 @@ class Scheduler:
                     output_dir=self.config.output_dir,
                     enable_fork=self.config.enable_fork,
                     memory_mode=self.config.memory_mode,
+                    causal_traps_enabled=self.config.causal_traps_enabled,
                 )
             else:
                 result = run_single_branch(
@@ -245,6 +247,7 @@ class Scheduler:
                     executor_agent=executor_agent,
                     memory_mode=self.config.memory_mode,
                     episode_status="running",
+                    causal_traps_enabled=self.config.causal_traps_enabled,
                 )
 
             if os.path.exists(out_file):
@@ -390,6 +393,7 @@ class Scheduler:
             branch_runner = BranchRunner(
                 eb_agent, oracle_agent, self.config.output_dir,
                 enable_fork=self.config.enable_fork,
+                causal_traps_enabled=self.config.causal_traps_enabled,
                 executor_agent=executor_agent,
             )
             result = branch_runner.run(

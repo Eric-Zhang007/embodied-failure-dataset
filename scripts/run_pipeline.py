@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--oracle-reasoning-effort", default="medium",
                         choices=["low", "medium", "high", "xhigh", "max"])
     parser.add_argument("--no-fork", action="store_true", help="Disable counterfactual forks")
+    parser.add_argument("--no-traps", action="store_true", help="Disable init traps and causal traps")
     parser.add_argument("--memory", default="semantic", choices=["semantic", "geometric"],
                         help="Memory mode: semantic (receptacle-grouped) or geometric (flat list)")
     parser.add_argument("--parallel", type=int, default=1)
@@ -61,6 +62,7 @@ def main():
         enable_fork=not args.no_fork,
         max_parallel=args.parallel,
         memory_mode=args.memory,
+        causal_traps_enabled=not args.no_traps,
     )
 
     scheduler = Scheduler(config)

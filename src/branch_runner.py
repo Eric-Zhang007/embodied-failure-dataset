@@ -5,7 +5,6 @@
 
 import os
 import json
-import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -22,6 +21,7 @@ from src.context_builder import build_branch_history
 from src.egocentric_memory import EgocentricMemory, SearchTrail
 from src.semantic_memory import SemanticMemory
 from src.critic_guard import CriticGuard
+from src.trap_trigger import CausalTrapEngine
 
 _VALID_ACTIONS = {
     "MoveAhead", "MoveBack", "MoveLeft", "MoveRight", "RotateLeft", "RotateRight", "LookUp", "LookDown",
@@ -38,33 +38,6 @@ _REPEATABLE_ACTIONS = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight"}
 _MAX_SEQUENCE_ACTIONS = 12
 _MAX_ACTION_REPEAT = 200
 
-
-def _sid(branch_id: str, idx: int) -> str:
-    """Globally-unique step id: '<branch>__s<idx>'.
-
-    Prefixing with branch_id makes step_id unique across branches (main +
-    forks) within one episode file. The '__' separator is filesystem-safe on
-    Windows, so it stays valid as a PNG filename ('<branch>__s<idx>.png').
-    step_id is treated as an opaque key everywhere (never int-parsed), so the
-    prefix is safe. Fork branches share one image dir, so this also prevents
-    frame-filename collisions between branches.
-    """
-    return f"{branch_id}__s{idx}"
-
-
-def _last_branch_step_id(ep, branch_id: str) -> Optional[str]:
-    """Return the step_id of the most recently recorded step on this branch,
-    or None if the branch has no steps yet.
-
-    Used to compute parent_step_id by reading actual episode state rather than
-    recomputing a string — correct for fresh runs, forks, and resume across the
-    old-format/new-format seam (old episodes have bare 's<idx>' ids)."""
-    last = None
-    for s in ep.data.get("steps", []):
-        if s.get("branch_id") == branch_id:
-            last = s.get("step_id")
-    return last
-
 # AI2-THOR cameraHorizon uses positive degrees down from level: LookDown adds
 # 30 degrees and LookUp subtracts 30. Controller.plan_horizons explicitly
 # enumerates 330° (-30° up), 0°, 30°, and 60° as supported horizons.
@@ -72,6 +45,14 @@ _CAMERA_HORIZON_MIN = -30.0
 _CAMERA_HORIZON_MAX = 60.0
 _CAMERA_HORIZON_EPSILON = 0.01
 _CAMERA_LOOK_STEP_DEGREES = 30.0
+
+
+def _apply_causal_traps(engine, action: str, success: bool,
+                        error, controller, params: dict = None):
+    """Check and apply causal traps from the engine after each action."""
+    traps = engine.step(action, success, error, controller, params)
+    for trap in traps:
+        inject(controller, **trap)
 
 
 @dataclass
@@ -113,6 +94,7 @@ class BranchRunner:
         enable_progress_gating: bool = True,
         enable_search_trail: bool = True,
         memory_mode: str = "semantic",  # "semantic" | "geometric"
+        causal_traps_enabled: bool = True,
     ):
         self.eb_agent = eb_agent
         self.oracle_agent = oracle_agent
@@ -121,6 +103,7 @@ class BranchRunner:
         self.enable_phase2 = enable_phase2
         self.step_limit_multiplier = step_limit_multiplier
         self.enable_fork = enable_fork
+        self.causal_traps_enabled = causal_traps_enabled
         self.recorder = StepRecorder()
         self._last_scan_step = -100
         self.memory_mode = memory_mode
@@ -218,10 +201,9 @@ class BranchRunner:
         else:
             memory = SemanticMemory()
         trail = SearchTrail(resolution=0.5)
+        causal_engine = CausalTrapEngine(enabled=self.causal_traps_enabled)
         intent_history: list[dict] = []  # completed/failed intent summaries
         current_intent = {"intent": "", "target": "", "steps": [], "start_step": 0}
-        phase2_injection_count = 0
-        phase2_max_injections = 3
         nonexecuted_retry_count = 0
         max_nonexecuted_retries = 3
         zero_step_completion_steps: dict[tuple[str, str], int] = {}
@@ -269,10 +251,10 @@ class BranchRunner:
                 ep.data.get("alfred_task_type") or ep.data.get("task_type", ""),
                 ep.data.get("pddl_params", {}),
             )
-            memory.update(metadata0, metadata0.get("objects", []), "LookAround", True, None, tc0, "initial scan")
+            memory.update(metadata0, metadata0.get("objects", []), "LookAround", True, None, tc0)
             # Also feed metadata from left/behind/right directions into memory
             for _d_label, _d_meta in look_metas[1:]:  # skip ahead (already done)
-                memory.update(_d_meta, _d_meta.get("objects", []), "LookAround", True, None, tc0, "initial scan")
+                memory.update(_d_meta, _d_meta.get("objects", []), "LookAround", True, None, tc0)
             self._record_trail(trail, metadata0)
             step_index = 1
             # Use new scan analysis to get direction + intent (not old propose_action)
@@ -299,7 +281,7 @@ class BranchRunner:
         while True:
             if step_index >= 200:
                 return self._make_result(config, "step_hard_limit", step_index, fork_tasks, fork_source_ids, ep)
-            parent_id = _last_branch_step_id(ep, config.branch_id)
+            parent_id = f"s{step_index - 1}" if step_index > 0 else None
             injection_decision = None
             # ==========================================================
             # Phase 1: EB Agent 提议动作
@@ -319,7 +301,7 @@ class BranchRunner:
             if task_complete:
                 self._write_success_step(
                     ep, config.branch_id, step_index,
-                    _last_branch_step_id(ep, config.branch_id),
+                    f"s{step_index - 1}" if step_index > 0 else None,
                     "Done", {},
                     {"success": True, "error": None, "frame": image, "metadata": metadata},
                     eb_reasoning="Task goal achieved (auto-detected).",
@@ -525,13 +507,13 @@ class BranchRunner:
                     image_dir = os.path.join(self.output_dir, ep.episode_id)
                     view_paths = []
                     for label, frame in look_images:
-                        vp = os.path.join(image_dir, f"{_sid(config.branch_id, step_index)}_look_{label}.png")
+                        vp = os.path.join(image_dir, f"s{step_index}_look_{label}.png")
                         StepRecorder.save_frame(frame, vp)
                         view_paths.append({"label": label, "image_path": vp})
                     look_step["lookaround_views"] = view_paths
                     self._write_success_step_direct(ep, look_step)
                     eb_history.append(look_step)
-                    parent_id = _sid(config.branch_id, step_index)
+                    parent_id = f"s{step_index}"
                     step_index += 1
                     memory.update(metadata, metadata.get("objects", []),
                                   "LookAround", True, None, task_criteria)
@@ -557,8 +539,9 @@ class BranchRunner:
                     image = snap["frame"]
                     metadata = snap["metadata"]
                     memory.update(metadata, metadata.get("objects", []),
-                                  "LookAround", True, None, task_criteria,
-                                  f"{intent} {intent_target}".strip())
+                                  "LookAround", True, None, task_criteria)
+                    self._record_trail(trail, metadata)
+                    # Use the new intent for Executor
                     intent = scan_result.get("intent", intent)
                     intent_target = scan_result.get("target", intent_target)
                     # Falls through to Executor below with the new intent
@@ -881,7 +864,7 @@ class BranchRunner:
                 if task_complete_done:
                     self._write_success_step(
                         ep, config.branch_id, step_index,
-                        _last_branch_step_id(ep, config.branch_id),
+                        f"s{step_index - 1}" if step_index > 0 else None,
                         "Done", {},
                         {"success": True, "error": None, "frame": image, "metadata": metadata},
                         eb_reasoning=eb_reasoning,
@@ -898,7 +881,7 @@ class BranchRunner:
                 }
                 step_entry = self._build_step_entry(
                     ep.episode_id, config.branch_id, step_index,
-                    _last_branch_step_id(ep, config.branch_id),
+                    f"s{step_index - 1}" if step_index > 0 else None,
                     "Done", {}, result, eb_reasoning,
                 )
                 step_entry["error_type"] = "done_rejected"
@@ -919,81 +902,8 @@ class BranchRunner:
                 nonexecuted_retry_count = 0
                 continue
 
-            # ==========================================================
-            # Phase 2: Oracle 注入决策
-            # ==========================================================
-            remaining = phase2_max_injections - phase2_injection_count
+            # Phase 2 injection removed — replaced by causal traps (src/trap_trigger.py)
             injection_decision = None
-            injection_attempt_errors: list[dict] = []
-            if self.enable_phase2 and cascade_level <= 1 and remaining > 0:
-                for injection_attempt in range(3):
-                    oracle_phase2 = self.oracle_agent.decide_injection(
-                        task_goal=ep.data["task_goal"],
-                        image=image,
-                        env_state=metadata,
-                        proposed_action=proposed_action,
-                        proposed_params=proposed_params,
-                        eb_reasoning=eb_reasoning,
-                        action_history=eb_history,
-                        cascade_level=cascade_level,
-                        is_fork=(config.parent_branch_id is not None),
-                        remaining_injections=remaining,
-                        injection_attempt_errors=injection_attempt_errors,
-                    )
-                    if not (oracle_phase2.get("inject") and oracle_phase2.get("injection")):
-                        break
-
-                    inj = oracle_phase2["injection"]
-                    inj_result = inject(env.controller, method=inj["method"], **inj["params"])
-                    if inj_result["success"]:
-                        phase2_injection_count += 1
-                        trap = {
-                            "trap_id": f"trap_{config.branch_id}_{step_index}",
-                            "branch_id": config.branch_id,
-                            "created_at_step_id": _sid(config.branch_id, step_index),
-                            "created_by": "oracle",
-                            "injection": inj,
-                            "modification_success": True,
-                            "triggered_at_step_id": None,
-                            "env_error": None,
-                            "status": "active",
-                        }
-                        ep.add_runtime_trap(trap)
-                        injection_decision = {
-                            "decided_to_inject": True,
-                            "injection": inj,
-                            "modification_success": True,
-                            "modification_error": None,
-                        }
-                        break
-
-                    attempt_error = {
-                        "method": inj.get("method"),
-                        "params": inj.get("params", {}),
-                        "error": inj_result.get("error"),
-                    }
-                    injection_attempt_errors.append(attempt_error)
-                    self._write_failure_log(failure_log_path, {
-                        "step_index": step_index,
-                        "branch_id": config.branch_id,
-                        "failure_type": "injection_setup_failed",
-                        "proposed_action": proposed_action,
-                        "proposed_params": proposed_params,
-                        "injection": inj,
-                        "error_message": inj_result.get("error"),
-                        "retry_attempt": injection_attempt + 1,
-                    })
-                else:
-                    raise RuntimeError(
-                        "Oracle injection setup failed 3 times for the same EB action. "
-                        "See failures log for attempted injections."
-                    )
-            elif self.enable_phase2 and remaining <= 0:
-                injection_decision = {
-                    "decided_to_inject": False,
-                    "reasoning": "LIMIT REACHED: all 3 successful injections have been used.",
-                    "injection": None,
-                }
 
             # ==========================================================
             # LookAround: 站原地旋转 4 次，截 4 张图发给 EB 做多图综合分析。
@@ -1032,13 +942,13 @@ class BranchRunner:
                 image_dir = os.path.join(self.output_dir, ep.episode_id)
                 view_paths = []
                 for label, frame in look_images:
-                    view_path = os.path.join(image_dir, f"{_sid(config.branch_id, step_index)}_look_{label}.png")
+                    view_path = os.path.join(image_dir, f"s{step_index}_look_{label}.png")
                     StepRecorder.save_frame(frame, view_path)
                     view_paths.append({"label": label, "image_path": view_path})
                 look_step["lookaround_views"] = view_paths
                 self._write_success_step_direct(ep, look_step)
                 eb_history.append(look_step)
-                parent_id = _sid(config.branch_id, step_index)
+                parent_id = f"s{step_index}"
                 step_index += 1
                 nonexecuted_retry_count = 0
                 memory.update(metadata, metadata.get("objects", []),
@@ -1166,9 +1076,11 @@ class BranchRunner:
                     step_index += 1
                     nonexecuted_retry_count = 0
                     memory.update(seq_result["metadata"], seq_result["metadata"].get("objects", []),
-                                  "MoveSequence", True, None, task_criteria,
-                                  f"{intent} {intent_target}".strip())
+                                  "MoveSequence", True, None, task_criteria)
                     self._record_trail(trail, seq_result["metadata"])
+                    # ── Causal trap check ──
+                    _apply_causal_traps(causal_engine, "MoveSequence", True, None,
+                                        env.controller)
                     self._track_searched_receptacles(proposed_params)
                     # Restore image/metadata from final state
                     image = seq_result["frame"]
@@ -1185,8 +1097,10 @@ class BranchRunner:
                     step_index += 1
                     nonexecuted_retry_count = 0
                     memory.update(metadata, metadata.get("objects", []),
-                                  "MoveSequence", False, seq_msg, task_criteria,
-                                  f"{intent} {intent_target}".strip())
+                                  "MoveSequence", False, seq_msg, task_criteria)
+                    # ── Causal trap check ──
+                    _apply_causal_traps(causal_engine, "MoveSequence", False, seq_msg,
+                                        env.controller)
                     pending_step = self._build_step_entry(
                         ep.episode_id, config.branch_id, step_index - 1, parent_id,
                         "MoveSequence", proposed_params, result, eb_reasoning, injection_decision,
@@ -1310,7 +1224,6 @@ class BranchRunner:
                         memory.update(
                             rec_metadata, rec_metadata.get("objects", []), rec_act,
                             rec_result["success"], rec_result.get("error"), task_criteria,
-                            f"{intent} {intent_target}".strip(),
                         )
                         rec_step = self._build_step_entry(
                             ep.episode_id, config.branch_id, step_index, parent_id,
@@ -1343,7 +1256,7 @@ class BranchRunner:
             resolved, resolve_warning = resolve_object_ids(proposed_action, proposed_params,
                                                            metadata.get("objects", []))
             act, params = adapt(proposed_action, resolved)
-            parent_id = _last_branch_step_id(ep, config.branch_id)
+            parent_id = f"s{step_index - 1}" if step_index > 0 else None
 
             # objectType not found in scene: log only, keep step_index unchanged, retry the EB request.
             if resolve_warning and act in _OBJECT_ACTIONS:
@@ -1396,8 +1309,11 @@ class BranchRunner:
                 eb_history.append(step_entry)
                 step_index += 1
                 nonexecuted_retry_count = 0
-                memory.update(result["metadata"], result["metadata"].get("objects", []), act, True, None, task_criteria, f"{intent} {intent_target}".strip())
+                memory.update(result["metadata"], result["metadata"].get("objects", []), act, True, None, task_criteria)
                 self._record_trail(trail, result["metadata"])
+                # ── Causal trap check ──
+                _apply_causal_traps(causal_engine, act, True, None,
+                                    env.controller, params)
                 if act == "OpenObject" and params.get("objectId"):
                     for obj in result["metadata"].get("objects", []):
                         if obj.get("objectId") == params["objectId"]:
@@ -1412,7 +1328,10 @@ class BranchRunner:
             # --- 环境失败 → Phase 3 + Phase 4 (写 JSON) ---
             cascade_level += 1
             last_error = result["error"]
-            memory.update(result.get("metadata", metadata), result.get("metadata", metadata).get("objects", []), act, False, result["error"], task_criteria, f"{intent} {intent_target}".strip())
+            memory.update(result.get("metadata", metadata), result.get("metadata", metadata).get("objects", []), act, False, result["error"], task_criteria)
+            # ── Causal trap check ──
+            _apply_causal_traps(causal_engine, act, False, result["error"],
+                                env.controller, params)
 
             # 追踪失败的 objectId
             obj_id = params.get("objectId")
@@ -1515,27 +1434,19 @@ class BranchRunner:
                 return result_br
 
             if self.enable_fork and oracle_phase4.get("should_fork"):
-                grade = oracle_phase4.get("counterfactual_grade", "WA")
-                gold = oracle_phase4.get("counterfactual_gold")
-                # AC: the agent's own counterfactual was correct → fork it.
-                # PA/WA: the agent was wrong/partial → fork the Oracle's corrected
-                #        gold instead, so the branch tests a verified alternative.
-                if grade == "AC" and eb_phase3.get("counterfactual"):
-                    cf_source = eb_phase3.get("counterfactual")
-                elif isinstance(gold, dict) and gold.get("target_step") is not None:
-                    cf_source = gold
-                else:
-                    cf_source = None
-                if cf_source is not None:
-                    fork_task = self._build_fork_task(
+                # Use Planner's counterfactual if available, fall back to Oracle's gold
+                counterfactual = eb_phase3.get("counterfactual") or oracle_phase4.get("counterfactual_gold")
+                if counterfactual:
+                    grade = oracle_phase4.get("counterfactual_grade", "WA")
+                    if grade == "AC":
+                        fork_task = self._build_fork_task(
                         config=config, current_step_idx=step_index - 1,
-                        counterfactual=cf_source,
-                        fallback_recovery=eb_phase3.get("proposed_recovery_action", {}),
+                        eb_phase3=eb_phase3, oracle_phase4=oracle_phase4,
                         history=eb_history, ep=ep,
                     )
                     if fork_task:
                         fork_tasks.append(fork_task)
-                        fork_source_ids.append(_sid(config.branch_id, step_index - 1))
+                        fork_source_ids.append(f"s{step_index - 1}")
 
         return self._make_result(config, "unreachable", step_index,
                                  fork_tasks, fork_source_ids, ep)
@@ -1568,51 +1479,6 @@ class BranchRunner:
         env.reset_to_alfred_scene(_require_alfred_scene(ep.data))
         replay_steps(env, branch_steps, skip_failed=True)
 
-        # ── Restore inventory: if the episode says the agent was holding
-        #     an object, try to pick it up in the resumed environment (replay
-        #     may have silently skipped the PickupObject step).
-        _s = env.get_state_snapshot()
-        _current_held = (_s["metadata"].get("inventoryObjects") or [])
-        if not _current_held:
-            _should_hold: str | None = None
-            _hold_actions = {"PickupObject"}
-            _drop_actions = {"PutObject", "DropHandObject"}
-            for _step in branch_steps:
-                _act = _step.get("action", "")
-                _ok = _step.get("success", False)
-                if not _ok:
-                    continue
-                if _act == "MoveSequence":
-                    for _sub in _step.get("action_params", {}).get("steps", []):
-                        _sa = _sub.get("action", "")
-                        if _sa in _hold_actions:
-                            _should_hold = _sub.get("params", {}).get("objectType")
-                        elif _sa in _drop_actions:
-                            _should_hold = None
-                elif _act in _hold_actions:
-                    _should_hold = _step.get("action_params", {}).get("objectType")
-                elif _act in _drop_actions:
-                    _should_hold = None
-            if _should_hold:
-                from src.action_adapter import resolve_object_ids, adapt
-                _objs = _s["metadata"].get("objects", [])
-                _resolved, _w = resolve_object_ids("PickupObject", {"objectType": _should_hold}, _objs)
-                if _w:
-                    logging.warning(
-                        "resume: cannot restore held object %s (not found in scene): %s",
-                        _should_hold, _w,
-                    )
-                else:
-                    _a, _p = adapt("PickupObject", _resolved)
-                    _r = env.step(_a, **_p)
-                    if _r["success"]:
-                        logging.info("resume: restored held object %s", _should_hold)
-                    else:
-                        logging.warning(
-                            "resume: failed to restore held object %s: %s",
-                            _should_hold, _r.get("error", "unknown"),
-                        )
-
         last_step = branch_steps[-1]
         start_idx = last_step["step_index_in_branch"] + 1
         config = BranchConfig(
@@ -1641,7 +1507,7 @@ class BranchRunner:
                           action, params, result, eb_reasoning, injection_decision=None):
         image_dir = os.path.join(self.output_dir, episode_id)
         step = self.recorder.build_step(
-            step_id=_sid(branch_id, step_idx), branch_id=branch_id, parent_step_id=parent_id,
+            step_id=f"s{step_idx}", branch_id=branch_id, parent_step_id=parent_id,
             step_index=step_idx, action=action, action_params=params,
             result=result, image_dir=image_dir,
         )
@@ -2017,12 +1883,12 @@ class BranchRunner:
         self._finalize(ep, config, result, fork_source_ids)
         return result
 
-    def _build_fork_task(self, config, current_step_idx, counterfactual, fallback_recovery, history, ep):
-        cf = counterfactual
+    def _build_fork_task(self, config, current_step_idx, eb_phase3, oracle_phase4, history, ep):
+        cf = eb_phase3.get("counterfactual")
         if not cf:
             return None
 
-        # 结构化 counterfactual（新格式）— EB Phase-3 或 Oracle gold 同构
+        # 结构化 counterfactual（新格式）
         if isinstance(cf, dict) and cf.get("target_step") is not None:
             target_idx = cf["target_step"]
             alt_action = cf.get("alternative_action", {})
@@ -2052,7 +1918,7 @@ class BranchRunner:
                 return None
             branches_from_id = target_step.get("parent_step_id")
             replaces_id = target_step.get("step_id")
-            alt_action = fallback_recovery or {}
+            alt_action = eb_phase3.get("proposed_recovery_action", {})
 
         fork_branch_id = f"fork_s{target_step.get('step_index_in_branch', '?')}_{config.branch_id}"
 
@@ -2070,7 +1936,7 @@ class BranchRunner:
             "diverges_at_step_id": branches_from_id,
             "fork_config": {
                 "replaces_step_id": replaces_id,
-                "origin_step_id": _sid(config.branch_id, current_step_idx),
+                "origin_step_id": f"s{current_step_idx}",
                 "alternative_action": alt_action,
                 "counterfactual_text": cf_text,
             },
@@ -2322,19 +2188,11 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                 if a not in _MOVEMENT:
                     resolved, warn = resolve_object_ids(a, sp, objects)
                     if warn:
-                        logging.warning(
-                            "replay: MoveSequence step %s (%s) objectId resolution failed at %s: %s",
-                            a, sp.get("objectType", "?"), s.get("step_id"), warn,
-                        )
                         break  # object not found → stop, matches original behavior
                     a, sp = adapt(a, resolved)
                 r = env.step(a, **sp)
                 if not r["success"]:
                     if skip_failed:
-                        logging.warning(
-                            "replay: MoveSequence step %s skipped at %s: %s",
-                            a, s.get("step_id"), r.get("error", "unknown"),
-                        )
                         break  # partial execution accepted, stop here
                     raise RuntimeError(
                         f"Replay MoveSequence step {a} failed at {s.get('step_id')}: {r['error']}"
@@ -2350,20 +2208,12 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
             objects = env.controller.last_event.metadata.get("objects", [])
             resolved, warn = resolve_object_ids(action, params, objects)
             if warn and skip_failed:
-                logging.warning(
-                    "replay: single action %s (%s) objectId resolution failed at %s: %s",
-                    action, params.get("objectType", "?"), s.get("step_id"), warn,
-                )
                 continue
             act, p = adapt(action, resolved)
 
         r = env.step(act, **p)
         if not r["success"]:
             if skip_failed:
-                logging.warning(
-                    "replay: single action %s skipped at %s: %s",
-                    action, s.get("step_id"), r.get("error", "unknown"),
-                )
                 continue
             raise RuntimeError(
                 f"Replay failed at {s.get('step_id')}: {action}({s.get('action_params', {})}) "
@@ -2439,6 +2289,7 @@ def run_single_branch(
     enable_search_trail: bool = True,
     memory_mode: str = "semantic",  # "semantic" | "geometric"
     episode_status: str = "pending",
+    causal_traps_enabled: bool = True,
 ) -> BranchResult:
     """
     一个 episode 的完整生命周期：加载数据 → 初始化环境 → 陷阱 → 跑分支。
@@ -2501,7 +2352,8 @@ def run_single_branch(
         runner = BranchRunner(eb_agent, oracle_agent, output_dir,
                               step_limit_multiplier=step_limit_multiplier,
                               enable_fork=enable_fork,
-                              enable_phase2=(trap_planner is not False and trap_planner is not None),
+                              enable_phase2=False,  # Phase 2 injection removed (replaced by causal traps)
+                              causal_traps_enabled=causal_traps_enabled,
                               executor_agent=executor_agent,
                               enable_critic=enable_critic,
                               critic_llm=critic_llm,

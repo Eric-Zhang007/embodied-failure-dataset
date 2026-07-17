@@ -24,6 +24,7 @@ from src.trap_planner import TrapPlanner
 from src.episode_manager import EpisodeManager
 from src.env_controller import EnvController
 from src.branch_runner import BranchConfig
+from src.trap_trigger import CausalTrapEngine
 
 ALL_TASKS = [
     "pick_and_place_simple",
@@ -63,6 +64,7 @@ def run_one(args, task_type, traj_path, n, total):
         enable_progress_gating="005" not in ablation_set,
         enable_search_trail="006" not in ablation_set,
         memory_mode=args.memory,
+        causal_traps_enabled=not args.no_traps,
     )
     print(f"{prefix} {task_type}: {ep_id} -> {result.termination_reason} ({result.total_steps} steps)")
     return task_type, ep_id, result
@@ -190,6 +192,7 @@ def _run_fork_e2e(args, parent_task_type, episode_id, fork_task: dict, n: int, t
         branch_runner = BranchRunner(
             eb_agent, oracle_agent, args.output,
             enable_fork=args.enable_fork,
+            causal_traps_enabled=not args.no_traps,
             executor_agent=executor_agent,
         )
         result = branch_runner.run(
