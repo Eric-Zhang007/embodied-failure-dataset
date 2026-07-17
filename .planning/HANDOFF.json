@@ -1,123 +1,44 @@
 {
   "version": "1.0",
-  "timestamp": "2026-07-17",
+  "timestamp": "2026-07-17T21:05:54+0800",
   "phase": "m1-p2",
-  "phase_name": "M1 P2: Semantic Memory Integration + Executor Escape + Phase 3 Fixes",
+  "phase_name": "M1 P2: Container-Retrieval Fix + Structured Oracle Gold + step_id Uniqueness + PR#3 Merge",
   "phase_dir": ".planning",
   "plan": 1,
-  "task": 3,
+  "task": 5,
   "total_tasks": 6,
   "status": "paused",
   "completed_tasks": [
-    {
-      "id": 1,
-      "name": "P2 Planner-level memory integration (MEMORY OVER VISUAL GUESSING, CONTAINER-FIRST, DISAMBIGUATION)",
-      "status": "done",
-      "progress": "PLANNER_SYSTEM + EXPLORE_BIAS_SYSTEM updated. E2E shows Planner follows memory correctly."
-    },
-    {
-      "id": 2,
-      "name": "Executor stuck escape + lateral cap fix",
-      "status": "done",
-      "progress": "MoveBack x8 (was x4), no re-approach after escape, MoveRight/MoveLeft cap x4. Failure rate 50%->12%."
-    },
-    {
-      "id": 3,
-      "name": "Memory freshness pipeline (replay fidelity, inventory restore, intent tracking, failure-aware rendering, failure-aware phase)",
-      "status": "done",
-      "progress": "5 sub-fixes across branch_runner.py + semantic_memory.py. 58/58 tests."
-    },
-    {
-      "id": 4,
-      "name": "Phase 3 collision-entity hallucination fix",
-      "status": "done",
-      "progress": "PHASE3_SYSTEM now explicitly warns about Cube.001/OVENDOOR.001 as non-interactable. Prompt-only fix per user directive."
-    },
-    {
-      "id": 5,
-      "name": "E2E test on pick_heat_then_place_in_recep (hardest task)",
-      "status": "in_progress",
-      "progress": "Agent reached heating phase (Egg in Microwave, Microwave toggled on) before API 524 timeout. 24 steps, 3 failures (12.5%)."
-    },
-    {
-      "id": 6,
-      "name": "Cleanup stale test files",
-      "status": "done",
-      "progress": "Removed 15 one-off debug/inspect scripts from repo root + scripts/."
-    }
+    {"id": 1, "name": "Diagnose interrupted heat-task resume failure (pick_heat_then_place_in_recep)", "status": "done", "progress": "Root cause found via AI2-THOR ground-truth probe: NOT replay-fidelity (Egg is Hot inside closed Microwave, faithful). Real cause = pose/interaction-visibility — agent rotated to face sink after heating, Microwave fell outside interaction cone (1.1m, visibleBounds2D=false), OpenObject+PickupObject both threw 'not within visibility', agent wandered. Known-issue #1 family, surfacing as retrieval-navigation gap. objectId resolution works fine (not the adapter bug)."},
+    {"id": 2, "name": "Container-retrieval Planner prompt fix (roadmap P3 start)", "status": "done", "commit": "3e412de", "progress": "Added RETRIEVAL FROM A CONTAINER rule to PLANNER_SYSTEM + EXPLORE_BIAS_SYSTEM in eb_agent.py: closed-container object absence is EXPECTED (visibleBounds2D=false), re-approach->open->pickup, do not wander. Prompt-only per user's Phase-3 precedent."},
+    {"id": 3, "name": "Structured Oracle counterfactual_gold + fork-the-gold routing", "status": "done", "commit": "3e412de", "progress": "oracle_agent.py PHASE4 gold now {target_step, alternative_action, reasoning} mirroring EB. branch_runner _build_fork_task forks EB CF on AC, Oracle gold on PA/WA. String back-compat kept."},
+    {"id": 4, "name": "Globally-unique branch-prefixed step_id", "status": "done", "commit": "3e412de", "progress": "_sid(branch,idx)='<branch>__s<idx>' (Windows-safe PNG names). parent_id from _last_branch_step_id() reading real episode state -> robust across old-format resume seam. ~10 sites in branch_runner + 2 fork-roots in scheduler. step_id is opaque everywhere (never int-parsed)."},
+    {"id": 5, "name": "E2E verification of retrieval fix on the paused heat episode", "status": "in_progress", "progress": "BLOCKED by provider API. Run replays cleanly (confirms step_id seam handling), RETRIEVAL prompt loads (system prompt 5090->5965 chars), but wedges on FIRST image-bearing Planner call. Provider (9527code.com) 524s on the real 143KB multimodal payload; 300s socket timeout freezes each attempt ~5min (no console/AI2-THOR output). Killed+relaunched 3x into same wall. Tiny image probes return 200 but mislead — only the full 143KB request fails."},
+    {"id": 6, "name": "Merge PR #3 (partner's scheduler rewrite) + resolve conflicts", "status": "done", "commit": "f4d8051, 49c6081", "progress": "PR #3 (laoma9604-design:pr/scheduler-parallel) merged. No textual conflicts; hand-verified semantic overlap in branch_runner (permanent_stuck escalation interleaves with fork routing, terminal checks precede fork eval) + scheduler (_run_fork(task,agents) signature coexists with _sid fork-roots). Also FIXED pre-existing fork bug: _run_fork called env.step with raw objectType, skipping resolve_object_ids/adapt -> now resolves+adapts (49c6081). 72 tests pass. Branch pushed to origin/session/retrieval-fork-stepid."}
   ],
   "remaining_tasks": [
-    {
-      "id": "p2-verify",
-      "name": "Complete E2E verification on pick_heat_then_place_in_recep — agent was at heating stage",
-      "status": "in_progress"
-    },
-    {
-      "id": "p3",
-      "name": "Fuzzy intent decomposition (locate X -> approach <location>)",
-      "status": "not_started"
-    },
-    {
-      "id": "p4",
-      "name": "Systematic exploration + scan->scan fix",
-      "status": "not_started"
-    },
-    {
-      "id": "p5",
-      "name": "Fork validation with E2E tests",
-      "status": "not_started"
-    },
-    {
-      "id": "p6",
-      "name": "7-task baseline (5 episodes each)",
-      "status": "not_started"
-    }
+    {"id": "p2-verify", "name": "Complete E2E verification once provider API recovers — confirm agent re-approaches Microwave and retrieves heated Egg (not wander), reaches task_complete", "status": "in_progress"},
+    {"id": "pr-land", "name": "Open PR from session/retrieval-fork-stepid -> main (currently contains BOTH partner's PR#3 and this session's work as one combined branch — user may want them split)", "status": "not_started"},
+    {"id": "p3-rest", "name": "Remaining roadmap P3: fuzzy intent decomposition beyond the container-retrieval case", "status": "not_started"},
+    {"id": "p4", "name": "Systematic exploration + scan->scan fix", "status": "not_started"},
+    {"id": "p5", "name": "Fork validation with E2E tests (now unblocked by the fork objectId-resolution fix)", "status": "not_started"},
+    {"id": "p6", "name": "7-task baseline (5 episodes each)", "status": "not_started"}
   ],
   "blockers": [
-    {
-      "description": "gpt-5.5 intermittently returns content=None. Mitigated with retries + reasoning_effort fallback. ~10% of 1-image calls still exhaust.",
-      "type": "technical",
-      "workaround": "Extended retry (5 validation + 3 transport = 15 total)."
-    },
-    {
-      "description": "9527code.com API returns 524 timeouts (~5-8 min into episodes). Two consecutive runs killed by upstream.",
-      "type": "external",
-      "workaround": "Retry. API recovers after a few minutes."
-    },
-    {
-      "description": "Model visually confuses Tomato for Apple — now mitigated by P2 memory rules (MEMORY OVER VISUAL GUESSING). Untested on actual Tomato/Apple episode.",
-      "type": "technical",
-      "workaround": "P2 rules instruct Planner to prioritize memory over visual appearance. Needs E2E verification on an episode with both objects."
-    }
+    {"description": "Provider 9527code.com 524s on the real 143KB image-bearing Planner request; 300s socket timeout freezes each attempt ~5min. Verification (task 5) cannot complete until upstream stabilizes for heavy multimodal requests.", "type": "external", "workaround": "Wait; API 'recovers after a few minutes' per prior notes. OR lower vlm_client.py timeout 300s->60s so wedged attempts fail-fast and retry sooner. Gate any relaunch on a FULL-SIZE image probe, not a tiny one (tiny returns 200 while real 143KB 524s)."}
+  ],
+  "human_actions_pending": [
+    {"action": "Decide whether to open PR from session/retrieval-fork-stepid as one combined PR (partner PR#3 + this session) or split them", "context": "The merge put both on one branch; clean but couples the two authors' work", "blocking": false}
   ],
   "decisions": [
-    {
-      "decision": "Phase 3 hallucination (CloseObject(Oven)) fixed purely via prompt rules, NOT fallback code",
-      "rationale": "User explicitly rejected the fallback approach. The prompt must teach the model that collision entities are non-interactable.",
-      "phase": "m1-p2"
-    },
-    {
-      "decision": "Executor stuck escape: MoveBack minimum increased from 4 to 8 steps (0.5m -> 1.0m)",
-      "rationale": "0.5m was insufficient to clear counter/cabinet geometry. 1.0m escape then rotate-only (no re-approach in same sequence).",
-      "phase": "m1-p2"
-    },
-    {
-      "decision": "Lateral strafe (MoveRight/MoveLeft) capped at repeat <= 4",
-      "rationale": "Strafe is riskier than forward movement in tight kitchens. MoveRight x8 was the primary cause of the dead_loop pattern.",
-      "phase": "m1-p2"
-    },
-    {
-      "decision": "Memory freshness: 5 fixes (replay logging, inventory restore, intent tracking, failure-aware rendering, failure-aware phase)",
-      "rationale": "Root cause analysis showed replay silently dropping PickupObject, stuck tracker starved of intent data, and memory encouraging retry loops.",
-      "phase": "m1-p2"
-    }
+    {"decision": "Item 3 redirect: fixed container-retrieval as Planner prompt (not replay_steps reconcile)", "rationale": "AI2-THOR probe proved replay was faithful; the reconcile fix targeted a non-existent bug. Real bug is retrieval-navigation, fixed prompt-only per user's Phase-3 precedent, merges roadmap P3.", "phase": "m1-p2"},
+    {"decision": "step_id separator = '__' (double underscore), not ':'", "rationale": "step_id IS the PNG filename; ':' is illegal on Windows. '__' is filesystem-safe.", "phase": "m1-p2"},
+    {"decision": "parent_id derived from _last_branch_step_id() not recomputed f-string", "rationale": "Robust across old-format resume seam (old episodes have bare s<idx> ids).", "phase": "m1-p2"},
+    {"decision": "Fork forks EB CF on AC, Oracle gold on PA/WA", "rationale": "Decouples 'did agent reason well' (grade/label) from 'do we have a proven recovery path' (fork outcome). Requires structured gold.", "phase": "m1-p2"},
+    {"decision": "Merged PR#3 into session branch rather than separate", "rationale": "No textual conflicts; both changesets verified to coexist; 72 tests pass. User may still want to split at PR-open time.", "phase": "m1-p2"},
+    {"decision": "Fixed _run_fork objectId resolution as part of the merge", "rationale": "PR#3 enables forks by default; the raw-objectType env.step would break every fork including the new structured-gold path. In-scope since my gold change routes actions there.", "phase": "m1-p2"}
   ],
-  "uncommitted_files": [
-    "src/branch_runner.py",
-    "src/eb_agent.py",
-    "src/executor.py",
-    "src/semantic_memory.py"
-  ],
-  "next_action": "Re-run E2E: uv run python scripts/e2e_test.py --api-key sk-xxx --task pick_heat_then_place_in_recep --random --no-traps --memory semantic — agent was at heating stage (Egg in Microwave, toggled on) when API died. Should finish in ~10-15 more steps.",
-  "context_notes": "P2 integration + executor escape + memory freshness + Phase 3 fix all implemented in one session. Failure rate dropped from 50% to 12.5%. Agent successfully navigates, picks up objects, and reaches heating phase. The Phase 3 hallucination fix (prompt-only) is untested. Stale test output dirs were accidentally deleted — re-running E2E will recreate them."
+  "uncommitted_files": [],
+  "next_action": "Check if provider API recovered: probe the FULL image path (143KB-scale, not tiny). If HTTP 200, relaunch: cd ~/embodied-failure-dataset && export PATH=\"$HOME/.local/bin:$PATH\" && uv run python scripts/resume_episode.py output_e2e_20260717_184436/trial_T20190908_215610_893109.json --api-key sk-IxX... --no-traps --memory semantic . Watch for RESP model= (past the wedge point) and intents mentioning approach/open/pickup Microwave/Egg. Success = agent retrieves Hot Egg from Microwave and reaches task_complete.",
+  "context_notes": "This session: diagnosed the interrupted resume (image-over-text discipline caught my own wrong replay-fidelity theory — AI2-THOR ground truth showed Egg is Hot in closed Microwave, real bug is pose/interaction-visibility). Fixed via Planner prompt. Then made Oracle gold structured + step_id globally unique (+9 tests). Then merged partner PR#3 (scheduler rewrite), resolved semantic overlaps, fixed a latent fork objectId bug (+1 test). 72 tests green, branch pushed. ONLY the live E2E verification remains, blocked purely by provider API 524-ing on heavy image requests. A leftover wedged resume process (task bay2ahazq) may still be running in WSL — kill with pkill -9 -f resume_episode.py before relaunching. Cron watchers all deleted."
 }
