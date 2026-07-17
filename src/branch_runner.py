@@ -149,6 +149,7 @@ class BranchRunner:
     ) -> BranchResult:
         step_index = start_step_index
         cascade_level = 0
+        stuck_escalation_count = 0  # StuckTracker interventions without recovery
         fork_tasks: list[dict] = []
         fork_source_ids: list[str] = []
         last_error: Optional[str] = None
@@ -1126,6 +1127,7 @@ class BranchRunner:
                 if seq_result.get("all_succeeded"):
                     # All steps succeeded — record as one successful step
                     cascade_level = 0
+                    stuck_escalation_count = 0
                     last_error = None
                     step_entry = self._build_step_entry(
                         ep.episode_id, config.branch_id, step_index, parent_id,
@@ -1211,6 +1213,16 @@ class BranchRunner:
                     self._write_success_step_direct(ep, step_entry)
                     eb_history.append(step_entry)
                     current_intent["steps"].append(step_entry)
+
+                    # ── StuckTracker escalation counter ──
+                    stuck_summary = memory._stuck_tracker.render_summary(step_index) if hasattr(memory, '_stuck_tracker') else ""
+                    if stuck_summary:
+                        stuck_escalation_count += 1
+                    if stuck_escalation_count >= 5:
+                        result_br = BranchResult(branch_id=config.branch_id, termination_reason="permanent_stuck", total_steps=step_index, fork_tasks=fork_tasks, fork_source_step_ids=fork_source_ids)
+                        self._finalize(ep, config, result_br, fork_source_ids)
+                        return result_br
+
                     # Dead loop / unrecoverable checks
                     hard_unrec = check_unrecoverable(metadata, ep.data)
                     if hard_unrec:
@@ -1344,6 +1356,7 @@ class BranchRunner:
             # --- 成功 → 写 JSON ---
             if result["success"]:
                 cascade_level = 0
+                stuck_escalation_count = 0
                 last_error = None
                 step_entry = self._build_step_entry(
                     ep.episode_id, config.branch_id, step_index, parent_id,
@@ -1428,6 +1441,19 @@ class BranchRunner:
             step_entry["oracle_recovery_verdict"] = oracle_phase4.get("recovery_verdict")
             self._write_success_step_direct(ep, step_entry)
             eb_history.append(step_entry)
+
+            # ── StuckTracker escalation counter ──
+            stuck_summary = memory._stuck_tracker.render_summary(step_index) if hasattr(memory, '_stuck_tracker') else ""
+            if stuck_summary:
+                stuck_escalation_count += 1
+            if stuck_escalation_count >= 5:
+                result_br = BranchResult(
+                    branch_id=config.branch_id, termination_reason="permanent_stuck",
+                    total_steps=step_index, fork_tasks=fork_tasks,
+                    fork_source_step_ids=fork_source_ids,
+                )
+                self._finalize(ep, config, result_br, fork_source_ids)
+                return result_br
 
             # Hard-coded dead-loop / unrecoverable checks (does not depend on Oracle API)
             hard_unrec = check_unrecoverable(metadata, ep.data)
@@ -2310,6 +2336,7 @@ def run_single_branch(
     enable_progress_gating: bool = True,
     enable_search_trail: bool = True,
     memory_mode: str = "semantic",  # "semantic" | "geometric"
+    episode_status: str = "pending",
 ) -> BranchResult:
     """
     一个 episode 的完整生命周期：加载数据 → 初始化环境 → 陷阱 → 跑分支。
@@ -2332,6 +2359,8 @@ def run_single_branch(
                                                         state["metadata"].get("objects", []))
 
         ep = EpisodeManager(episode_id, output_dir, meta)
+        if episode_status != "pending":
+            ep.set_status(episode_status, os.getpid() if episode_status == "running" else None)
 
         if trap_planner:
             failure_log_path = os.path.join(output_dir, episode_id, "failures_main.jsonl")

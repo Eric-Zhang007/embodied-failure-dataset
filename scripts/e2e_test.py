@@ -11,15 +11,19 @@ import argparse
 import glob
 import os
 import sys
+import threading
 import time as _time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 from src.vlm_client import VLMClient
 from src.eb_agent import EBAgent
 from src.oracle_agent import OracleAgent
 from src.executor import ExecutorAgent
-from src.branch_runner import run_single_branch
+from src.branch_runner import run_single_branch, BranchRunner
 from src.trap_planner import TrapPlanner
+from src.episode_manager import EpisodeManager
+from src.env_controller import EnvController
+from src.branch_runner import BranchConfig
 
 ALL_TASKS = [
     "pick_and_place_simple",
@@ -37,7 +41,35 @@ def run_one(args, task_type, traj_path, n, total):
     ep_id = os.path.basename(os.path.dirname(traj_path))
     prefix = f"[{n}/{total}]" if total > 1 else ""
 
-    # Each worker creates its own agents (VLMClient is not thread-safe across models)
+    eb_agent, oracle_agent, executor_agent = _make_agents(args)
+    trap_planner = None if args.no_traps else TrapPlanner()
+
+    # Compute ablation flags: --ablation includes spikes to DISABLE
+    ablation_set = set(args.ablation)
+    result = run_single_branch(
+        traj_path=traj_path,
+        eb_agent=eb_agent,
+        oracle_agent=oracle_agent,
+        output_dir=args.output,
+        trap_planner=trap_planner,
+        enable_fork=args.enable_fork,
+        step_limit_multiplier=2,
+        executor_agent=executor_agent,
+        enable_searched_markers="001" not in ablation_set,
+        enable_intent_dedup="002a" not in ablation_set,
+        enable_critic_guard="002b" in ablation_set,  # 002b is off by default; --ablation 002b ENABLES it
+        enable_curiosity_scoreboard="003" not in ablation_set,
+        enable_contrastive_planner="004" not in ablation_set,
+        enable_progress_gating="005" not in ablation_set,
+        enable_search_trail="006" not in ablation_set,
+        memory_mode=args.memory,
+    )
+    print(f"{prefix} {task_type}: {ep_id} -> {result.termination_reason} ({result.total_steps} steps)")
+    return task_type, ep_id, result
+
+
+def _make_agents(args):
+    """Create a fresh set of agents for one worker."""
     planner_client = VLMClient.openai(
         args.planner_model, args.api_key,
         base_url=args.api_base_url,
@@ -56,31 +88,142 @@ def run_one(args, task_type, traj_path, n, total):
     eb_agent = EBAgent(planner_client)
     oracle_agent = OracleAgent(oracle_client)
     executor_agent = ExecutorAgent(executor_client)
+    return eb_agent, oracle_agent, executor_agent
 
-    trap_planner = None if args.no_traps else TrapPlanner()
 
-    # Compute ablation flags: --ablation includes spikes to DISABLE
-    ablation_set = set(args.ablation)
-    result = run_single_branch(
-        traj_path=traj_path,
-        eb_agent=eb_agent,
-        oracle_agent=oracle_agent,
-        output_dir=args.output,
-        trap_planner=trap_planner,
-        enable_fork=False,
-        step_limit_multiplier=2,
-        executor_agent=executor_agent,
-        enable_searched_markers="001" not in ablation_set,
-        enable_intent_dedup="002a" not in ablation_set,
-        enable_critic_guard="002b" in ablation_set,  # 002b is off by default; --ablation 002b ENABLES it
-        enable_curiosity_scoreboard="003" not in ablation_set,
-        enable_contrastive_planner="004" not in ablation_set,
-        enable_progress_gating="005" not in ablation_set,
-        enable_search_trail="006" not in ablation_set,
-        memory_mode=args.memory,
-    )
-    print(f"{prefix} {task_type}: {ep_id} -> {result.termination_reason} ({result.total_steps} steps)")
-    return task_type, ep_id, result
+def _run_fork_e2e(args, parent_task_type, episode_id, fork_task: dict, n: int, total: int):
+    """Run a fork branch spawned from a completed main branch."""
+    from src.branch_runner import ForkManager, replay_steps
+    from src.step_recorder import StepRecorder
+    from src.alfred_scene import _require_alfred_scene
+
+    out_file = os.path.join(args.output, f"{episode_id}.json")
+    if not os.path.exists(out_file):
+        return parent_task_type, episode_id, BranchResult(
+            branch_id=fork_task.get("branch_id", "fork"),
+            termination_reason="fork_skipped_no_episode",
+            total_steps=0, fork_tasks=[], fork_source_step_ids=[],
+        )
+
+    ep = EpisodeManager.load(out_file)
+    config = BranchConfig(**fork_task)
+    fc = config.fork_config or {}
+    eb_agent, oracle_agent, executor_agent = _make_agents(args)
+    recorder = StepRecorder()
+
+    ep.set_status("running", os.getpid())
+    print(f"\n[fork {n}/{total}] Starting {config.branch_id} (parent={config.parent_branch_id}) on {episode_id}")
+
+    env = EnvController(scene=ep.data.get("scene", ""))
+    try:
+        # 1. Replay shared context steps from parent branch
+        shared_ids = set(config.shared_context_step_ids)
+        shared_steps = [
+            s for s in ep.data["steps"]
+            if s.get("branch_id") == config.parent_branch_id and s["step_id"] in shared_ids
+        ]
+        shared_steps.sort(key=lambda x: x.get("step_index_in_branch", 0))
+
+        env.reset_to_alfred_scene(_require_alfred_scene(ep.data))
+        replay_steps(env, shared_steps, skip_failed=True)
+
+        # 2. Execute fork alternative action
+        alt_action = fc.get("alternative_action", {})
+        alt_name = alt_action.get("action")
+        alt_params = alt_action.get("params", {}) or {}
+        if not alt_name:
+            raise ValueError(f"Fork alternative_action lacks action: {alt_action}")
+
+        alt_result = env.step(alt_name, **alt_params)
+        if not alt_result.get("success"):
+            image_dir = os.path.join(args.output, episode_id)
+            fork_root = recorder.build_step(
+                step_id="s0", branch_id=config.branch_id,
+                parent_step_id=config.diverges_at_step_id,
+                step_index=0, action=alt_name, action_params=alt_params,
+                result=alt_result, image_dir=image_dir,
+            )
+            fork_root["error_type"] = "environment_failure"
+            fork_root["fork_metadata"] = {
+                "is_fork_root": True,
+                "fork_source_branch_id": config.parent_branch_id,
+                "fork_source_step_id": fc.get("origin_step_id"),
+                "replaces_step_id": fc.get("replaces_step_id"),
+                "reasoning_rewritten_by": "oracle",
+            }
+            ep.add_step(fork_root)
+            ep2 = EpisodeManager.load(out_file)
+            ep2.set_status("failed")
+            return parent_task_type, episode_id, BranchResult(
+                branch_id=config.branch_id, termination_reason="fork_failed",
+                total_steps=1, fork_tasks=[], fork_source_step_ids=[],
+            )
+
+        # 3. Rewrite reasoning + record fork root
+        fm = ForkManager(eb_agent, oracle_agent, None, args.output)
+        rewritten = fm._rewrite_reasoning(
+            shared_steps=shared_steps,
+            original_action="?",
+            original_reasoning="",
+            alternative_action=alt_action,
+            counterfactual_text=fc.get("counterfactual_text", ""),
+        )
+
+        image_dir = os.path.join(args.output, episode_id)
+        fork_root = recorder.build_step(
+            step_id="s0", branch_id=config.branch_id,
+            parent_step_id=config.diverges_at_step_id,
+            step_index=0, action=alt_name, action_params=alt_params,
+            result=alt_result, image_dir=image_dir,
+        )
+        fork_root["eb_reasoning"] = rewritten
+        fork_root["fork_metadata"] = {
+            "is_fork_root": True,
+            "fork_source_branch_id": config.parent_branch_id,
+            "fork_source_step_id": fc.get("origin_step_id"),
+            "replaces_step_id": fc.get("replaces_step_id"),
+            "reasoning_rewritten_by": "oracle",
+        }
+        ep.add_step(fork_root)
+
+        # 4. Delegate to BranchRunner from step_index=1
+        branch_runner = BranchRunner(
+            eb_agent, oracle_agent, args.output,
+            enable_fork=args.enable_fork,
+            executor_agent=executor_agent,
+        )
+        result = branch_runner.run(
+            config=config, env=env, ep=ep,
+            start_step_index=1,
+        )
+
+        ep2 = EpisodeManager.load(out_file)
+        final_status = "failed" if result.termination_reason.startswith("worker_crash") else "completed"
+        ep2.set_status(final_status)
+        print(f"  [fork] Finished {config.branch_id}: {result.termination_reason} ({result.total_steps} steps)")
+        return parent_task_type, episode_id, result
+    except KeyboardInterrupt:
+        if os.path.exists(out_file):
+            EpisodeManager.load(out_file).set_status("interrupted")
+        raise
+    except Exception:
+        if os.path.exists(out_file):
+            EpisodeManager.load(out_file).set_status("failed")
+        raise
+    finally:
+        env.close()
+
+
+def _run_main_with_sem(sem, args, task_type, traj_path, n, total):
+    """Wrapper: acquire semaphore, then run main branch."""
+    with sem:
+        return run_one(args, task_type, traj_path, n, total)
+
+
+def _run_fork_with_sem(sem, args, task_type, episode_id, fork_task, n, total):
+    """Wrapper: acquire semaphore, then run fork branch."""
+    with sem:
+        return _run_fork_e2e(args, task_type, episode_id, fork_task, n, total)
 
 
 def main():
@@ -108,6 +251,7 @@ def main():
                         help="Disable specific spikes for ablation testing (e.g. --ablation 003 006)")
     parser.add_argument("--memory", default="semantic", choices=["semantic", "geometric"],
                         help="Memory mode: semantic (receptacle-grouped, freshness-aware) or geometric (flat list)")
+    parser.add_argument("--enable-fork", action="store_true", help="Enable Oracle fork tasks on AC counterfactuals")
     args = parser.parse_args()
 
     if not args.output:
@@ -173,17 +317,38 @@ def main():
         print(f"Total steps: {result.total_steps}")
         print(f"Fork tasks: {len(result.fork_tasks)}")
     else:
-        # Parallel execution
+        # Parallel execution with Semaphore + dynamic fork submission
         max_workers = min(args.parallel, total)
-        results = {}
+        sem = threading.Semaphore(max_workers)
+        results: dict[str, BranchResult] = {}
+        n_done = 0
+        n_submitted = total
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {}
+            futures: dict = {}
             for i, (task_type, traj_path) in enumerate(tasks_to_run, 1):
-                f = executor.submit(run_one, args, task_type, traj_path, i, total)
-                futures[f] = task_type
-            for future in as_completed(futures):
-                task_type, ep_id, result = future.result()
-                results[task_type] = result
+                f = executor.submit(_run_main_with_sem, sem, args, task_type, traj_path, i, total)
+                futures[f] = ("main", task_type)
+
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    kind, task_type = futures.pop(future)
+                    task_type, ep_id, result = future.result()
+                    n_done += 1
+
+                    if kind == "main":
+                        results[task_type] = result
+                        # Submit fork tasks back to the same pool
+                        for ft in result.fork_tasks:
+                            n_submitted += 1
+                            f = executor.submit(
+                                _run_fork_with_sem, sem, args, task_type, ep_id, ft, n_submitted, n_submitted,
+                            )
+                            futures[f] = ("fork", task_type)
+
+                    print(f"[{n_done}/{n_submitted}] {task_type}: {result.termination_reason} "
+                          f"({result.total_steps} steps){' [fork]' if kind == 'fork' else ''}")
 
         # Summary
         print(f"\n{'='*60}")

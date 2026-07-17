@@ -3,7 +3,7 @@
 
 [api]
 base_url = "https://www.9527code.com/v1"
-api_key = "sk-IxXjSiRZ3IhCd4hxMajweiXamF0R1U1cHmNECBrRbIz8v0hy"
+api_key = "sk-1Umt0PPJiwyy5kFe19mFhkzCfuMcEIpOIgqx5J2thwjAHz6c"
 
 [models]
 planner = "gpt-5.5"

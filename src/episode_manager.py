@@ -1,8 +1,12 @@
 import json
 import os
+import threading
 
 
 class EpisodeManager:
+    _locks: dict[str, threading.Lock] = {}
+    _locks_guard = threading.Lock()
+
     def __init__(
         self,
         episode_id: str,
@@ -25,26 +29,62 @@ class EpisodeManager:
             "runtime_traps": [],
             "steps": [],
             "final_outcome": None,
+            "status": "pending",
+            "pid": None,
         }
 
         os.makedirs(output_dir, exist_ok=True)
         self._flush()
 
+    @classmethod
+    def _lock_for(cls, file_path: str) -> threading.Lock:
+        key = os.path.abspath(file_path)
+        with cls._locks_guard:
+            if key not in cls._locks:
+                cls._locks[key] = threading.Lock()
+            return cls._locks[key]
+
+    def _mutate(self, mutation):
+        lock = self._lock_for(self.file_path)
+        with lock:
+            if os.path.exists(self.file_path):
+                self._reload_unlocked()
+            mutation(self.data)
+            self._flush_unlocked()
+
     def add_step(self, step: dict):
-        self.data["steps"].append(step)
-        self._flush()
+        def append_step(data):
+            data["steps"].append(step)
+
+        self._mutate(append_step)
 
     def add_initial_trap(self, trap: dict):
-        self.data["initial_traps"].append(trap)
-        self._flush()
+        def append_trap(data):
+            data["initial_traps"].append(trap)
+
+        self._mutate(append_trap)
 
     def add_runtime_trap(self, trap: dict):
-        self.data["runtime_traps"].append(trap)
-        self._flush()
+        def append_trap(data):
+            data["runtime_traps"].append(trap)
+
+        self._mutate(append_trap)
 
     def set_final_outcome(self, outcome: dict):
-        self.data["final_outcome"] = outcome
-        self._flush()
+        def set_outcome(data):
+            data["final_outcome"] = outcome
+
+        self._mutate(set_outcome)
+
+    def set_status(self, status: str, pid: int | None = None):
+        if status not in {"pending", "running", "completed", "failed", "interrupted"}:
+            raise ValueError(f"Invalid episode status: {status}")
+
+        def update_status(data):
+            data["status"] = status
+            data["pid"] = pid
+
+        self._mutate(update_status)
 
     def get_steps_for_branch(self, branch_id: str) -> list[dict]:
         return [s for s in self.data["steps"] if s["branch_id"] == branch_id]
@@ -64,19 +104,39 @@ class EpisodeManager:
         return ids
 
     def _flush(self):
-        with open(self.file_path, "w") as f:
+        lock = self._lock_for(self.file_path)
+        with lock:
+            self._flush_unlocked()
+
+    def _flush_unlocked(self):
+        temp_path = f"{self.file_path}.{threading.get_ident()}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(self.data, f, indent=2, ensure_ascii=False)
+        os.replace(temp_path, self.file_path)
+
+    def _reload_unlocked(self):
+        with open(self.file_path, "r", encoding="utf-8") as f:
+            self.data = json.load(f)
+        self._ensure_status_fields()
+
+    def _ensure_status_fields(self):
+        if "status" not in self.data:
+            self.data["status"] = "completed" if self.data.get("final_outcome") else "interrupted"
+        self.data.setdefault("pid", None)
 
     # ------------------------------------------------------------------
     # 静态工厂方法：从已有文件恢复
     # ------------------------------------------------------------------
     @staticmethod
     def load(file_path: str) -> "EpisodeManager":
-        with open(file_path, "r") as f:
-            data = json.load(f)
+        lock = EpisodeManager._lock_for(file_path)
+        with lock:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
 
         mgr = EpisodeManager.__new__(EpisodeManager)
         mgr.episode_id = data["episode_id"]
         mgr.file_path = file_path
         mgr.data = data
+        mgr._ensure_status_fields()
         return mgr
