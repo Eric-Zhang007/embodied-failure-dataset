@@ -21,6 +21,7 @@ from src.context_builder import build_branch_history
 from src.egocentric_memory import EgocentricMemory, SearchTrail
 from src.semantic_memory import SemanticMemory
 from src.critic_guard import CriticGuard
+from src.trap_trigger import CausalTrapEngine
 
 _VALID_ACTIONS = {
     "MoveAhead", "MoveBack", "MoveLeft", "MoveRight", "RotateLeft", "RotateRight", "LookUp", "LookDown",
@@ -44,6 +45,14 @@ _CAMERA_HORIZON_MIN = -30.0
 _CAMERA_HORIZON_MAX = 60.0
 _CAMERA_HORIZON_EPSILON = 0.01
 _CAMERA_LOOK_STEP_DEGREES = 30.0
+
+
+def _apply_causal_traps(engine, action: str, success: bool,
+                        error, controller, params: dict = None):
+    """Check and apply causal traps from the engine after each action."""
+    traps = engine.step(action, success, error, controller, params)
+    for trap in traps:
+        inject(controller, **trap)
 
 
 @dataclass
@@ -85,6 +94,7 @@ class BranchRunner:
         enable_progress_gating: bool = True,
         enable_search_trail: bool = True,
         memory_mode: str = "semantic",  # "semantic" | "geometric"
+        causal_traps_enabled: bool = True,
     ):
         self.eb_agent = eb_agent
         self.oracle_agent = oracle_agent
@@ -93,6 +103,7 @@ class BranchRunner:
         self.enable_phase2 = enable_phase2
         self.step_limit_multiplier = step_limit_multiplier
         self.enable_fork = enable_fork
+        self.causal_traps_enabled = causal_traps_enabled
         self.recorder = StepRecorder()
         self._last_scan_step = -100
         self.memory_mode = memory_mode
@@ -190,10 +201,9 @@ class BranchRunner:
         else:
             memory = SemanticMemory()
         trail = SearchTrail(resolution=0.5)
+        causal_engine = CausalTrapEngine(enabled=self.causal_traps_enabled)
         intent_history: list[dict] = []  # completed/failed intent summaries
         current_intent = {"intent": "", "target": "", "steps": [], "start_step": 0}
-        phase2_injection_count = 0
-        phase2_max_injections = 3
         nonexecuted_retry_count = 0
         max_nonexecuted_retries = 3
         zero_step_completion_steps: dict[tuple[str, str], int] = {}
@@ -892,81 +902,8 @@ class BranchRunner:
                 nonexecuted_retry_count = 0
                 continue
 
-            # ==========================================================
-            # Phase 2: Oracle 注入决策
-            # ==========================================================
-            remaining = phase2_max_injections - phase2_injection_count
+            # Phase 2 injection removed — replaced by causal traps (src/trap_trigger.py)
             injection_decision = None
-            injection_attempt_errors: list[dict] = []
-            if self.enable_phase2 and cascade_level <= 1 and remaining > 0:
-                for injection_attempt in range(3):
-                    oracle_phase2 = self.oracle_agent.decide_injection(
-                        task_goal=ep.data["task_goal"],
-                        image=image,
-                        env_state=metadata,
-                        proposed_action=proposed_action,
-                        proposed_params=proposed_params,
-                        eb_reasoning=eb_reasoning,
-                        action_history=eb_history,
-                        cascade_level=cascade_level,
-                        is_fork=(config.parent_branch_id is not None),
-                        remaining_injections=remaining,
-                        injection_attempt_errors=injection_attempt_errors,
-                    )
-                    if not (oracle_phase2.get("inject") and oracle_phase2.get("injection")):
-                        break
-
-                    inj = oracle_phase2["injection"]
-                    inj_result = inject(env.controller, method=inj["method"], **inj["params"])
-                    if inj_result["success"]:
-                        phase2_injection_count += 1
-                        trap = {
-                            "trap_id": f"trap_{config.branch_id}_{step_index}",
-                            "branch_id": config.branch_id,
-                            "created_at_step_id": f"s{step_index}",
-                            "created_by": "oracle",
-                            "injection": inj,
-                            "modification_success": True,
-                            "triggered_at_step_id": None,
-                            "env_error": None,
-                            "status": "active",
-                        }
-                        ep.add_runtime_trap(trap)
-                        injection_decision = {
-                            "decided_to_inject": True,
-                            "injection": inj,
-                            "modification_success": True,
-                            "modification_error": None,
-                        }
-                        break
-
-                    attempt_error = {
-                        "method": inj.get("method"),
-                        "params": inj.get("params", {}),
-                        "error": inj_result.get("error"),
-                    }
-                    injection_attempt_errors.append(attempt_error)
-                    self._write_failure_log(failure_log_path, {
-                        "step_index": step_index,
-                        "branch_id": config.branch_id,
-                        "failure_type": "injection_setup_failed",
-                        "proposed_action": proposed_action,
-                        "proposed_params": proposed_params,
-                        "injection": inj,
-                        "error_message": inj_result.get("error"),
-                        "retry_attempt": injection_attempt + 1,
-                    })
-                else:
-                    raise RuntimeError(
-                        "Oracle injection setup failed 3 times for the same EB action. "
-                        "See failures log for attempted injections."
-                    )
-            elif self.enable_phase2 and remaining <= 0:
-                injection_decision = {
-                    "decided_to_inject": False,
-                    "reasoning": "LIMIT REACHED: all 3 successful injections have been used.",
-                    "injection": None,
-                }
 
             # ==========================================================
             # LookAround: 站原地旋转 4 次，截 4 张图发给 EB 做多图综合分析。
@@ -1141,6 +1078,9 @@ class BranchRunner:
                     memory.update(seq_result["metadata"], seq_result["metadata"].get("objects", []),
                                   "MoveSequence", True, None, task_criteria)
                     self._record_trail(trail, seq_result["metadata"])
+                    # ── Causal trap check ──
+                    _apply_causal_traps(causal_engine, "MoveSequence", True, None,
+                                        env.controller)
                     self._track_searched_receptacles(proposed_params)
                     # Restore image/metadata from final state
                     image = seq_result["frame"]
@@ -1158,6 +1098,9 @@ class BranchRunner:
                     nonexecuted_retry_count = 0
                     memory.update(metadata, metadata.get("objects", []),
                                   "MoveSequence", False, seq_msg, task_criteria)
+                    # ── Causal trap check ──
+                    _apply_causal_traps(causal_engine, "MoveSequence", False, seq_msg,
+                                        env.controller)
                     pending_step = self._build_step_entry(
                         ep.episode_id, config.branch_id, step_index - 1, parent_id,
                         "MoveSequence", proposed_params, result, eb_reasoning, injection_decision,
@@ -1368,6 +1311,9 @@ class BranchRunner:
                 nonexecuted_retry_count = 0
                 memory.update(result["metadata"], result["metadata"].get("objects", []), act, True, None, task_criteria)
                 self._record_trail(trail, result["metadata"])
+                # ── Causal trap check ──
+                _apply_causal_traps(causal_engine, act, True, None,
+                                    env.controller, params)
                 if act == "OpenObject" and params.get("objectId"):
                     for obj in result["metadata"].get("objects", []):
                         if obj.get("objectId") == params["objectId"]:
@@ -1383,6 +1329,9 @@ class BranchRunner:
             cascade_level += 1
             last_error = result["error"]
             memory.update(result.get("metadata", metadata), result.get("metadata", metadata).get("objects", []), act, False, result["error"], task_criteria)
+            # ── Causal trap check ──
+            _apply_causal_traps(causal_engine, act, False, result["error"],
+                                env.controller, params)
 
             # 追踪失败的 objectId
             obj_id = params.get("objectId")
@@ -1484,10 +1433,13 @@ class BranchRunner:
                 self._finalize(ep, config, result_br, fork_source_ids)
                 return result_br
 
-            if self.enable_fork and oracle_phase4.get("should_fork") and eb_phase3.get("counterfactual"):
-                grade = oracle_phase4.get("counterfactual_grade", "WA")
-                if grade == "AC":
-                    fork_task = self._build_fork_task(
+            if self.enable_fork and oracle_phase4.get("should_fork"):
+                # Use Planner's counterfactual if available, fall back to Oracle's gold
+                counterfactual = eb_phase3.get("counterfactual") or oracle_phase4.get("counterfactual_gold")
+                if counterfactual:
+                    grade = oracle_phase4.get("counterfactual_grade", "WA")
+                    if grade == "AC":
+                        fork_task = self._build_fork_task(
                         config=config, current_step_idx=step_index - 1,
                         eb_phase3=eb_phase3, oracle_phase4=oracle_phase4,
                         history=eb_history, ep=ep,
@@ -2337,6 +2289,7 @@ def run_single_branch(
     enable_search_trail: bool = True,
     memory_mode: str = "semantic",  # "semantic" | "geometric"
     episode_status: str = "pending",
+    causal_traps_enabled: bool = True,
 ) -> BranchResult:
     """
     一个 episode 的完整生命周期：加载数据 → 初始化环境 → 陷阱 → 跑分支。
@@ -2399,7 +2352,8 @@ def run_single_branch(
         runner = BranchRunner(eb_agent, oracle_agent, output_dir,
                               step_limit_multiplier=step_limit_multiplier,
                               enable_fork=enable_fork,
-                              enable_phase2=(trap_planner is not False and trap_planner is not None),
+                              enable_phase2=False,  # Phase 2 injection removed (replaced by causal traps)
+                              causal_traps_enabled=causal_traps_enabled,
                               executor_agent=executor_agent,
                               enable_critic=enable_critic,
                               critic_llm=critic_llm,

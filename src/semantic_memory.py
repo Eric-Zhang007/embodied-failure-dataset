@@ -44,6 +44,7 @@ class SemanticMemory(MemoryInterface):
         self._task_type: str = ""
         self._task_target: str = ""
         self._task_receptacle: str = ""
+        self._toggled_target: bool = False
 
         # Visitation stats
         self.receptacle_visit_counts: dict[str, int] = {}
@@ -161,6 +162,12 @@ class SemanticMemory(MemoryInterface):
                 blocker_dir = obs.direction
             self._last_error = self._compress_error(action, error_message)
 
+        # Track successful toggle/process actions for task progress
+        _TOGGLE_ACTIONS = {"ToggleObjectOn", "ToggleObjectOff", "SliceObject",
+                           "CookObject", "CleanObject", "BreakObject", "FillObjectWithLiquid"}
+        if success and action in _TOGGLE_ACTIONS:
+            self._toggled_target = True
+
         intent_parts = intent.split(maxsplit=1)
         intent_verb = intent_parts[0] if intent_parts else ""
         intent_target = intent_parts[1] if len(intent_parts) > 1 else ""
@@ -229,7 +236,7 @@ class SemanticMemory(MemoryInterface):
             checks.append(("Pick up", any(e.object_type == target and e.status == "held"
                                           for e in self._objects.values())))
             checks.append(("Heat/Cool/Clean" if self._task_type else "Process",
-                          False))  # tracked via object state
+                          self._toggled_target))  # tracked via successful ToggleObjectOn/Cut/etc.
             checks.append(("Place in " + self._task_receptacle,
                           any(e.object_type == target and e.status == "placed"
                               for e in self._objects.values())))
