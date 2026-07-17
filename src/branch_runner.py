@@ -38,6 +38,33 @@ _REPEATABLE_ACTIONS = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight"}
 _MAX_SEQUENCE_ACTIONS = 12
 _MAX_ACTION_REPEAT = 200
 
+
+def _sid(branch_id: str, idx: int) -> str:
+    """Globally-unique step id: '<branch>__s<idx>'.
+
+    Prefixing with branch_id makes step_id unique across branches (main +
+    forks) within one episode file. The '__' separator is filesystem-safe on
+    Windows, so it stays valid as a PNG filename ('<branch>__s<idx>.png').
+    step_id is treated as an opaque key everywhere (never int-parsed), so the
+    prefix is safe. Fork branches share one image dir, so this also prevents
+    frame-filename collisions between branches.
+    """
+    return f"{branch_id}__s{idx}"
+
+
+def _last_branch_step_id(ep, branch_id: str) -> Optional[str]:
+    """Return the step_id of the most recently recorded step on this branch,
+    or None if the branch has no steps yet.
+
+    Used to compute parent_step_id by reading actual episode state rather than
+    recomputing a string — correct for fresh runs, forks, and resume across the
+    old-format/new-format seam (old episodes have bare 's<idx>' ids)."""
+    last = None
+    for s in ep.data.get("steps", []):
+        if s.get("branch_id") == branch_id:
+            last = s.get("step_id")
+    return last
+
 # AI2-THOR cameraHorizon uses positive degrees down from level: LookDown adds
 # 30 degrees and LookUp subtracts 30. Controller.plan_horizons explicitly
 # enumerates 330° (-30° up), 0°, 30°, and 60° as supported horizons.
@@ -271,7 +298,7 @@ class BranchRunner:
         while True:
             if step_index >= 200:
                 return self._make_result(config, "step_hard_limit", step_index, fork_tasks, fork_source_ids, ep)
-            parent_id = f"s{step_index - 1}" if step_index > 0 else None
+            parent_id = _last_branch_step_id(ep, config.branch_id)
             injection_decision = None
             # ==========================================================
             # Phase 1: EB Agent 提议动作
@@ -291,7 +318,7 @@ class BranchRunner:
             if task_complete:
                 self._write_success_step(
                     ep, config.branch_id, step_index,
-                    f"s{step_index - 1}" if step_index > 0 else None,
+                    _last_branch_step_id(ep, config.branch_id),
                     "Done", {},
                     {"success": True, "error": None, "frame": image, "metadata": metadata},
                     eb_reasoning="Task goal achieved (auto-detected).",
@@ -497,13 +524,13 @@ class BranchRunner:
                     image_dir = os.path.join(self.output_dir, ep.episode_id)
                     view_paths = []
                     for label, frame in look_images:
-                        vp = os.path.join(image_dir, f"s{step_index}_look_{label}.png")
+                        vp = os.path.join(image_dir, f"{_sid(config.branch_id, step_index)}_look_{label}.png")
                         StepRecorder.save_frame(frame, vp)
                         view_paths.append({"label": label, "image_path": vp})
                     look_step["lookaround_views"] = view_paths
                     self._write_success_step_direct(ep, look_step)
                     eb_history.append(look_step)
-                    parent_id = f"s{step_index}"
+                    parent_id = _sid(config.branch_id, step_index)
                     step_index += 1
                     memory.update(metadata, metadata.get("objects", []),
                                   "LookAround", True, None, task_criteria)
@@ -853,7 +880,7 @@ class BranchRunner:
                 if task_complete_done:
                     self._write_success_step(
                         ep, config.branch_id, step_index,
-                        f"s{step_index - 1}" if step_index > 0 else None,
+                        _last_branch_step_id(ep, config.branch_id),
                         "Done", {},
                         {"success": True, "error": None, "frame": image, "metadata": metadata},
                         eb_reasoning=eb_reasoning,
@@ -870,7 +897,7 @@ class BranchRunner:
                 }
                 step_entry = self._build_step_entry(
                     ep.episode_id, config.branch_id, step_index,
-                    f"s{step_index - 1}" if step_index > 0 else None,
+                    _last_branch_step_id(ep, config.branch_id),
                     "Done", {}, result, eb_reasoning,
                 )
                 step_entry["error_type"] = "done_rejected"
@@ -922,7 +949,7 @@ class BranchRunner:
                         trap = {
                             "trap_id": f"trap_{config.branch_id}_{step_index}",
                             "branch_id": config.branch_id,
-                            "created_at_step_id": f"s{step_index}",
+                            "created_at_step_id": _sid(config.branch_id, step_index),
                             "created_by": "oracle",
                             "injection": inj,
                             "modification_success": True,
@@ -1004,13 +1031,13 @@ class BranchRunner:
                 image_dir = os.path.join(self.output_dir, ep.episode_id)
                 view_paths = []
                 for label, frame in look_images:
-                    view_path = os.path.join(image_dir, f"s{step_index}_look_{label}.png")
+                    view_path = os.path.join(image_dir, f"{_sid(config.branch_id, step_index)}_look_{label}.png")
                     StepRecorder.save_frame(frame, view_path)
                     view_paths.append({"label": label, "image_path": view_path})
                 look_step["lookaround_views"] = view_paths
                 self._write_success_step_direct(ep, look_step)
                 eb_history.append(look_step)
-                parent_id = f"s{step_index}"
+                parent_id = _sid(config.branch_id, step_index)
                 step_index += 1
                 nonexecuted_retry_count = 0
                 memory.update(metadata, metadata.get("objects", []),
@@ -1304,7 +1331,7 @@ class BranchRunner:
             resolved, resolve_warning = resolve_object_ids(proposed_action, proposed_params,
                                                            metadata.get("objects", []))
             act, params = adapt(proposed_action, resolved)
-            parent_id = f"s{step_index - 1}" if step_index > 0 else None
+            parent_id = _last_branch_step_id(ep, config.branch_id)
 
             # objectType not found in scene: log only, keep step_index unchanged, retry the EB request.
             if resolve_warning and act in _OBJECT_ACTIONS:
@@ -1461,17 +1488,28 @@ class BranchRunner:
                 self._finalize(ep, config, result_br, fork_source_ids)
                 return result_br
 
-            if self.enable_fork and oracle_phase4.get("should_fork") and eb_phase3.get("counterfactual"):
+            if self.enable_fork and oracle_phase4.get("should_fork"):
                 grade = oracle_phase4.get("counterfactual_grade", "WA")
-                if grade == "AC":
+                gold = oracle_phase4.get("counterfactual_gold")
+                # AC: the agent's own counterfactual was correct → fork it.
+                # PA/WA: the agent was wrong/partial → fork the Oracle's corrected
+                #        gold instead, so the branch tests a verified alternative.
+                if grade == "AC" and eb_phase3.get("counterfactual"):
+                    cf_source = eb_phase3.get("counterfactual")
+                elif isinstance(gold, dict) and gold.get("target_step") is not None:
+                    cf_source = gold
+                else:
+                    cf_source = None
+                if cf_source is not None:
                     fork_task = self._build_fork_task(
                         config=config, current_step_idx=step_index - 1,
-                        eb_phase3=eb_phase3, oracle_phase4=oracle_phase4,
+                        counterfactual=cf_source,
+                        fallback_recovery=eb_phase3.get("proposed_recovery_action", {}),
                         history=eb_history, ep=ep,
                     )
                     if fork_task:
                         fork_tasks.append(fork_task)
-                        fork_source_ids.append(f"s{step_index - 1}")
+                        fork_source_ids.append(_sid(config.branch_id, step_index - 1))
 
         return self._make_result(config, "unreachable", step_index,
                                  fork_tasks, fork_source_ids, ep)
@@ -1577,7 +1615,7 @@ class BranchRunner:
                           action, params, result, eb_reasoning, injection_decision=None):
         image_dir = os.path.join(self.output_dir, episode_id)
         step = self.recorder.build_step(
-            step_id=f"s{step_idx}", branch_id=branch_id, parent_step_id=parent_id,
+            step_id=_sid(branch_id, step_idx), branch_id=branch_id, parent_step_id=parent_id,
             step_index=step_idx, action=action, action_params=params,
             result=result, image_dir=image_dir,
         )
@@ -1953,12 +1991,12 @@ class BranchRunner:
         self._finalize(ep, config, result, fork_source_ids)
         return result
 
-    def _build_fork_task(self, config, current_step_idx, eb_phase3, oracle_phase4, history, ep):
-        cf = eb_phase3.get("counterfactual")
+    def _build_fork_task(self, config, current_step_idx, counterfactual, fallback_recovery, history, ep):
+        cf = counterfactual
         if not cf:
             return None
 
-        # 结构化 counterfactual（新格式）
+        # 结构化 counterfactual（新格式）— EB Phase-3 或 Oracle gold 同构
         if isinstance(cf, dict) and cf.get("target_step") is not None:
             target_idx = cf["target_step"]
             alt_action = cf.get("alternative_action", {})
@@ -1988,7 +2026,7 @@ class BranchRunner:
                 return None
             branches_from_id = target_step.get("parent_step_id")
             replaces_id = target_step.get("step_id")
-            alt_action = eb_phase3.get("proposed_recovery_action", {})
+            alt_action = fallback_recovery or {}
 
         fork_branch_id = f"fork_s{target_step.get('step_index_in_branch', '?')}_{config.branch_id}"
 
@@ -2006,7 +2044,7 @@ class BranchRunner:
             "diverges_at_step_id": branches_from_id,
             "fork_config": {
                 "replaces_step_id": replaces_id,
-                "origin_step_id": f"s{current_step_idx}",
+                "origin_step_id": _sid(config.branch_id, current_step_idx),
                 "alternative_action": alt_action,
                 "counterfactual_text": cf_text,
             },

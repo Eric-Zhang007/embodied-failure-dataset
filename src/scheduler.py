@@ -15,7 +15,7 @@ from src.oracle_agent import OracleAgent
 from src.executor import ExecutorAgent
 from src.branch_runner import (
     BranchRunner, BranchConfig, BranchResult,
-    run_single_branch, replay_steps,
+    run_single_branch, replay_steps, _sid,
 )
 from src.fork_manager import ForkManager
 from src.env_controller import EnvController
@@ -242,7 +242,7 @@ class Scheduler:
             if not alt_result.get("success"):
                 image_dir = os.path.join(self.config.output_dir, ep_id)
                 fork_root = self.recorder.build_step(
-                    step_id="s0",
+                    step_id=_sid(config.branch_id, 0),
                     branch_id=config.branch_id,
                     parent_step_id=config.diverges_at_step_id,
                     step_index=0,
@@ -278,7 +278,7 @@ class Scheduler:
 
             image_dir = os.path.join(self.config.output_dir, ep_id)
             fork_root = self.recorder.build_step(
-                step_id="s0",
+                step_id=_sid(config.branch_id, 0),
                 branch_id=config.branch_id,
                 parent_step_id=config.diverges_at_step_id,
                 step_index=0,
