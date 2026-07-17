@@ -290,6 +290,19 @@ class SemanticMemory(MemoryInterface):
             lines.append(f"  ▸ {e.object_type} — last seen {freshness} {loc}.")
             if parent and not self._is_receptacle_visible(parent):
                 lines.append(f"    I should try opening {parent} and looking inside.")
+
+        # ── Failure saturation: if I've failed to interact with the target at
+        #     its last known location repeatedly, append a confidence-lowering hint.
+        failures_at_location = 0
+        for key, count in self._stuck_tracker._intent_failure.items():
+            intent_verb, intent_target = key
+            if intent_target == self._task_target and intent_verb in ("pickup", "approach", "open"):
+                failures_at_location = max(failures_at_location, count)
+        if failures_at_location >= 3:
+            lines.append(f"\n  ⚡ WARNING: I've failed to reach the {self._task_target} here "
+                         f"{failures_at_location} times. I may be stuck at a bad angle — "
+                         f"try approaching from a different direction or checking other "
+                         f"locations where the {self._task_target} might also be.")
         return "\n".join(lines) + "\n"
 
     def _render_remembered_grouped(self) -> str:
@@ -506,6 +519,19 @@ class SemanticMemory(MemoryInterface):
         if held:
             return {"phase": "DELIVERY",
                     "reason": f"I am holding the {target}; I need to process and deliver it"}
+
+        # ── Failure-aware phase override: if I've tried to interact with the target
+        #     at its current location too many times, force EXPLORATION so I don't
+        #     keep retrying a dead-end approach.
+        failures_at_target = 0
+        for key, count in self._stuck_tracker._intent_failure.items():
+            verb, tgt = key
+            if tgt == target and verb in ("pickup", "approach", "open", "put"):
+                failures_at_target = max(failures_at_target, count)
+        if failures_at_target >= 4:
+            return {"phase": "EXPLORATION",
+                    "reason": (f"I've failed to reach the {target} {failures_at_target} times "
+                               "at its last known location — I should explore alternatives.")}
 
         if self.has_type(target):
             if self.is_type_visible(target):
