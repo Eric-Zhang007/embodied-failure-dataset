@@ -227,6 +227,85 @@ class SchedulerAccountingTest(unittest.TestCase):
         self.assertEqual(scheduler.stats["completed"], 3)
 
 
+class ForkAltActionResolutionTest(unittest.TestCase):
+    """_run_fork must resolve objectType->objectId before env.step, like the
+    main loop. Otherwise structured EB/Oracle counterfactual actions (which
+    carry objectType) fail with AI2-THOR 'target not found'."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._warmup_patcher = patch("src.vlm_client.VLMClient.openai")
+        mock_cls = cls._warmup_patcher.start()
+        mock_client = MagicMock()
+        mock_client.chat_text.return_value = "OK"
+        mock_cls.return_value = mock_client
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._warmup_patcher.stop()
+
+    def test_alt_action_objecttype_is_resolved_before_env_step(self):
+        egg_id = "Egg|+01.67|+00.97|+02.02"
+        objects = [{"objectType": "Egg", "objectId": egg_id,
+                    "visibleBounds2D": True, "pickupable": True, "receptacle": False}]
+
+        recorded = {}
+
+        import numpy as np
+
+        class FakeEnv:
+            def __init__(self, scene=None):
+                pass
+            def reset_to_alfred_scene(self, *a, **k):
+                pass
+            def get_state_snapshot(self):
+                return {"metadata": {"objects": objects},
+                        "frame": np.zeros((4, 4, 3), dtype=np.uint8)}
+            def step(self, action, **params):
+                recorded["action"] = action
+                recorded["params"] = params
+                # Fail immediately so _run_fork short-circuits at the fork_failed
+                # branch, BEFORE any reasoning-rewrite API call. We only care that
+                # the params reaching env.step were resolved.
+                return {"success": False, "error": "stop here",
+                        "frame": np.zeros((4, 4, 3), dtype=np.uint8)}
+            def close(self):
+                pass
+
+        config = SchedulerConfig(output_dir=tempfile.mkdtemp())
+        with patch("src.scheduler.EnvController", FakeEnv):
+            scheduler = Scheduler(config)
+            ep_id = "epfork"
+            out_file = os.path.join(config.output_dir, f"{ep_id}.json")
+            # minimal episode file the fork loader can read
+            EpisodeManager(ep_id, config.output_dir, {
+                "task_goal": "g", "scene": "FloorPlan1", "task_type": "heat",
+                "alfred_scene": {"object_poses": [1]},
+            })
+            fork_cfg = BranchConfig(
+                episode_id=ep_id, branch_id="fork_s1_main",
+                parent_branch_id="main", shared_context_step_ids=[],
+                diverges_at_step_id="main__s1",
+                fork_config={
+                    "replaces_step_id": "main__s1",
+                    "origin_step_id": "main__s2",
+                    "alternative_action": {"action": "PickupObject",
+                                           "params": {"objectType": "Egg"}},
+                    "counterfactual_text": "should have grabbed the egg",
+                },
+            )
+            task = {"episode_id": ep_id, "meta": {"scene": "FloorPlan1"},
+                    "traj_path": "", "base_step_count": 0,
+                    "branch_config": fork_cfg}
+            with patch("src.scheduler.replay_steps"):
+                scheduler._run_fork(task, scheduler._create_agents())
+
+        # objectType must be gone; a resolved objectId must be present.
+        self.assertEqual("PickupObject", recorded["action"])
+        self.assertEqual(egg_id, recorded["params"].get("objectId"))
+        self.assertNotIn("objectType", recorded["params"])
+
+
 class EpisodeManagerConcurrencyTest(unittest.TestCase):
     def _metadata(self):
         return {

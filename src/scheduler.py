@@ -4,6 +4,7 @@
 
 import os
 import glob
+import logging
 import threading
 from dataclasses import dataclass
 from collections import deque
@@ -22,6 +23,7 @@ from src.env_controller import EnvController
 from src.episode_manager import EpisodeManager
 from src.alfred_parser import load_traj, extract_metadata, extract_low_actions
 from src.step_recorder import StepRecorder
+from src.action_adapter import resolve_object_ids, adapt
 
 
 @dataclass
@@ -305,13 +307,26 @@ class Scheduler:
             replay_steps(env, shared_steps, skip_failed=True)
 
             # 2. 执行 fork 替代动作
+            #    alt_params 来自 EB/Oracle 的结构化 counterfactual，带 objectType/
+            #    receptacleType。像主循环一样先 resolve_object_ids -> adapt 成
+            #    objectId，否则 AI2-THOR 找不到目标（container-interior 对象尤甚）。
             alt_action = fc.get("alternative_action", {})
             alt_name = alt_action.get("action")
             alt_params = alt_action.get("params", {}) or {}
             if not alt_name:
                 raise ValueError(f"Fork alternative_action lacks action: {alt_action}")
 
-            alt_result = env.step(alt_name, **alt_params)
+            fork_objects = env.get_state_snapshot()["metadata"].get("objects", [])
+            resolved_params, resolve_warning = resolve_object_ids(
+                alt_name, alt_params, fork_objects
+            )
+            exec_name, exec_params = adapt(alt_name, resolved_params)
+            if resolve_warning:
+                logging.warning(
+                    "fork %s: alt-action %s objectId resolution failed: %s",
+                    config.branch_id, alt_name, resolve_warning,
+                )
+            alt_result = env.step(exec_name, **exec_params)
 
             if not alt_result.get("success"):
                 image_dir = os.path.join(self.config.output_dir, ep_id)
