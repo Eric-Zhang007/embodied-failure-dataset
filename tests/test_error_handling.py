@@ -652,5 +652,136 @@ class ErrorHandlingTest(unittest.TestCase):
                 alfred_parser.extract_metadata = original_extract
 
 
+class _FakeEp:
+    """Minimal EpisodeManager stand-in for step-id/fork unit tests."""
+    def __init__(self, steps=None):
+        self.episode_id = "ep_test"
+        self.data = {"steps": steps or []}
+
+
+class StepIdUniquenessTest(unittest.TestCase):
+    def test_sid_format_and_filesystem_safe(self):
+        from src.branch_runner import _sid
+        self.assertEqual("main__s0", _sid("main", 0))
+        self.assertEqual("fork_s5_main__s3", _sid("fork_s5_main", 3))
+        # Must be usable as a PNG filename on Windows: no reserved chars.
+        for ch in '<>:"/\\|?*':
+            self.assertNotIn(ch, _sid("fork_s5_main", 3))
+
+    def test_sid_globally_unique_across_branches(self):
+        from src.branch_runner import _sid
+        # Same local index on different branches must not collide.
+        self.assertNotEqual(_sid("main", 0), _sid("fork_s5_main", 0))
+
+    def test_last_branch_step_id_none_when_empty(self):
+        from src.branch_runner import _last_branch_step_id
+        self.assertIsNone(_last_branch_step_id(_FakeEp(), "main"))
+
+    def test_last_branch_step_id_returns_latest_on_branch(self):
+        from src.branch_runner import _last_branch_step_id
+        ep = _FakeEp([
+            {"branch_id": "main", "step_id": "main__s0"},
+            {"branch_id": "main", "step_id": "main__s1"},
+            {"branch_id": "fork_s1_main", "step_id": "fork_s1_main__s0"},
+        ])
+        self.assertEqual("main__s1", _last_branch_step_id(ep, "main"))
+        self.assertEqual("fork_s1_main__s0", _last_branch_step_id(ep, "fork_s1_main"))
+
+    def test_last_branch_step_id_bridges_old_format_seam(self):
+        # Resuming an episode recorded under the old bare-'s<idx>' scheme:
+        # parent must point at the actual last id, not a recomputed prefix.
+        from src.branch_runner import _last_branch_step_id
+        ep = _FakeEp([
+            {"branch_id": "main", "step_id": "s0"},
+            {"branch_id": "main", "step_id": "s1"},
+        ])
+        self.assertEqual("s1", _last_branch_step_id(ep, "main"))
+
+
+class ForkCounterfactualSourceTest(unittest.TestCase):
+    """_build_fork_task must fork the structured counterfactual it is handed,
+    whether that comes from EB (AC) or the Oracle gold (PA/WA)."""
+
+    def _runner(self):
+        return BranchRunner(object(), NoopOracle(), ".")
+
+    def _history(self):
+        return [
+            {"branch_id": "main", "step_id": "main__s0",
+             "step_index_in_branch": 0, "parent_step_id": None,
+             "action": "PickupObject"},
+            {"branch_id": "main", "step_id": "main__s1",
+             "step_index_in_branch": 1, "parent_step_id": "main__s0",
+             "action": "PutObject"},
+        ]
+
+    def _config(self):
+        return BranchConfig(episode_id="ep_test", branch_id="main",
+                            parent_branch_id=None)
+
+    def test_structured_counterfactual_targets_named_step(self):
+        runner = self._runner()
+        cf = {"target_step": 0,
+              "alternative_action": {"action": "OpenObject",
+                                     "params": {"objectType": "Microwave"}},
+              "reasoning": "should have opened it first"}
+        task = runner._build_fork_task(
+            config=self._config(), current_step_idx=1,
+            counterfactual=cf, fallback_recovery={},
+            history=self._history(), ep=_FakeEp(),
+        )
+        self.assertIsNotNone(task)
+        self.assertEqual("main__s0", task["fork_config"]["replaces_step_id"])
+        self.assertEqual({"action": "OpenObject",
+                          "params": {"objectType": "Microwave"}},
+                         task["fork_config"]["alternative_action"])
+        # origin id must be branch-prefixed and globally unique
+        self.assertEqual("main__s1", task["fork_config"]["origin_step_id"])
+
+    def test_oracle_gold_is_forkable_same_as_eb(self):
+        # A PA/WA gold has the identical structured shape and must build a task.
+        runner = self._runner()
+        gold = {"target_step": 1,
+                "alternative_action": {"action": "MoveBack", "params": {}},
+                "reasoning": "back off before retrying"}
+        task = runner._build_fork_task(
+            config=self._config(), current_step_idx=1,
+            counterfactual=gold, fallback_recovery={},
+            history=self._history(), ep=_FakeEp(),
+        )
+        self.assertIsNotNone(task)
+        self.assertEqual("main__s1", task["fork_config"]["replaces_step_id"])
+        self.assertEqual({"action": "MoveBack", "params": {}},
+                         task["fork_config"]["alternative_action"])
+
+    def test_missing_target_step_in_history_returns_none(self):
+        runner = self._runner()
+        cf = {"target_step": 99,
+              "alternative_action": {"action": "MoveBack", "params": {}},
+              "reasoning": "x"}
+        task = runner._build_fork_task(
+            config=self._config(), current_step_idx=1,
+            counterfactual=cf, fallback_recovery={},
+            history=self._history(), ep=_FakeEp(),
+        )
+        self.assertIsNone(task)
+
+    def test_legacy_string_counterfactual_uses_fallback_recovery(self):
+        runner = self._runner()
+        task = runner._build_fork_task(
+            config=self._config(), current_step_idx=1,
+            counterfactual="I should have opened the microwave",
+            fallback_recovery={"action": "OpenObject",
+                               "params": {"objectType": "Microwave"}},
+            history=self._history(), ep=_FakeEp(),
+        )
+        self.assertIsNotNone(task)
+        # heuristic picks the most recent interaction step (PutObject @ main__s1)
+        self.assertEqual("main__s1", task["fork_config"]["replaces_step_id"])
+        self.assertEqual({"action": "OpenObject",
+                          "params": {"objectType": "Microwave"}},
+                         task["fork_config"]["alternative_action"])
+
+
 if __name__ == "__main__":
     unittest.main()

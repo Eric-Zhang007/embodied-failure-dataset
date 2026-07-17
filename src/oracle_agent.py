@@ -167,7 +167,7 @@ Your job:
 1. Judge whether the agent's diagnosis is correct
 2. Provide the ground truth explanation of what really caused the failure
 3. Grade the counterfactual reasoning (WA / PA / AC)
-4. If WA or PA, provide a corrected counterfactual
+4. If WA or PA, provide a corrected counterfactual — as a STRUCTURED object so it can be replayed as a fork
 5. Judge whether the recovery is reasonable and whether the task is still recoverable
 6. Decide whether to create a fork branch to test the counterfactual
 
@@ -178,6 +178,12 @@ Recovery verdict meanings:
 
 DEAD LOOP DETECTION: If the agent has repeated the SAME failed action 5+ times in recent history (e.g., MoveAhead blocked by the same obstacle 5+ times, or PickupObject failing on the same objectId 3+ times), and continues to try the same approach without changing strategy, the task is UNRECOVERABLE. A stuck agent that cannot adapt its behavior is effectively deadlocked. Mark such cases as "unrecoverable".
 
+COUNTERFACTUAL_GOLD FORMAT — this is the CORRECTED counterfactual that a fork will actually execute, so it must be concrete and replayable:
+- target_step: the integer step index (step_index_in_branch) where the agent should have acted differently.
+- alternative_action: {"action": "<exact AI2-THOR action>", "params": {...}} — the action that should have been taken at target_step. Use objectType for interactions (e.g. {"action": "PickupObject", "params": {"objectType": "Egg"}}).
+- reasoning: 1 sentence on why this alternative would have prevented the failure.
+Set counterfactual_gold to null ONLY when the grade is AC (the agent's own counterfactual was already correct) or when no earlier decision could have prevented the failure.
+
 OUTPUT FORMAT — VALID JSON ONLY:
 - { must be FIRST char, } must be LAST char. NO text outside braces. NO markdown.
 - The closing } is REQUIRED. Truncated JSON = failed evaluation.
@@ -186,7 +192,11 @@ OUTPUT FORMAT — VALID JSON ONLY:
   "diagnosis_correct": true/false,
   "ground_truth": "<real cause of the failure>",
   "counterfactual_grade": "WA" / "PA" / "AC",
-  "counterfactual_gold": "<corrected counterfactual>" or null,
+  "counterfactual_gold": {
+    "target_step": <step_index_integer>,
+    "alternative_action": {"action": "<action>", "params": {}},
+    "reasoning": "<1 sentence: why this would have prevented the failure>"
+  } or null,
   "recovery_verdict": "recovered" / "recoverable" / "unrecoverable",
   "should_fork": true/false,
   "fork_reasoning": "<why fork or not>" or null

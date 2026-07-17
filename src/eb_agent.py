@@ -292,6 +292,9 @@ OBJECT INTERACTION — use objectType (plain type name, no coordinates):
 TASK CONTROL:
 - MoveSequence(steps): chain multiple movements. Steps: [{"action": "MoveAhead", "repeat": 5}, ...]. Stops on first failure. Use to close distance to a known target without re-scanning.
 
+CRITICAL — COLLISION ENTITIES ARE NOT INTERACTABLE OBJECTS:
+The error message may mention internal collision geometry names (Cube.001, OVENDOOR.001, Cube.527, etc.) — these are invisible physics boundaries, NOT objects you can interact with. Do NOT propose OpenObject/CloseObject for these names. They are not in the visible-objects list and cannot be opened or closed. Instead, use NAVIGATION (MoveBack, Rotate, MoveLeft/Right) to go around the obstacle. If the error says "Cube.001 is blocking", the recovery is to MoveBack and find a different path — NOT to "close the oven" or "open the cube."
+
 Important rules for the counterfactual:
 - Only provide it if you genuinely believe a different EARLIER decision would have prevented the failure
 - The counterfactual must reference a specific past step and the alternative action
@@ -385,6 +388,10 @@ Output a single high-level intent. Be specific about the target object. Use EXAC
 
 RULES:
 - Look at the image, visible objects, task goal, hand status, and spatial memory.
+- MEMORY OVER VISUAL GUESSING: If the spatial memory contains a "WHERE MY TARGET IS" section, BELIEVE IT. The memory tracks each object by its unique identity — it knows the REAL location of your target even when a visually similar object (same color/shape) is in view. If memory says your target is inside Fridge, you must OPEN Fridge. Do NOT get distracted by a lookalike on CounterTop.
+- CONTAINER-FIRST: If memory says the target was last seen INSIDE a specific container (Fridge, Cabinet, Microwave, etc.), and that container is visible or remembered, your intent MUST be to open that container. Searching other surfaces while memory pins the target to a container wastes steps and produces meaningless failures.
+- DISAMBIGUATION: Objects marked with ⚠ in the visible list are NOT your target. Memory is authoritative — the ⚠ warning means the real target was seen elsewhere, and this is a different object that merely looks similar. Ignore lookalikes completely.
+- RETRIEVAL FROM A CONTAINER: If the target is a heat/cool/clean-processed object (or anything I earlier placed inside a container such as Microwave/Fridge/Cabinet), it will NOT appear in the visible objects list while that container is closed — an object inside a closed container has visibleBounds2D=false. Its ABSENCE from the visible list is EXPECTED and is NOT evidence the object is gone or that I should search elsewhere. Memory still knows it is in that container. To retrieve it, decompose in this exact order: (1) "approach <container>" until the container is within 0.5m and in view — I may have rotated or stepped away after placing/heating it, so I must RE-APPROACH, not interact from where I now stand; (2) "open <container>"; (3) "pickup <target>". Do NOT abandon the container and wander to other receptacles just because the target is not currently visible.
 - Decide the next logical sub-goal to make progress toward the task.
 - If target is >0.5m away: intent is to APPROACH it first.
 - If target is in hand and task requires putting it somewhere: intent is to PLACE it.
@@ -474,11 +481,16 @@ CRITICAL — EXPLORATION DIRECTIVE:
 - Look at the SPATIAL MEMORY for remembered-but-unvisited receptacles (not marked SEARCHED).
 - If the target has NEVER been seen, pick a receptacle you have NOT approached yet.
 - Prefer novel locations over familiar ones. Diversity is the goal.
+- MEMORY OVER VISUAL GUESSING: If spatial memory says the target is inside a specific container, prioritize opening that container over novel exploration. The exploration bias does NOT override memory — memory of the target's actual location is always the highest priority.
 
 Output a single high-level intent. Be specific about the target object. Use EXACT objectType names.
 
 RULES:
 - Look at the image, visible objects, task goal, hand status, and spatial memory.
+- MEMORY OVER VISUAL GUESSING: If the spatial memory contains a "WHERE MY TARGET IS" section, BELIEVE IT. The memory tracks each object by its unique identity — it knows the REAL location of your target even when a visually similar object (same color/shape) is in view. If memory says your target is inside Fridge, you must OPEN Fridge. Do NOT get distracted by a lookalike on CounterTop.
+- CONTAINER-FIRST: If memory says the target was last seen INSIDE a specific container (Fridge, Cabinet, Microwave, etc.), and that container is visible or remembered, your intent MUST be to open that container. Even when exploring, the known target location takes priority over unexplored areas.
+- DISAMBIGUATION: Objects marked with ⚠ in the visible list are NOT your target. Memory is authoritative — the ⚠ warning means the real target was seen elsewhere, and this is a different object that merely looks similar. Ignore lookalikes completely.
+- RETRIEVAL FROM A CONTAINER OVERRIDES EXPLORATION: If the target was earlier placed inside a container (Microwave/Fridge/Cabinet — e.g. after heating/cooling/cleaning), it will NOT appear in the visible list while that container is closed (visibleBounds2D=false). Its absence is EXPECTED and is NOT a reason to explore a new receptacle. Re-approach that SAME container to within 0.5m (I may have stepped/rotated away after placing it), then open it, then pickup the target. Never wander to a novel receptacle when memory pins the target inside a known container.
 - Decide the next logical sub-goal to make progress toward the task.
 - If target is >0.5m away: intent is to APPROACH it first.
 - If target is in hand and task requires putting it somewhere: intent is to PLACE it.
