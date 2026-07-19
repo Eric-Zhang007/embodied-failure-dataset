@@ -113,11 +113,13 @@ class BranchRunner:
         enable_progress_gating: bool = True,
         enable_search_trail: bool = True,
         memory_mode: str = "semantic",  # "semantic" | "geometric"
+        _fork_callback=None,
     ):
         self.eb_agent = eb_agent
         self.oracle_agent = oracle_agent
         self.executor_agent = executor_agent
         self.output_dir = output_dir
+        self._fork_callback = _fork_callback
         self.enable_phase2 = enable_phase2
         self.step_limit_multiplier = step_limit_multiplier
         self.enable_fork = enable_fork
@@ -174,6 +176,7 @@ class BranchRunner:
         env: EnvController,
         ep: EpisodeManager,
         start_step_index: int = 0,
+        _memory=None,
     ) -> BranchResult:
         step_index = start_step_index
         cascade_level = 0
@@ -213,7 +216,9 @@ class BranchRunner:
         )
 
         failed_object_ids: set[str] = set()
-        if self.memory_mode == "geometric":
+        if _memory is not None:
+            memory = _memory
+        elif self.memory_mode == "geometric":
             memory = EgocentricMemory()
         else:
             memory = SemanticMemory()
@@ -1267,6 +1272,33 @@ class BranchRunner:
                         self._finalize(ep, config, result_br, fork_source_ids)
                         return result_br
 
+                    if self.enable_fork and oracle_phase4.get("should_fork"):
+                        grade = oracle_phase4.get("counterfactual_grade", "WA")
+                        gold = oracle_phase4.get("counterfactual_gold")
+                        if grade == "AC" and eb_phase3.get("counterfactual"):
+                            cf_source = eb_phase3.get("counterfactual")
+                        elif isinstance(gold, dict) and gold.get("target_step") is not None:
+                            cf_source = gold
+                        else:
+                            logging.warning(
+                                "Fork skipped: Oracle grade=%s but counterfactual_gold is "
+                                "null or missing target_step. Episode=%s, step=%d",
+                                grade, ep.episode_id, step_index - 1,
+                            )
+                            cf_source = None
+                        if cf_source is not None:
+                            fork_task = self._build_fork_task(
+                                config=config, current_step_idx=step_index - 1,
+                                counterfactual=cf_source,
+                                fallback_recovery=eb_phase3.get("proposed_recovery_action", {}),
+                                history=eb_history, ep=ep,
+                            )
+                            if fork_task:
+                                fork_tasks.append(fork_task)
+                                fork_source_ids.append(_sid(config.branch_id, step_index - 1))
+                                if self._fork_callback:
+                                    self._fork_callback(fork_task)
+
                     # ── Recovery execution ──
                     recovery_verdict = oracle_phase4.get("recovery_verdict", "")
                     if recovery_verdict == "recoverable":
@@ -1525,6 +1557,11 @@ class BranchRunner:
                 elif isinstance(gold, dict) and gold.get("target_step") is not None:
                     cf_source = gold
                 else:
+                    logging.warning(
+                        "Fork skipped: Oracle grade=%s but counterfactual_gold is null or "
+                        "missing target_step. Episode=%s, step=%d",
+                        grade, ep.episode_id, step_index - 1,
+                    )
                     cf_source = None
                 if cf_source is not None:
                     fork_task = self._build_fork_task(
@@ -1557,6 +1594,7 @@ class BranchRunner:
         enable_fork: bool = False,
         enable_phase2: bool = True,
         memory_mode: str = "semantic",
+        fork_callback=None,
     ) -> BranchResult:
         ep = EpisodeManager.load(episode_path)
         branch_steps = ep.get_steps_for_branch(branch_id)
@@ -1566,7 +1604,20 @@ class BranchRunner:
         scene = ep.data["scene"]
         env = EnvController(scene=scene)
         env.reset_to_alfred_scene(_require_alfred_scene(ep.data))
-        replay_steps(env, branch_steps, skip_failed=True)
+
+        # Warm memory during replay so semantic state survives resume
+        if memory_mode == "semantic":
+            from src.semantic_memory import SemanticMemory
+            _warmed_memory = SemanticMemory()
+        else:
+            from src.egocentric_memory import EgocentricMemory
+            _warmed_memory = EgocentricMemory()
+        _tc = get_completion_criteria_text(
+            ep.data.get("alfred_task_type") or ep.data.get("task_type", ""),
+            ep.data.get("pddl_params", {}),
+        )
+        replay_steps(env, branch_steps, skip_failed=True,
+                      memory=_warmed_memory, task_criteria=_tc)
 
         # ── Restore inventory: if the episode says the agent was holding
         #     an object, try to pick it up in the resumed environment (replay
@@ -1626,11 +1677,13 @@ class BranchRunner:
                      step_limit_multiplier=step_limit_multiplier,
                      enable_fork=enable_fork,
                      enable_phase2=enable_phase2,
-                     memory_mode=memory_mode)
+                     memory_mode=memory_mode,
+                     _fork_callback=fork_callback)
         runner.executor_agent = executor_agent
         return runner.run(
             config=config, env=env, ep=ep,
             start_step_index=start_idx,
+            _memory=_warmed_memory,
         )
 
     # ------------------------------------------------------------------
@@ -2026,6 +2079,14 @@ class BranchRunner:
         if isinstance(cf, dict) and cf.get("target_step") is not None:
             target_idx = cf["target_step"]
             alt_action = cf.get("alternative_action", {})
+            alt_name = alt_action.get("action", "")
+            if alt_name and alt_name not in (_VALID_ACTIONS - _META_ACTIONS):
+                logging.warning(
+                    "_build_fork_task: invalid alternative action %r in counterfactual. "
+                    "Episode=%s, branch=%s, target_step=%s",
+                    alt_name, ep.episode_id, config.branch_id, target_idx,
+                )
+                return None
             cf_text = cf.get("reasoning", "")
             # 在 history 中查找目标步
             target_step = None
@@ -2034,6 +2095,11 @@ class BranchRunner:
                     target_step = s
                     break
             if target_step is None:
+                logging.warning(
+                    "_build_fork_task: target_step %s not found in history. "
+                    "Episode=%s, branch=%s",
+                    target_idx, ep.episode_id, config.branch_id,
+                )
                 return None
             branches_from_id = target_step.get("parent_step_id")
             replaces_id = target_step.get("step_id")
@@ -2053,6 +2119,15 @@ class BranchRunner:
             branches_from_id = target_step.get("parent_step_id")
             replaces_id = target_step.get("step_id")
             alt_action = fallback_recovery or {}
+            if alt_action:
+                alt_name = alt_action.get("action", "")
+                if alt_name and alt_name not in (_VALID_ACTIONS - _META_ACTIONS):
+                    logging.warning(
+                        "_build_fork_task: invalid legacy alternative action %r. "
+                        "Episode=%s, branch=%s",
+                        alt_name, ep.episode_id, config.branch_id,
+                    )
+                    return None
 
         fork_branch_id = f"fork_s{target_step.get('step_index_in_branch', '?')}_{config.branch_id}"
 
@@ -2077,26 +2152,28 @@ class BranchRunner:
         }
 
     def _finalize(self, ep, config, result, fork_source_ids):
-        outcome = ep.data.get("final_outcome") or {"main_branch": None, "forks": []}
         branch_entry = {
             "branch_id": result.branch_id,
             "termination_reason": result.termination_reason,
             "total_steps": result.total_steps,
         }
-        if result.branch_id == "main":
-            outcome["main_branch"] = branch_entry
-            # Include dedup statistics in episode outcome for analysis
-            outcome["dedup_stats"] = dict(self.eb_agent.dedup_stats)
+        is_main = result.branch_id == "main"
+        if is_main:
+            ep.update_final_outcome(
+                branch_entry, dedup_stats=dict(self.eb_agent.dedup_stats),
+                is_main=True,
+            )
         else:
-            branch_entry["fork_source_step_id"] = (
+            fork_source_step_id = (
                 fork_source_ids[0] if fork_source_ids else
                 config.fork_config.get("origin_step_id", "?") if config.fork_config else "?"
             )
-            branch_entry["counterfactual_verified"] = (
-                result.termination_reason == "task_complete"
+            counterfactual_verified = result.termination_reason == "task_complete"
+            ep.update_final_outcome(
+                branch_entry, is_main=False,
+                fork_source_step_id=fork_source_step_id,
+                counterfactual_verified=counterfactual_verified,
             )
-            outcome["forks"].append(branch_entry)
-        ep.set_final_outcome(outcome)
 
 
 # ======================================================================
@@ -2280,15 +2357,20 @@ def _extract_task_target_types(traj: dict) -> set[str]:
     return targets
 
 
-def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True):
+def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True,
+                  memory=None, task_criteria: str = ""):
     """
     Replay steps to restore agent state for resume / fork init.
     Handles MoveSequence, LookAround, and single actions correctly.
     MoveSequence steps are expanded and replayed individually; execution stops
     on first failure (matching the original MoveSequence behavior).
     Failed steps are skipped when skip_failed=True.
+    If memory is provided, feed each replayed step into it to rebuild
+    spatial/semantic memory state across resume.
     """
     from src.action_adapter import resolve_object_ids, adapt
+    from src.egocentric_memory import EgocentricMemory
+    from src.semantic_memory import SemanticMemory
 
     _MOVEMENT = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight",
                  "RotateLeft", "RotateRight", "LookUp", "LookDown"}
@@ -2296,6 +2378,7 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
     for s in steps:
         action = s["action"]
         params = s.get("action_params", {})
+        step_success = s.get("success", True)
 
         if action in ("Pass", "Done"):
             continue
@@ -2308,12 +2391,17 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                     raise RuntimeError(
                         f"Replay LookAround RotateLeft failed at {s.get('step_id')}: {r['error']}"
                     )
+                if memory and task_criteria:
+                    meta = env.controller.last_event.metadata
+                    memory.update(meta, meta.get("objects", []),
+                                  "RotateLeft", r["success"], r.get("error"), task_criteria)
             continue
 
         # MoveSequence: expand and replay individual steps
         if action == "MoveSequence":
             objects = env.controller.last_event.metadata.get("objects", [])
             seq_steps = params.get("steps", [])
+            all_ok = True
             for st in seq_steps:
                 a = st.get("action", "")
                 sp = dict(st.get("params", {}))
@@ -2335,16 +2423,28 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                             "replay: MoveSequence step %s skipped at %s: %s",
                             a, s.get("step_id"), r.get("error", "unknown"),
                         )
+                        all_ok = False
                         break  # partial execution accepted, stop here
                     raise RuntimeError(
                         f"Replay MoveSequence step {a} failed at {s.get('step_id')}: {r['error']}"
                     )
+            if memory and task_criteria:
+                meta = env.controller.last_event.metadata
+                memory.update(meta, meta.get("objects", []),
+                              "MoveSequence", all_ok,
+                              None if all_ok else "partial replay",
+                              task_criteria)
             continue
 
         # Single actions (old single-agent path)
         if action in _MOVEMENT:
             act, p = action, {}
         elif action in _META_ACTIONS:
+            if memory and task_criteria:
+                meta = env.controller.last_event.metadata
+                memory.update(meta, meta.get("objects", []),
+                              action, False, "meta-action skipped in replay",
+                              task_criteria)
             continue
         else:
             objects = env.controller.last_event.metadata.get("objects", [])
@@ -2354,10 +2454,19 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                     "replay: single action %s (%s) objectId resolution failed at %s: %s",
                     action, params.get("objectType", "?"), s.get("step_id"), warn,
                 )
+                if memory and task_criteria:
+                    meta = env.controller.last_event.metadata
+                    memory.update(meta, meta.get("objects", []),
+                                  action, False, warn, task_criteria)
                 continue
             act, p = adapt(action, resolved)
 
         r = env.step(act, **p)
+        if memory and task_criteria:
+            meta = env.controller.last_event.metadata
+            memory.update(meta, meta.get("objects", []),
+                          action, r.get("success", False),
+                          r.get("error"), task_criteria)
         if not r["success"]:
             if skip_failed:
                 logging.warning(
@@ -2369,6 +2478,49 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                 f"Replay failed at {s.get('step_id')}: {action}({s.get('action_params', {})}) "
                 f"-> {r['error']}"
             )
+
+
+def execute_move_sequence_steps(env, steps: list[dict], metadata: dict = None):
+    """Execute a MoveSequence step list. Returns (success, frame, metadata, error).
+
+    Used by fork execution (_run_fork) to expand and run counterfactual MoveSequences.
+    """
+    from src.action_adapter import resolve_object_ids, adapt
+
+    _MOVEMENT = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight",
+                 "RotateLeft", "RotateRight", "LookUp", "LookDown"}
+    _META = {"Done", "LookAround"}
+
+    final_frame = None
+    final_metadata = metadata or {}
+
+    for step in steps:
+        action = step.get("action", "")
+        if action in _META:
+            return False, final_frame, final_metadata, f"MoveSequence contains meta-action {action!r}"
+        if action not in _VALID_ACTIONS:
+            return False, final_frame, final_metadata, f"MoveSequence contains invalid action {action!r}"
+
+        step_params = dict(step.get("params", {}) or {})
+        if action not in _MOVEMENT:
+            current_objs = (final_metadata or {}).get("objects", [])
+            resolved, warn = resolve_object_ids(action, step_params, current_objs)
+            if warn:
+                return False, final_frame, final_metadata, f"{action} resolution failed: {warn}"
+            act_name, act_params = adapt(action, resolved)
+        else:
+            act_name = action
+            act_params = {}
+
+        repeat = step.get("repeat", 1)
+        for _ in range(repeat):
+            result = env.step(act_name, **act_params)
+            final_frame = result.get("frame", final_frame)
+            final_metadata = result.get("metadata", final_metadata)
+            if not result.get("success"):
+                return False, final_frame, final_metadata, result.get("error", "step failed")
+
+    return True, final_frame, final_metadata, None
 
 
 def _require_alfred_scene(data: dict) -> dict:
@@ -2439,6 +2591,7 @@ def run_single_branch(
     enable_search_trail: bool = True,
     memory_mode: str = "semantic",  # "semantic" | "geometric"
     episode_status: str = "pending",
+    fork_callback=None,
 ) -> BranchResult:
     """
     一个 episode 的完整生命周期：加载数据 → 初始化环境 → 陷阱 → 跑分支。
@@ -2512,7 +2665,8 @@ def run_single_branch(
                               enable_contrastive_planner=enable_contrastive_planner,
                               enable_progress_gating=enable_progress_gating,
                               enable_search_trail=enable_search_trail,
-                              memory_mode=memory_mode)
+                              memory_mode=memory_mode,
+                              _fork_callback=fork_callback)
 
         config = BranchConfig(
             episode_id=episode_id,

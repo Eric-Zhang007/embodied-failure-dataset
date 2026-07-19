@@ -1,44 +1,46 @@
 {
   "version": "1.0",
-  "timestamp": "2026-07-17T21:05:54+0800",
+  "timestamp": "2026-07-18T16:12:11+0800",
   "phase": "m1-p2",
-  "phase_name": "M1 P2: Container-Retrieval Fix + Structured Oracle Gold + step_id Uniqueness + PR#3 Merge",
-  "phase_dir": ".planning",
-  "plan": 1,
-  "task": 5,
-  "total_tasks": 6,
-  "status": "paused",
+  "phase_name": "Scheduler & Fork Bugfixes + Counterfactual Quality",
+  "phase_dir": ".planning/",
+  "plan": null,
+  "task": 7,
+  "total_tasks": 7,
+  "status": "in_progress",
   "completed_tasks": [
-    {"id": 1, "name": "Diagnose interrupted heat-task resume failure (pick_heat_then_place_in_recep)", "status": "done", "progress": "Root cause found via AI2-THOR ground-truth probe: NOT replay-fidelity (Egg is Hot inside closed Microwave, faithful). Real cause = pose/interaction-visibility — agent rotated to face sink after heating, Microwave fell outside interaction cone (1.1m, visibleBounds2D=false), OpenObject+PickupObject both threw 'not within visibility', agent wandered. Known-issue #1 family, surfacing as retrieval-navigation gap. objectId resolution works fine (not the adapter bug)."},
-    {"id": 2, "name": "Container-retrieval Planner prompt fix (roadmap P3 start)", "status": "done", "commit": "3e412de", "progress": "Added RETRIEVAL FROM A CONTAINER rule to PLANNER_SYSTEM + EXPLORE_BIAS_SYSTEM in eb_agent.py: closed-container object absence is EXPECTED (visibleBounds2D=false), re-approach->open->pickup, do not wander. Prompt-only per user's Phase-3 precedent."},
-    {"id": 3, "name": "Structured Oracle counterfactual_gold + fork-the-gold routing", "status": "done", "commit": "3e412de", "progress": "oracle_agent.py PHASE4 gold now {target_step, alternative_action, reasoning} mirroring EB. branch_runner _build_fork_task forks EB CF on AC, Oracle gold on PA/WA. String back-compat kept."},
-    {"id": 4, "name": "Globally-unique branch-prefixed step_id", "status": "done", "commit": "3e412de", "progress": "_sid(branch,idx)='<branch>__s<idx>' (Windows-safe PNG names). parent_id from _last_branch_step_id() reading real episode state -> robust across old-format resume seam. ~10 sites in branch_runner + 2 fork-roots in scheduler. step_id is opaque everywhere (never int-parsed)."},
-    {"id": 5, "name": "E2E verification of retrieval fix on the paused heat episode", "status": "in_progress", "progress": "BLOCKED by provider API. Run replays cleanly (confirms step_id seam handling), RETRIEVAL prompt loads (system prompt 5090->5965 chars), but wedges on FIRST image-bearing Planner call. Provider (9527code.com) 524s on the real 143KB multimodal payload; 300s socket timeout freezes each attempt ~5min (no console/AI2-THOR output). Killed+relaunched 3x into same wall. Tiny image probes return 200 but mislead — only the full 143KB request fails."},
-    {"id": 6, "name": "Merge PR #3 (partner's scheduler rewrite) + resolve conflicts", "status": "done", "commit": "f4d8051, 49c6081", "progress": "PR #3 (laoma9604-design:pr/scheduler-parallel) merged. No textual conflicts; hand-verified semantic overlap in branch_runner (permanent_stuck escalation interleaves with fork routing, terminal checks precede fork eval) + scheduler (_run_fork(task,agents) signature coexists with _sid fork-roots). Also FIXED pre-existing fork bug: _run_fork called env.step with raw objectType, skipping resolve_object_ids/adapt -> now resolves+adapts (49c6081). 72 tests pass. Branch pushed to origin/session/retrieval-fork-stepid."}
+    {"id": 1, "name": "Scheduler round 1: race fix, dead code, trap_planner, fork status", "status": "done"},
+    {"id": 2, "name": "Fork round 1: action validation, logging, real rewriter args, Path A fork block", "status": "done"},
+    {"id": 3, "name": "VLM timeout tuning: 300→5→30s, faster retry, warmup non-fatal, CDN base_url", "status": "done"},
+    {"id": 4, "name": "Phase 3/4 prompt: force counterfactual, list allowed actions, forbid meta-actions", "status": "done"},
+    {"id": 5, "name": "MoveSequence support in fork path + fork-mid-run parallel submission", "status": "done"},
+    {"id": 6, "name": "Semantic memory persistence across resume (replay_steps feeds memory)", "status": "done"},
+    {"id": 7, "name": "E2E verification — fork + resume + task_complete", "status": "in_progress", "progress": "Memory fix working; API intermittent; agent still in exploration loop post-resume"}
   ],
   "remaining_tasks": [
-    {"id": "p2-verify", "name": "Complete E2E verification once provider API recovers — confirm agent re-approaches Microwave and retrieves heated Egg (not wander), reaches task_complete", "status": "in_progress"},
-    {"id": "pr-land", "name": "Open PR from session/retrieval-fork-stepid -> main (currently contains BOTH partner's PR#3 and this session's work as one combined branch — user may want them split)", "status": "not_started"},
-    {"id": "p3-rest", "name": "Remaining roadmap P3: fuzzy intent decomposition beyond the container-retrieval case", "status": "not_started"},
-    {"id": "p4", "name": "Systematic exploration + scan->scan fix", "status": "not_started"},
-    {"id": "p5", "name": "Fork validation with E2E tests (now unblocked by the fork objectId-resolution fix)", "status": "not_started"},
-    {"id": "p6", "name": "7-task baseline (5 episodes each)", "status": "not_started"}
+    {"id": 7, "name": "Complete E2E verification — confirm fork creation + task_complete", "status": "in_progress"}
   ],
   "blockers": [
-    {"description": "Provider 9527code.com 524s on the real 143KB image-bearing Planner request; 300s socket timeout freezes each attempt ~5min. Verification (task 5) cannot complete until upstream stabilizes for heavy multimodal requests.", "type": "external", "workaround": "Wait; API 'recovers after a few minutes' per prior notes. OR lower vlm_client.py timeout 300s->60s so wedged attempts fail-fast and retry sooner. Gate any relaunch on a FULL-SIZE image probe, not a tiny one (tiny returns 200 while real 143KB 524s)."}
+    {"description": "Provider cdn.9527code.com intermittent timeouts on large image requests", "type": "external", "workaround": "30s timeout, 5 retries; wait for provider recovery"}
   ],
+  "async_jobs": [],
   "human_actions_pending": [
-    {"action": "Decide whether to open PR from session/retrieval-fork-stepid as one combined PR (partner PR#3 + this session) or split them", "context": "The merge put both on one branch; clean but couples the two authors' work", "blocking": false}
+    {"action": "Resume episode output_e2e_20260717_184436/trial_T20190908_215610_893109.json once API returns", "context": "Verify memory persistence fix + fork production", "blocking": false}
   ],
   "decisions": [
-    {"decision": "Item 3 redirect: fixed container-retrieval as Planner prompt (not replay_steps reconcile)", "rationale": "AI2-THOR probe proved replay was faithful; the reconcile fix targeted a non-existent bug. Real bug is retrieval-navigation, fixed prompt-only per user's Phase-3 precedent, merges roadmap P3.", "phase": "m1-p2"},
-    {"decision": "step_id separator = '__' (double underscore), not ':'", "rationale": "step_id IS the PNG filename; ':' is illegal on Windows. '__' is filesystem-safe.", "phase": "m1-p2"},
-    {"decision": "parent_id derived from _last_branch_step_id() not recomputed f-string", "rationale": "Robust across old-format resume seam (old episodes have bare s<idx> ids).", "phase": "m1-p2"},
-    {"decision": "Fork forks EB CF on AC, Oracle gold on PA/WA", "rationale": "Decouples 'did agent reason well' (grade/label) from 'do we have a proven recovery path' (fork outcome). Requires structured gold.", "phase": "m1-p2"},
-    {"decision": "Merged PR#3 into session branch rather than separate", "rationale": "No textual conflicts; both changesets verified to coexist; 72 tests pass. User may still want to split at PR-open time.", "phase": "m1-p2"},
-    {"decision": "Fixed _run_fork objectId resolution as part of the merge", "rationale": "PR#3 enables forks by default; the raw-objectType env.step would break every fork including the new structured-gold path. In-scope since my gold change routes actions there.", "phase": "m1-p2"}
+    {"decision": "30s VLM timeout (not 5s, not 300s)", "rationale": "5s too short for GPT-5.5 image reasoning (8-20s typical); 300s wastes 15min on dead API. 30s hits the balance."},
+    {"decision": "cdn.9527code.com over www.9527code.com", "rationale": "CDN may be more stable; same backend but different edge routing"},
+    {"decision": "Force counterfactual output in EB Phase 3", "rationale": "Null counterfactuals prevent fork creation. More aggressive prompt + retry ensures coverage."},
+    {"decision": "Allow MoveSequence in fork alternative_action", "rationale": "Initially banned due to lack of executor; added standalone expander to support it."},
+    {"decision": "Fork mid-run parallel via queue callback", "rationale": "Fork doesn't require main branch completion. Queue + callback enables immediate submission."},
+    {"decision": "Semantic memory rebuild via replay_steps memory.update()", "rationale": "Resume creates fresh empty memory; replay feeding restores held/placed/toggled state."}
   ],
-  "uncommitted_files": [],
-  "next_action": "Check if provider API recovered: probe the FULL image path (143KB-scale, not tiny). If HTTP 200, relaunch: cd ~/embodied-failure-dataset && export PATH=\"$HOME/.local/bin:$PATH\" && uv run python scripts/resume_episode.py output_e2e_20260717_184436/trial_T20190908_215610_893109.json --api-key sk-IxX... --no-traps --memory semantic . Watch for RESP model= (past the wedge point) and intents mentioning approach/open/pickup Microwave/Egg. Success = agent retrieves Hot Egg from Microwave and reaches task_complete.",
-  "context_notes": "This session: diagnosed the interrupted resume (image-over-text discipline caught my own wrong replay-fidelity theory — AI2-THOR ground truth showed Egg is Hot in closed Microwave, real bug is pose/interaction-visibility). Fixed via Planner prompt. Then made Oracle gold structured + step_id globally unique (+9 tests). Then merged partner PR#3 (scheduler rewrite), resolved semantic overlaps, fixed a latent fork objectId bug (+1 test). 72 tests green, branch pushed. ONLY the live E2E verification remains, blocked purely by provider API 524-ing on heavy image requests. A leftover wedged resume process (task bay2ahazq) may still be running in WSL — kill with pkill -9 -f resume_episode.py before relaunching. Cron watchers all deleted."
+  "uncommitted_files": [
+    "CLAUDE.md", "config.toml", "scripts/e2e_test.py", "scripts/e2e_test_output.py",
+    "scripts/resume_episode.py", "scripts/run_pipeline.py", "src/branch_runner.py",
+    "src/eb_agent.py", "src/episode_manager.py", "src/oracle_agent.py",
+    "src/scheduler.py", "src/vlm_client.py"
+  ],
+  "next_action": "Resume output_e2e_20260717_184436/trial_T20190908_215610_893109.json --api-key sk-IxX... --no-traps --memory semantic. Verify counterfactual→fork→task_complete chain.",
+  "context_notes": "Heavy bugfix session on partner's scheduler/fork code. Memory persistence fix is key new capability. Agent still stuck in exploration loop post-resume (Planner ignores memory's Egg location cue). May need Planner prompt tuning for exploration priority vs memory recall."
 }

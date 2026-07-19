@@ -229,7 +229,7 @@ def _run_fork_with_sem(sem, args, task_type, episode_id, fork_task, n, total):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--api-key", required=True, help="OpenAI API key")
-    parser.add_argument("--api-base-url", default="https://www.9527code.com/v1", help="OpenAI-compatible API base URL")
+    parser.add_argument("--api-base-url", default="https://cdn.9527code.com/v1", help="OpenAI-compatible API base URL")
     parser.add_argument("--planner-model", default="gpt-5.5")
     parser.add_argument("--oracle-model", default="gpt-5.5")
     parser.add_argument("--executor-model", default="gpt-5.5")

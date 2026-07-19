@@ -76,6 +76,24 @@ class EpisodeManager:
 
         self._mutate(set_outcome)
 
+    def update_final_outcome(self, branch_entry: dict, dedup_stats: dict = None,
+                              is_main: bool = False, fork_source_step_id: str = "",
+                              counterfactual_verified: bool = False):
+        """Atomically read-modify-write final_outcome to prevent races
+        when multiple forks update the same episode concurrently."""
+        def mutation(data):
+            outcome = data.get("final_outcome") or {"main_branch": None, "forks": []}
+            if is_main:
+                outcome["main_branch"] = branch_entry
+                if dedup_stats:
+                    outcome["dedup_stats"] = dedup_stats
+            else:
+                branch_entry["fork_source_step_id"] = fork_source_step_id
+                branch_entry["counterfactual_verified"] = counterfactual_verified
+                outcome["forks"].append(branch_entry)
+            data["final_outcome"] = outcome
+        self._mutate(mutation)
+
     def set_status(self, status: str, pid: int | None = None):
         if status not in {"pending", "running", "completed", "failed", "interrupted"}:
             raise ValueError(f"Invalid episode status: {status}")

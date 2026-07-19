@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--task", type=str, default="")
     parser.add_argument("--splits", default="train,valid_seen,valid_unseen")
     parser.add_argument("--api-key", default="", help="OpenAI API key")
-    parser.add_argument("--api-base-url", default="https://www.9527code.com/v1", help="OpenAI-compatible API base URL")
+    parser.add_argument("--api-base-url", default="https://cdn.9527code.com/v1", help="OpenAI-compatible API base URL")
     parser.add_argument("--planner-model", default="gpt-5.5")
     parser.add_argument("--oracle-model", default="gpt-5.5")
     parser.add_argument("--executor-model", default="gpt-5.5")
@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--oracle-reasoning-effort", default="medium",
                         choices=["low", "medium", "high", "xhigh", "max"])
     parser.add_argument("--no-fork", action="store_true", help="Disable counterfactual forks")
+    parser.add_argument("--no-traps", action="store_true", help="Disable initial trap injection and Phase 2")
     parser.add_argument("--memory", default="semantic", choices=["semantic", "geometric"],
                         help="Memory mode: semantic (receptacle-grouped) or geometric (flat list)")
     parser.add_argument("--parallel", type=int, default=1)
@@ -61,6 +62,7 @@ def main():
         enable_fork=not args.no_fork,
         max_parallel=args.parallel,
         memory_mode=args.memory,
+        no_traps=args.no_traps,
     )
 
     scheduler = Scheduler(config)

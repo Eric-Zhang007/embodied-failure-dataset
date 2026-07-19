@@ -5,6 +5,7 @@
 import os
 import glob
 import logging
+import queue
 import threading
 from dataclasses import dataclass
 from collections import deque
@@ -17,6 +18,7 @@ from src.executor import ExecutorAgent
 from src.branch_runner import (
     BranchRunner, BranchConfig, BranchResult,
     run_single_branch, replay_steps, _sid,
+    execute_move_sequence_steps,
 )
 from src.fork_manager import ForkManager
 from src.env_controller import EnvController
@@ -24,6 +26,7 @@ from src.episode_manager import EpisodeManager
 from src.alfred_parser import load_traj, extract_metadata, extract_low_actions
 from src.step_recorder import StepRecorder
 from src.action_adapter import resolve_object_ids, adapt
+from src.trap_planner import TrapPlanner
 
 
 @dataclass
@@ -35,7 +38,7 @@ class SchedulerConfig:
     task_filter: str = ""
     splits: str = "train,valid_seen,valid_unseen"
     api_key: str = ""
-    api_base_url: str = "https://www.9527code.com/v1"
+    api_base_url: str = "https://cdn.9527code.com/v1"
     planner_model: str = "gpt-5.5"
     executor_model: str = "gpt-5.5"
     oracle_model: str = "gpt-5.5"
@@ -44,6 +47,7 @@ class SchedulerConfig:
     oracle_reasoning_effort: str = "medium"
     enable_fork: bool = True
     memory_mode: str = "semantic"  # "semantic" | "geometric"
+    no_traps: bool = False
 
 
 class Scheduler:
@@ -57,13 +61,12 @@ class Scheduler:
             reasoning_effort=config.planner_reasoning_effort,
         )
         _t0 = _time.time()
-        warmup_client.chat_text(system_prompt="Say OK.", user_text="OK", max_tokens=5)
-        print(f"Oracle warmup: {_time.time() - _t0:.1f}s")
-        self.fork_manager = ForkManager(
-            None, None, None, config.output_dir,
-        )
+        try:
+            warmup_client.chat_text(system_prompt="Say OK.", user_text="OK", max_tokens=5)
+            print(f"API warmup: {_time.time() - _t0:.1f}s")
+        except Exception as e:
+            print(f"API warmup skipped (API error: {e})")
         self.queue: deque[dict] = deque()
-        self._lock = threading.Lock()
         self.recorder = StepRecorder()
 
     def _create_agents(self):
@@ -151,6 +154,9 @@ class Scheduler:
         self.stats = {"completed": 0, "skipped": 0, "failed": 0}
         self._lock = threading.Lock()
         self._semaphore = threading.Semaphore(max_workers)
+        _fork_queue = queue.Queue()
+        for task in self.queue:
+            task["_fork_queue"] = _fork_queue
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -187,6 +193,14 @@ class Scheduler:
                             futures[executor.submit(
                                 self._run_task_worker, entry, 0, total,
                             )] = entry
+
+                    # Drain fork_queue for forks submitted mid-run via callback
+                    while not _fork_queue.empty():
+                        entry = _fork_queue.get_nowait()
+                        total += 1
+                        futures[executor.submit(
+                            self._run_task_worker, entry, 0, total,
+                        )] = entry
                     self._report(total)
 
         print(f"\n\nDone. {self.stats['completed']} branches, {self.stats['failed']} failed, "
@@ -223,6 +237,13 @@ class Scheduler:
         if existing:
             existing.set_status("running", os.getpid())
 
+        _fork_queue = task.get("_fork_queue")
+        if _fork_queue is not None:
+            def _on_fork(fork_task):
+                _fork_queue.put(self._fork_entry(task, fork_task))
+        else:
+            _on_fork = None
+
         try:
             if existing and existing.get_steps_for_branch("main"):
                 result = BranchRunner.resume(
@@ -234,17 +255,21 @@ class Scheduler:
                     output_dir=self.config.output_dir,
                     enable_fork=self.config.enable_fork,
                     memory_mode=self.config.memory_mode,
+                    fork_callback=_on_fork,
                 )
             else:
+                trap_planner = None if self.config.no_traps else TrapPlanner()
                 result = run_single_branch(
                     traj_path=task["traj_path"],
                     eb_agent=eb_agent,
                     oracle_agent=oracle_agent,
                     output_dir=self.config.output_dir,
+                    trap_planner=trap_planner,
                     enable_fork=self.config.enable_fork,
                     executor_agent=executor_agent,
                     memory_mode=self.config.memory_mode,
                     episode_status="running",
+                    fork_callback=_on_fork,
                 )
 
             if os.path.exists(out_file):
@@ -259,10 +284,12 @@ class Scheduler:
             if os.path.exists(out_file):
                 EpisodeManager.load(out_file).set_status("interrupted")
             raise
-        except Exception:
+        except Exception as e:
+            logging.warning("Worker for %s crashed, marking interrupted: %s", ep_id, e)
             if os.path.exists(out_file):
-                EpisodeManager.load(out_file).set_status("failed")
-            raise
+                EpisodeManager.load(out_file).set_status("interrupted")
+            return BranchResult(branch_id="main", termination_reason="worker_crash",
+                                total_steps=0, fork_tasks=[], fork_source_step_ids=[])
 
     @staticmethod
     def _pid_is_alive(pid: int) -> bool:
@@ -307,26 +334,37 @@ class Scheduler:
             replay_steps(env, shared_steps, skip_failed=True)
 
             # 2. 执行 fork 替代动作
-            #    alt_params 来自 EB/Oracle 的结构化 counterfactual，带 objectType/
-            #    receptacleType。像主循环一样先 resolve_object_ids -> adapt 成
-            #    objectId，否则 AI2-THOR 找不到目标（container-interior 对象尤甚）。
             alt_action = fc.get("alternative_action", {})
             alt_name = alt_action.get("action")
             alt_params = alt_action.get("params", {}) or {}
             if not alt_name:
                 raise ValueError(f"Fork alternative_action lacks action: {alt_action}")
 
-            fork_objects = env.get_state_snapshot()["metadata"].get("objects", [])
-            resolved_params, resolve_warning = resolve_object_ids(
-                alt_name, alt_params, fork_objects
-            )
-            exec_name, exec_params = adapt(alt_name, resolved_params)
-            if resolve_warning:
-                logging.warning(
-                    "fork %s: alt-action %s objectId resolution failed: %s",
-                    config.branch_id, alt_name, resolve_warning,
+            if alt_name == "MoveSequence":
+                steps = alt_params.get("steps", [])
+                success, frame, metadata, error = execute_move_sequence_steps(
+                    env, steps, env.get_state_snapshot()["metadata"],
                 )
-            alt_result = env.step(exec_name, **exec_params)
+                alt_result = {
+                    "success": success,
+                    "error": error,
+                    "frame": frame,
+                    "metadata": metadata or env.get_state_snapshot()["metadata"],
+                }
+                exec_name = alt_name
+                exec_params = alt_params
+            else:
+                fork_objects = env.get_state_snapshot()["metadata"].get("objects", [])
+                resolved_params, resolve_warning = resolve_object_ids(
+                    alt_name, alt_params, fork_objects
+                )
+                exec_name, exec_params = adapt(alt_name, resolved_params)
+                if resolve_warning:
+                    logging.warning(
+                        "fork %s: alt-action %s objectId resolution failed: %s",
+                        config.branch_id, alt_name, resolve_warning,
+                    )
+                alt_result = env.step(exec_name, **exec_params)
 
             if not alt_result.get("success"):
                 image_dir = os.path.join(self.config.output_dir, ep_id)
@@ -356,11 +394,16 @@ class Scheduler:
 
             # 3. 重写推理 + 记录 fork root step
             eb_agent, oracle_agent, executor_agent = agents
+            replaces_id = fc.get("replaces_step_id", "")
+            replaced_step = next(
+                (s for s in ep.data["steps"] if s.get("step_id") == replaces_id),
+                {},
+            )
             fm = ForkManager(eb_agent, oracle_agent, None, self.config.output_dir)
             rewritten = fm._rewrite_reasoning(
                 shared_steps=shared_steps,
-                original_action="?",
-                original_reasoning="",
+                original_action=replaced_step.get("action", "?"),
+                original_reasoning=replaced_step.get("eb_reasoning", ""),
                 alternative_action=alt_action,
                 counterfactual_text=fc.get("counterfactual_text", ""),
             )
@@ -387,41 +430,41 @@ class Scheduler:
             ep.add_step(fork_root)
 
             # 4. 委托 BranchRunner 从 step_index=1 继续
+            _fork_queue = task.get("_fork_queue")
+            if _fork_queue is not None:
+                def _on_fork(fork_task):
+                    _fork_queue.put(self._fork_entry(task, fork_task))
+            else:
+                _on_fork = None
             branch_runner = BranchRunner(
                 eb_agent, oracle_agent, self.config.output_dir,
                 enable_fork=self.config.enable_fork,
                 executor_agent=executor_agent,
+                _fork_callback=_on_fork,
             )
             result = branch_runner.run(
                 config=config, env=env, ep=ep,
                 start_step_index=1,
             )
-            final_status = (
-                "failed" if result.termination_reason.startswith("worker_crash")
-                else "completed"
-            )
-            EpisodeManager.load(out_file).set_status(final_status)
             print(f"[fork] Finished {config.branch_id}: {result.termination_reason} ({result.total_steps} steps)")
             return result
         except KeyboardInterrupt:
-            if os.path.exists(out_file):
-                EpisodeManager.load(out_file).set_status("interrupted")
             raise
         except Exception:
-            if os.path.exists(out_file):
-                EpisodeManager.load(out_file).set_status("failed")
             raise
         finally:
             env.close()
 
     def _fork_entry(self, parent_task: dict, fork_task: dict) -> dict:
-        return {
+        entry = {
             "traj_path": parent_task.get("traj_path", ""),
             "episode_id": parent_task["episode_id"],
             "meta": parent_task["meta"],
             "base_step_count": parent_task["base_step_count"],
             "branch_config": BranchConfig(**fork_task),
+            "_fork_queue": parent_task.get("_fork_queue"),
         }
+        return entry
 
     def _report(self, total: int):
         done = self.stats["completed"] + self.stats["failed"] + self.stats["skipped"]

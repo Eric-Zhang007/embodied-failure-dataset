@@ -373,10 +373,11 @@ class VLMClient:
                      self.model, "json" if json_mode else "text", body_size, msg_summary)
 
         last_conn_error = None
-        timeout = 300
+        timeout = 30
         tried_without_reasoning = False
         transport_attempt = 0
-        while transport_attempt < 3:  # 最多 3 次传输尝试
+        max_transport = 5
+        while transport_attempt < max_transport:
             transport_attempt += 1
             try:
                 resp = requests.post(
@@ -443,9 +444,9 @@ class VLMClient:
                     self._dump_failure(body, "200_MALFORMED_EXHAUSTED",
                                        f"{extract_error} (after {MAX_RESPONSE_RETRIES} validation attempts): {resp.text[:500]}",
                                        elapsed)
-                    if transport_attempt < 3:
-                        logger.warning("MALFORMED_200_EXHAUSTED model=%s retrying transport attempt=%d/3",
-                                       self.model, transport_attempt + 1)
+                    if transport_attempt < max_transport:
+                        logger.warning("MALFORMED_200_EXHAUSTED model=%s retrying transport attempt=%d/%d",
+                                       self.model, transport_attempt + 1, max_transport)
                         time.sleep(2 ** (transport_attempt - 1))
                         continue
                     raise ValueError(
@@ -456,16 +457,16 @@ class VLMClient:
                 if resp.status_code == 429:
                     self._write_api_exchange(body, 429, resp.text, elapsed, transport_attempt)
                     wait = 5 * transport_attempt
-                    logger.warning("RATE_LIMIT retry %d/3 wait %ds", transport_attempt, wait)
+                    logger.warning("RATE_LIMIT retry %d/%d wait %ds", transport_attempt, max_transport, wait)
                     time.sleep(wait)
                     continue
                 # 5xx: server errors (502/503/504/524) — transient, retry with backoff
                 if resp.status_code >= 500:
                     self._write_api_exchange(body, resp.status_code, resp.text, elapsed, transport_attempt)
-                    if transport_attempt < 3:
-                        wait = 2 ** (transport_attempt - 1)  # 1s, 2s
-                        logger.warning("SERVER_ERR retry %d/3 status=%d wait=%ds",
-                                       transport_attempt, resp.status_code, wait)
+                    if transport_attempt < max_transport:
+                        wait = min(transport_attempt * 0.5, 3.0)  # 0.5s, 1s, 1.5s, 2s, 2.5s
+                        logger.warning("SERVER_ERR retry %d/%d status=%d wait=%.1fs",
+                                       transport_attempt, max_transport, resp.status_code, wait)
                         time.sleep(wait)
                         continue
                     # All retries exhausted — dump and raise
@@ -473,10 +474,10 @@ class VLMClient:
                     resp.raise_for_status()
                 # Other errors (4xx client errors / relay glitches): retry, then dump and raise
                 self._write_api_exchange(body, resp.status_code, resp.text, elapsed, transport_attempt)
-                if transport_attempt < 3:
-                    wait = 2 ** transport_attempt  # 1s, 2s, 4s
-                    logger.warning("CLIENT_ERR retry %d/3 status=%d wait=%ds",
-                                   transport_attempt, resp.status_code, wait)
+                if transport_attempt < max_transport:
+                    wait = min(2 ** transport_attempt, 8)  # 1s, 2s, 4s, 8s, 8s
+                    logger.warning("CLIENT_ERR retry %d/%d status=%d wait=%ds",
+                                   transport_attempt, max_transport, resp.status_code, wait)
                     time.sleep(wait)
                     continue
                 self._dump_failure(body, resp.status_code, resp.text, elapsed)
@@ -486,17 +487,16 @@ class VLMClient:
                 last_conn_error = e
                 elapsed = time.time() - t_start
                 self._write_api_exchange(body, "CONNECTION_ERROR", str(e), elapsed, transport_attempt)
-                logger.warning("CONN_ERR model=%s attempt=%d/3 error=%s", self.model, transport_attempt, e)
-                if transport_attempt < 3:
-                    time.sleep(2 ** (transport_attempt - 1))
+                logger.warning("CONN_ERR model=%s attempt=%d/%d error=%s", self.model, transport_attempt, max_transport, e)
+                if transport_attempt < max_transport:
+                    time.sleep(min(transport_attempt * 0.5, 3.0))
 
             except requests.exceptions.Timeout:
                 elapsed = time.time() - t_start
                 self._write_api_exchange(body, "TIMEOUT", f"timeout={timeout}s", elapsed, transport_attempt)
-                logger.warning("TIMEOUT model=%s attempt=%d/3 timeout=%ds elapsed=%.1fs",
-                              self.model, transport_attempt, timeout, elapsed)
-                if transport_attempt < 3:
-                    timeout += 100  # 300 → 400 → 500
+                logger.warning("TIMEOUT model=%s attempt=%d/%d timeout=%ds elapsed=%.1fs",
+                              self.model, transport_attempt, max_transport, timeout, elapsed)
+                if transport_attempt < max_transport:
                     continue
                 self._dump_failure(body, "TIMEOUT_EXHAUSTED",
                                    f"All retries exhausted, last timeout={timeout}s", elapsed)
@@ -505,7 +505,7 @@ class VLMClient:
         # ConnectionError 重试全部失败
         elapsed = time.time() - t_start
         self._dump_failure(body, "CONNECTION_EXHAUSTED", str(last_conn_error), elapsed)
-        raise RuntimeError(f"API unreachable after 3 attempts: {last_conn_error}")
+        raise RuntimeError(f"API unreachable after {max_transport} attempts: {last_conn_error}")
 
     def _dump_failure(self, body: dict, status, response_text: str, elapsed: float):
         """失败时把完整请求体写到日志文件。"""

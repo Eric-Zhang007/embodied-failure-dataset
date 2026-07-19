@@ -14,7 +14,7 @@ def main():
     parser.add_argument("episode_json", help="Path to episode JSON file")
     parser.add_argument("--branch-id", default="main", help="Branch to resume")
     parser.add_argument("--api-key", required=True)
-    parser.add_argument("--api-base-url", default="https://www.9527code.com/v1")
+    parser.add_argument("--api-base-url", default="https://cdn.9527code.com/v1")
     parser.add_argument("--planner-model", default="gpt-5.5")
     parser.add_argument("--executor-model", default="gpt-5.5")
     parser.add_argument("--oracle-model", default="gpt-5.5")

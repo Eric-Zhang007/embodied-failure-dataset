@@ -180,7 +180,13 @@ DEAD LOOP DETECTION: If the agent has repeated the SAME failed action 5+ times i
 
 COUNTERFACTUAL_GOLD FORMAT — this is the CORRECTED counterfactual that a fork will actually execute, so it must be concrete and replayable:
 - target_step: the integer step index (step_index_in_branch) where the agent should have acted differently.
-- alternative_action: {"action": "<exact AI2-THOR action>", "params": {...}} — the action that should have been taken at target_step. Use objectType for interactions (e.g. {"action": "PickupObject", "params": {"objectType": "Egg"}}).
+- alternative_action: {"action": "<action>", "params": {...}} — the SINGLE action that should have been taken at target_step.
+  Use objectType for interactions (e.g. {"action": "PickupObject", "params": {"objectType": "Egg"}}).
+  ALLOWED actions: MoveAhead, MoveBack, MoveLeft, MoveRight, RotateLeft, RotateRight, LookUp, LookDown,
+  PickupObject, PutObject, OpenObject, CloseObject, ToggleObjectOn, ToggleObjectOff,
+  SliceObject, BreakObject, FillObjectWithLiquid, EmptyLiquidFromObject, DropHandObject,
+  MoveSequence (use params: {"steps": [{"action": "...", "repeat": N}, ...]} for multi-step moves).
+  FORBIDDEN: Done, LookAround — these are meta-actions that cannot be executed as a fork step.
 - reasoning: 1 sentence on why this alternative would have prevented the failure.
 Set counterfactual_gold to null ONLY when the grade is AC (the agent's own counterfactual was already correct) or when no earlier decision could have prevented the failure.
 

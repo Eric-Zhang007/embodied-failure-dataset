@@ -14,7 +14,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 - **Python**: 3.10（通过 uv 管理）
 - **仿真**: AI2-THOR 5.0.0，WSLg 优先（`:0`），fallback Xvfb 无头渲染
-- **API**: OpenAI 兼容接口 (www.9527code.com/v1)
+- **API**: OpenAI 兼容接口 (cdn.9527code.com/v1)
 - **API Key**: sk-IxXjSiRZ3IhCd4hxMajweiXamF0R1U1cHmNECBrRbIz8v0hy
 - **Planner (EB) 模型**: gpt-5.5 (reasoning_effort=medium)
 - **Executor 模型**: gpt-5.5 (reasoning_effort=medium)

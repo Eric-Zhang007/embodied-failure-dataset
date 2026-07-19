@@ -2,7 +2,7 @@
 # GPT-5.5 via OpenAI-compatible endpoint
 
 [api]
-base_url = "https://www.9527code.com/v1"
+base_url = "https://cdn.9527code.com/v1"
 api_key = "sk-1Umt0PPJiwyy5kFe19mFhkzCfuMcEIpOIgqx5J2thwjAHz6c"
 
 [models]

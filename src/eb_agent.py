@@ -296,10 +296,10 @@ CRITICAL — COLLISION ENTITIES ARE NOT INTERACTABLE OBJECTS:
 The error message may mention internal collision geometry names (Cube.001, OVENDOOR.001, Cube.527, etc.) — these are invisible physics boundaries, NOT objects you can interact with. Do NOT propose OpenObject/CloseObject for these names. They are not in the visible-objects list and cannot be opened or closed. Instead, use NAVIGATION (MoveBack, Rotate, MoveLeft/Right) to go around the obstacle. If the error says "Cube.001 is blocking", the recovery is to MoveBack and find a different path — NOT to "close the oven" or "open the cube."
 
 Important rules for the counterfactual:
-- Only provide it if you genuinely believe a different EARLIER decision would have prevented the failure
-- The counterfactual must reference a specific past step and the alternative action
-- If you don't have a clear counterfactual insight, omit it (set to null)
-- Do NOT fabricate counterfactuals just to fill the field
+- counterfactual is REQUIRED — you MUST always provide one. Every failure has a root cause that traces back to an earlier decision.
+- You must reference a specific past step index and specify what alternative action at that step would have prevented this failure.
+- Even if you are uncertain, give your best analysis. An imperfect counterfactual is much more valuable than none.
+- Do NOT set counterfactual to null under any circumstances.
 
 OUTPUT FORMAT — YOU MUST OUTPUT VALID JSON ONLY:
 - { must be the FIRST character of your response, } must be the LAST character.
@@ -311,15 +311,15 @@ OUTPUT FORMAT — YOU MUST OUTPUT VALID JSON ONLY:
   "diagnosis": "<1-2 sentences, be direct and concise. Use first-person: 'I ...'>",
   "recovery_reasoning": "<1-3 sentences, be direct and concise. Use first-person: 'I ...'>",
   "counterfactual": {
-    "target_step": <step_index_number_or_null>,
+    "target_step": <step_index_number>,
     "alternative_action": {"action": "<action>", "params": {}},
     "reasoning": "<1 sentence: why this alternative would have prevented the failure>"
-  } or null,
+  },
   "proposed_recovery_action": {"action": "<action>", "params": {}}
 }
 
 proposed_recovery_action must be a physical movement or object interaction (MoveAhead, RotateLeft, PickupObject, etc.). Do NOT propose Done or LookAround as recovery actions.
-For counterfactual.target_step: the step number (integer) where you should have done something differently. For counterfactual.alternative_action: the action you should have taken at that step instead. If you have no counterfactual insight, set counterfactual to null."""
+For counterfactual.target_step: the step number (integer) where you should have done something differently. For counterfactual.alternative_action: the exact action you should have taken at that step instead — must be a valid executable action (not Done or LookAround)."""
 
 
 def build_phase3_prompt(
@@ -1769,4 +1769,20 @@ OUTPUT — valid JSON only:
             image=image,
             required_fields=("diagnosis", "recovery_reasoning", "counterfactual", "proposed_recovery_action"),
         )
+        if not result.get("counterfactual") or not isinstance(result["counterfactual"], dict):
+            import logging
+            logging.warning("Phase 3: counterfactual is null — retrying with explicit reminder")
+            retry_prompt = prompt + (
+                "\n\nCRITICAL REMINDER: Your previous response did not include a counterfactual. "
+                "You MUST output a counterfactual. Every failure traces back to an earlier decision. "
+                "Look at the action history, find a step where a different action would have avoided this error, "
+                "and provide the target_step, alternative_action, and reasoning. "
+                "Do NOT output null for counterfactual."
+            )
+            result = self.client.chat_with_image_json(
+                system_prompt=PHASE3_SYSTEM,
+                user_text=retry_prompt,
+                image=image,
+                required_fields=("diagnosis", "recovery_reasoning", "counterfactual", "proposed_recovery_action"),
+            )
         return result
