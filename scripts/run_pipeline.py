@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--oracle-reasoning-effort", default="medium",
                         choices=["low", "medium", "high", "xhigh", "max"])
     parser.add_argument("--no-fork", action="store_true", help="Disable counterfactual forks")
+    parser.add_argument("--agentic-oracle", action="store_true")
     parser.add_argument("--memory", default="semantic", choices=["semantic", "geometric"],
                         help="Memory mode: semantic (receptacle-grouped) or geometric (flat list)")
     parser.add_argument("--parallel", type=int, default=1)
@@ -59,6 +60,7 @@ def main():
         executor_reasoning_effort=args.executor_reasoning_effort,
         oracle_reasoning_effort=args.oracle_reasoning_effort,
         enable_fork=not args.no_fork,
+        agentic_oracle=args.agentic_oracle,
         max_parallel=args.parallel,
         memory_mode=args.memory,
     )

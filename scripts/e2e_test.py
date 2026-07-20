@@ -53,6 +53,7 @@ def run_one(args, task_type, traj_path, n, total):
         output_dir=args.output,
         trap_planner=trap_planner,
         enable_fork=args.enable_fork,
+        agentic_oracle=args.agentic_oracle,
         step_limit_multiplier=2,
         executor_agent=executor_agent,
         enable_searched_markers="001" not in ablation_set,
@@ -191,6 +192,7 @@ def _run_fork_e2e(args, parent_task_type, episode_id, fork_task: dict, n: int, t
             eb_agent, oracle_agent, args.output,
             enable_fork=args.enable_fork,
             executor_agent=executor_agent,
+            agentic_oracle=args.agentic_oracle,
         )
         result = branch_runner.run(
             config=config, env=env, ep=ep,
@@ -252,6 +254,7 @@ def main():
     parser.add_argument("--memory", default="semantic", choices=["semantic", "geometric"],
                         help="Memory mode: semantic (receptacle-grouped, freshness-aware) or geometric (flat list)")
     parser.add_argument("--enable-fork", action="store_true", help="Enable Oracle fork tasks on AC counterfactuals")
+    parser.add_argument("--agentic-oracle", action="store_true")
     args = parser.parse_args()
 
     if not args.output:

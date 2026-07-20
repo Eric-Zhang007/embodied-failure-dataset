@@ -8,6 +8,7 @@
 
 import json
 import logging
+from pathlib import Path
 import numpy as np
 
 from src.vlm_client import VLMClient
@@ -295,4 +296,109 @@ class OracleAgent:
                 "fork_reasoning",
             ),
         )
+        return result
+
+
+_AGENTIC_FAILURE_LIBRARY = json.loads(
+    (Path(__file__).resolve().parent.parent / "data" / "failure_type_library.json").read_text(encoding="utf-8")
+)
+_AGENTIC_FAILURE_LIBRARY_TEXT = json.dumps(_AGENTIC_FAILURE_LIBRARY, ensure_ascii=False, indent=2)
+
+_AGENTIC_TOOLS = """Available intervention tools:
+- set_object_property: {"object_type": "<type>", "property": "<prop>", "value": true/false}
+- close_container: {"object_type": "<type>"}
+- occlude_object: {"object_type": "<type>"}
+- hide_object: {"object_type": "<type>"}
+- swap_object: {"target_type": "<type>", "new_type": "<type>"}
+- remove_object: {"object_type": "<type>"}"""
+
+_AGENTIC_REVIEW_SYSTEM = f"""You are an autonomous Oracle supervising an embodied household agent.
+After sustained successful progress, decide whether a useful, recoverable intervention would create an informative failure, or whether to keep observing. Never make the task permanently impossible and do not target an object when doing so would make the stated goal unachievable.
+
+{_AGENTIC_TOOLS}
+
+The following failure library is inspiration, not a restriction:
+{_AGENTIC_FAILURE_LIBRARY_TEXT}
+
+Return valid JSON only:
+{{"action": "intervene" or "observe", "intervention": {{"tool": "<tool>", "params": {{...}}}} or null, "reasoning": "<brief reason>"}}"""
+
+_AGENTIC_FAILURE_SYSTEM = f"""You are an autonomous Oracle supervising an embodied household agent after an environment action failed.
+Choose fork to test a concrete alternative at an earlier existing history step, terminate only when continued execution is not useful or the task is unrecoverable, or observe to let the agent continue planning without Oracle diagnosis or recovery.
+
+A fork_plan must use this exact replayable shape:
+{{"target_step": <existing step_index_in_branch>, "alternative_action": {{"action": "<AI2-THOR action>", "params": {{...}}}}, "reasoning": "<brief reason>"}}
+
+The following failure library is inspiration, not a restriction:
+{_AGENTIC_FAILURE_LIBRARY_TEXT}
+
+Return valid JSON only:
+{{"action": "fork" or "terminate" or "observe", "fork_plan": <structured fork plan> or null, "reasoning": "<brief reason>"}}"""
+
+
+class AgenticOracle:
+    def __init__(self, client: VLMClient):
+        self.client = client
+        self._success_count = 0
+
+    def periodic_review(
+        self,
+        image: np.ndarray,
+        task_goal: str,
+        visible_objects: list[dict],
+        action_history: list[dict],
+        memory_text: str,
+    ) -> dict:
+        self._success_count += 1
+        if self._success_count % 3:
+            return {
+                "action": "observe",
+                "intervention": None,
+                "reasoning": "Periodic review is due after three successful steps.",
+            }
+
+        prompt = "\n".join([
+            f"Task goal: {task_goal}",
+            f"Visible objects: {json.dumps(visible_objects, ensure_ascii=False)}",
+            memory_text,
+            build_oracle_history_context(action_history),
+            "Review current progress and decide whether to intervene.",
+        ])
+        result = self.client.chat_with_image_json(
+            system_prompt=_AGENTIC_REVIEW_SYSTEM,
+            user_text=prompt,
+            image=image,
+            required_fields=("action", "intervention", "reasoning"),
+        )
+        if result.get("action") not in ("intervene", "observe"):
+            result["action"] = "observe"
+        if result["action"] != "intervene":
+            result["intervention"] = None
+        return result
+
+    def analyze_failure(
+        self,
+        image: np.ndarray,
+        task_goal: str,
+        error_message: str,
+        action_history: list[dict],
+        memory_text: str,
+    ) -> dict:
+        prompt = "\n".join([
+            f"Task goal: {task_goal}",
+            f"Environment error: {error_message}",
+            memory_text,
+            build_oracle_history_context(action_history),
+            "Choose whether to fork, terminate, or observe.",
+        ])
+        result = self.client.chat_with_image_json(
+            system_prompt=_AGENTIC_FAILURE_SYSTEM,
+            user_text=prompt,
+            image=image,
+            required_fields=("action", "fork_plan", "reasoning"),
+        )
+        if result.get("action") not in ("fork", "terminate", "observe"):
+            result["action"] = "observe"
+        if result["action"] != "fork":
+            result["fork_plan"] = None
         return result
