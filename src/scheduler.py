@@ -43,6 +43,7 @@ class SchedulerConfig:
     executor_reasoning_effort: str = "medium"
     oracle_reasoning_effort: str = "medium"
     enable_fork: bool = True
+    agentic_oracle: bool = False
     memory_mode: str = "semantic"  # "semantic" | "geometric"
 
 
@@ -233,6 +234,7 @@ class Scheduler:
                     executor_agent=executor_agent,
                     output_dir=self.config.output_dir,
                     enable_fork=self.config.enable_fork,
+                    agentic_oracle=self.config.agentic_oracle,
                     memory_mode=self.config.memory_mode,
                 )
             else:
@@ -391,6 +393,7 @@ class Scheduler:
                 eb_agent, oracle_agent, self.config.output_dir,
                 enable_fork=self.config.enable_fork,
                 executor_agent=executor_agent,
+                agentic_oracle=self.config.agentic_oracle,
             )
             result = branch_runner.run(
                 config=config, env=env, ep=ep,

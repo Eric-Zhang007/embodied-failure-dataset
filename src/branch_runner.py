@@ -11,7 +11,7 @@ from typing import Optional
 
 from src.vlm_client import VLMClient
 from src.eb_agent import EBAgent
-from src.oracle_agent import OracleAgent
+from src.oracle_agent import AgenticOracle, OracleAgent
 from src.env_controller import EnvController
 from src.env_injector import inject
 from src.step_recorder import StepRecorder
@@ -113,9 +113,11 @@ class BranchRunner:
         enable_progress_gating: bool = True,
         enable_search_trail: bool = True,
         memory_mode: str = "semantic",  # "semantic" | "geometric"
+        agentic_oracle: bool = False,
     ):
         self.eb_agent = eb_agent
         self.oracle_agent = oracle_agent
+        self.agentic = AgenticOracle(oracle_agent.client) if agentic_oracle else None
         self.executor_agent = executor_agent
         self.output_dir = output_dir
         self.enable_phase2 = enable_phase2
@@ -141,6 +143,39 @@ class BranchRunner:
         self.enable_contrastive_planner: bool = enable_contrastive_planner  # 004 — dual-intent selection
         self.enable_progress_gating: bool = enable_progress_gating        # 005 — phase-aware guardrail injection
         self.enable_search_trail: bool = enable_search_trail              # 006 — trail-based revisit scoring
+
+    def _agentic_review(self, ep, config, step_index, step_entry, env, image, metadata, history, memory_text):
+        if not self.agentic:
+            return
+        review = self.agentic.periodic_review(
+            image=image,
+            task_goal=ep.data["task_goal"],
+            visible_objects=metadata.get("objects", []),
+            action_history=history + [step_entry],
+            memory_text=memory_text,
+        )
+        step_entry["agentic_oracle_review"] = review
+        intervention = review.get("intervention")
+        if review.get("action") != "intervene" or not isinstance(intervention, dict):
+            return
+        tool = intervention.get("tool")
+        params = intervention.get("params", {})
+        if not tool or not isinstance(params, dict):
+            return
+        result = inject(env.controller, method=tool, **params)
+        step_entry["agentic_intervention_result"] = result
+        if result.get("success"):
+            ep.add_runtime_trap({
+                "trap_id": f"agentic_trap_{config.branch_id}_{step_index}",
+                "branch_id": config.branch_id,
+                "created_at_step_id": _sid(config.branch_id, step_index),
+                "created_by": "agentic_oracle",
+                "injection": {"method": tool, "params": params},
+                "modification_success": True,
+                "triggered_at_step_id": None,
+                "env_error": None,
+                "status": "active",
+            })
 
     # ------------------------------------------------------------------
     # Trail helper (Spike 006: search-trail-cost)
@@ -925,7 +960,7 @@ class BranchRunner:
             remaining = phase2_max_injections - phase2_injection_count
             injection_decision = None
             injection_attempt_errors: list[dict] = []
-            if self.enable_phase2 and cascade_level <= 1 and remaining > 0:
+            if not self.agentic and self.enable_phase2 and cascade_level <= 1 and remaining > 0:
                 for injection_attempt in range(3):
                     oracle_phase2 = self.oracle_agent.decide_injection(
                         task_goal=ep.data["task_goal"],
@@ -988,7 +1023,7 @@ class BranchRunner:
                         "Oracle injection setup failed 3 times for the same EB action. "
                         "See failures log for attempted injections."
                     )
-            elif self.enable_phase2 and remaining <= 0:
+            elif not self.agentic and self.enable_phase2 and remaining <= 0:
                 injection_decision = {
                     "decided_to_inject": False,
                     "reasoning": "LIMIT REACHED: all 3 successful injections have been used.",
@@ -1160,16 +1195,20 @@ class BranchRunner:
                         ep.episode_id, config.branch_id, step_index, parent_id,
                         "MoveSequence", proposed_params, seq_result, eb_reasoning, injection_decision,
                     )
-                    self._write_success_step_direct(ep, step_entry)
-                    eb_history.append(step_entry)
-                    current_intent["steps"].append(step_entry)
-                    step_index += 1
-                    nonexecuted_retry_count = 0
                     memory.update(seq_result["metadata"], seq_result["metadata"].get("objects", []),
                                   "MoveSequence", True, None, task_criteria,
                                   f"{intent} {intent_target}".strip())
                     self._record_trail(trail, seq_result["metadata"])
                     self._track_searched_receptacles(proposed_params)
+                    self._agentic_review(
+                        ep, config, step_index, step_entry, env, seq_result["frame"],
+                        seq_result["metadata"], eb_history, memory.render(),
+                    )
+                    self._write_success_step_direct(ep, step_entry)
+                    eb_history.append(step_entry)
+                    current_intent["steps"].append(step_entry)
+                    step_index += 1
+                    nonexecuted_retry_count = 0
                     # Restore image/metadata from final state
                     image = seq_result["frame"]
                     metadata = seq_result["metadata"]
@@ -1197,6 +1236,37 @@ class BranchRunner:
                     obj_id = seq_result.get("failed_params", {}).get("objectId")
                     if obj_id:
                         failed_object_ids.add(obj_id)
+                    if self.agentic:
+                        agentic_decision = self.agentic.analyze_failure(
+                            image=image,
+                            task_goal=ep.data["task_goal"],
+                            error_message=seq_msg,
+                            action_history=diagnosis_history,
+                            memory_text=memory.render(),
+                        )
+                        pending_step["agentic_oracle_failure"] = agentic_decision
+                        self._write_success_step_direct(ep, pending_step)
+                        eb_history.append(pending_step)
+                        current_intent["steps"].append(pending_step)
+                        hard_unrec = check_unrecoverable(metadata, ep.data)
+                        if hard_unrec or detect_dead_loop(eb_history):
+                            reason = f"unrecoverable_hard:{hard_unrec}" if hard_unrec else "dead_loop"
+                            result_br = BranchResult(config.branch_id, reason, step_index, fork_tasks, fork_source_ids)
+                            self._finalize(ep, config, result_br, fork_source_ids)
+                            return result_br
+                        if agentic_decision.get("action") == "terminate":
+                            result_br = BranchResult(config.branch_id, "agentic_terminate", step_index, fork_tasks, fork_source_ids)
+                            self._finalize(ep, config, result_br, fork_source_ids)
+                            return result_br
+                        if agentic_decision.get("action") == "fork" and self.enable_fork:
+                            fork_task = self._build_fork_task(
+                                config, step_index - 1, agentic_decision.get("fork_plan"),
+                                {}, eb_history, ep,
+                            )
+                            if fork_task:
+                                fork_tasks.append(fork_task)
+                                fork_source_ids.append(_sid(config.branch_id, step_index - 1))
+                        continue
                     # Phase 3: Planner diagnoses
                     eb_phase3 = self.eb_agent.diagnose_failure(
                         task_goal=ep.data["task_goal"],
@@ -1392,12 +1462,17 @@ class BranchRunner:
                     ep.episode_id, config.branch_id, step_index, parent_id,
                     act, params, result, eb_reasoning, injection_decision,
                 )
-                self._write_success_step_direct(ep, step_entry)
-                eb_history.append(step_entry)
-                step_index += 1
-                nonexecuted_retry_count = 0
                 memory.update(result["metadata"], result["metadata"].get("objects", []), act, True, None, task_criteria, f"{intent} {intent_target}".strip())
                 self._record_trail(trail, result["metadata"])
+                self._agentic_review(
+                    ep, config, step_index, step_entry, env, result["frame"],
+                    result["metadata"], eb_history, memory.render(),
+                )
+                self._write_success_step_direct(ep, step_entry)
+                eb_history.append(step_entry)
+                current_intent["steps"].append(step_entry)
+                step_index += 1
+                nonexecuted_retry_count = 0
                 if act == "OpenObject" and params.get("objectId"):
                     for obj in result["metadata"].get("objects", []):
                         if obj.get("objectId") == params["objectId"]:
@@ -1425,6 +1500,38 @@ class BranchRunner:
             )
             pending_step["error_type"] = "environment_failure"
             diagnosis_history = eb_history + [pending_step]
+
+            if self.agentic:
+                agentic_decision = self.agentic.analyze_failure(
+                    image=result["frame"],
+                    task_goal=ep.data["task_goal"],
+                    error_message=result["error"] or "Unknown error",
+                    action_history=diagnosis_history,
+                    memory_text=memory.render(),
+                )
+                pending_step["agentic_oracle_failure"] = agentic_decision
+                self._write_success_step_direct(ep, pending_step)
+                eb_history.append(pending_step)
+                current_intent["steps"].append(pending_step)
+                hard_unrec = check_unrecoverable(metadata, ep.data)
+                if hard_unrec or detect_dead_loop(eb_history):
+                    reason = f"unrecoverable_hard:{hard_unrec}" if hard_unrec else "dead_loop"
+                    result_br = BranchResult(config.branch_id, reason, step_index, fork_tasks, fork_source_ids)
+                    self._finalize(ep, config, result_br, fork_source_ids)
+                    return result_br
+                if agentic_decision.get("action") == "terminate":
+                    result_br = BranchResult(config.branch_id, "agentic_terminate", step_index, fork_tasks, fork_source_ids)
+                    self._finalize(ep, config, result_br, fork_source_ids)
+                    return result_br
+                if agentic_decision.get("action") == "fork" and self.enable_fork:
+                    fork_task = self._build_fork_task(
+                        config, step_index - 1, agentic_decision.get("fork_plan"),
+                        {}, eb_history, ep,
+                    )
+                    if fork_task:
+                        fork_tasks.append(fork_task)
+                        fork_source_ids.append(_sid(config.branch_id, step_index - 1))
+                continue
 
             eb_phase3 = self.eb_agent.diagnose_failure(
                 task_goal=ep.data["task_goal"],
@@ -1471,6 +1578,7 @@ class BranchRunner:
             step_entry["oracle_recovery_verdict"] = oracle_phase4.get("recovery_verdict")
             self._write_success_step_direct(ep, step_entry)
             eb_history.append(step_entry)
+            current_intent["steps"].append(step_entry)
 
             # ── StuckTracker escalation counter ──
             stuck_summary = memory._stuck_tracker.render_summary(step_index) if hasattr(memory, '_stuck_tracker') else ""
@@ -1557,6 +1665,7 @@ class BranchRunner:
         enable_fork: bool = False,
         enable_phase2: bool = True,
         memory_mode: str = "semantic",
+        agentic_oracle: bool = False,
     ) -> BranchResult:
         ep = EpisodeManager.load(episode_path)
         branch_steps = ep.get_steps_for_branch(branch_id)
@@ -1626,7 +1735,8 @@ class BranchRunner:
                      step_limit_multiplier=step_limit_multiplier,
                      enable_fork=enable_fork,
                      enable_phase2=enable_phase2,
-                     memory_mode=memory_mode)
+                     memory_mode=memory_mode,
+                     agentic_oracle=agentic_oracle)
         runner.executor_agent = executor_agent
         return runner.run(
             config=config, env=env, ep=ep,
@@ -2439,6 +2549,7 @@ def run_single_branch(
     enable_search_trail: bool = True,
     memory_mode: str = "semantic",  # "semantic" | "geometric"
     episode_status: str = "pending",
+    agentic_oracle: bool = False,
 ) -> BranchResult:
     """
     一个 episode 的完整生命周期：加载数据 → 初始化环境 → 陷阱 → 跑分支。
@@ -2512,7 +2623,8 @@ def run_single_branch(
                               enable_contrastive_planner=enable_contrastive_planner,
                               enable_progress_gating=enable_progress_gating,
                               enable_search_trail=enable_search_trail,
-                              memory_mode=memory_mode)
+                              memory_mode=memory_mode,
+                              agentic_oracle=agentic_oracle)
 
         config = BranchConfig(
             episode_id=episode_id,
