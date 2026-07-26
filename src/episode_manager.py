@@ -27,6 +27,7 @@ class EpisodeManager:
             "alfred_scene": metadata.get("alfred_scene"),
             "initial_traps": metadata.get("initial_traps", []),
             "runtime_traps": [],
+            "semantic_memory_states": {},
             "steps": [],
             "final_outcome": None,
             "status": "pending",
@@ -58,6 +59,13 @@ class EpisodeManager:
 
         self._mutate(append_step)
 
+    def add_step_with_semantic_memory_state(self, step: dict, state: dict):
+        def append_step_and_state(data):
+            data["steps"].append(step)
+            data.setdefault("semantic_memory_states", {})[step["branch_id"]] = state
+
+        self._mutate(append_step_and_state)
+
     def add_initial_trap(self, trap: dict):
         def append_trap(data):
             data["initial_traps"].append(trap)
@@ -69,6 +77,87 @@ class EpisodeManager:
             data["runtime_traps"].append(trap)
 
         self._mutate(append_trap)
+
+    def trigger_runtime_trap(self, trap_id: str, step_id: str, error_message: str):
+        def mark_triggered(data):
+            for trap in data["runtime_traps"]:
+                if trap.get("trap_id") == trap_id:
+                    event = {"step_id": step_id, "env_error": error_message}
+                    trap.setdefault("trigger_events", []).append(event)
+                    trap["triggered_at_step_id"] = step_id
+                    trap["env_error"] = error_message
+                    trap["status"] = "triggered"
+                    return
+            raise ValueError(f"Runtime trap not found: {trap_id}")
+
+        self._mutate(mark_triggered)
+
+    def recover_runtime_trap(
+        self,
+        branch_id: str,
+        action: str,
+        action_params: dict,
+        step_id: str,
+    ) -> list[str]:
+        recovered_ids = []
+
+        def mark_recovered(data):
+            for trap in data["runtime_traps"]:
+                if trap.get("branch_id") != branch_id or trap.get("status") != "triggered":
+                    continue
+                recovery_steps = trap.get("recovery_steps") or []
+                recovery_stage = trap.get("recovery_stage", 0)
+                if recovery_steps:
+                    expected = recovery_steps[recovery_stage]
+                    if (
+                        action != expected.get("action")
+                        or expected.get("object_id") != action_params.get("objectId")
+                    ):
+                        continue
+                    event = {"action": action, "params": dict(action_params)}
+                    trap.setdefault("recovery_events", []).append(event)
+                    next_stage = recovery_stage + 1
+                    if next_stage < len(recovery_steps):
+                        next_recovery = recovery_steps[next_stage]
+                        trap["recovery_stage"] = next_stage
+                        trap["recovery_action"] = {
+                            "action": next_recovery["action"],
+                            "params": dict(next_recovery["params"]),
+                        }
+                        trap["status"] = "active"
+                        continue
+                    trap["status"] = "recovered"
+                    trap["recovered_at_step_id"] = step_id
+                    trap["recovered_by_action"] = event
+                    recovered_ids.append(trap["trap_id"])
+                    continue
+
+                expected = trap.get("recovery_action") or {}
+                expected_params = expected.get("params") or {}
+                expected_object_id = expected_params.get("objectId")
+                if (
+                    action == expected.get("action")
+                    and (expected_object_id is None or expected_object_id == action_params.get("objectId"))
+                ):
+                    trap["status"] = "recovered"
+                    trap["recovered_at_step_id"] = step_id
+                    trap["recovered_by_action"] = {
+                        "action": action,
+                        "params": dict(action_params),
+                    }
+                    recovered_ids.append(trap["trap_id"])
+
+        self._mutate(mark_recovered)
+        return recovered_ids
+
+    def set_semantic_memory_state(self, branch_id: str, state: dict):
+        def set_state(data):
+            data.setdefault("semantic_memory_states", {})[branch_id] = state
+
+        self._mutate(set_state)
+
+    def get_semantic_memory_state(self, branch_id: str) -> dict | None:
+        return self.data.get("semantic_memory_states", {}).get(branch_id)
 
     def set_final_outcome(self, outcome: dict):
         def set_outcome(data):
@@ -141,6 +230,7 @@ class EpisodeManager:
         if "status" not in self.data:
             self.data["status"] = "completed" if self.data.get("final_outcome") else "interrupted"
         self.data.setdefault("pid", None)
+        self.data.setdefault("semantic_memory_states", {})
 
     # ------------------------------------------------------------------
     # 静态工厂方法：从已有文件恢复

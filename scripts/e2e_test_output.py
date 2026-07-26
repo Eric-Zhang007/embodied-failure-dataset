@@ -9,7 +9,6 @@ from src.vlm_client import VLMClient
 from src.eb_agent import EBAgent
 from src.oracle_agent import OracleAgent
 from src.branch_runner import run_single_branch
-from src.trap_planner import TrapPlanner
 
 LOCAL_EB_URL = "http://localhost:8000/v1"
 
@@ -102,10 +101,9 @@ def main():
     oracle_client.chat_text(system_prompt="Say OK.", user_text="OK", max_tokens=5)
     print(f"done ({_time.time() - _t0:.1f}s)\n")
 
-    trap_planner = None if args.no_traps else TrapPlanner()
     result = run_single_branch(
         traj_path=traj_path, eb_agent=eb_agent, oracle_agent=oracle_agent,
-        output_dir=args.output, trap_planner=trap_planner,
+        output_dir=args.output, enable_phase2=not args.no_traps,
         enable_fork=False, step_limit_multiplier=2,
     )
 

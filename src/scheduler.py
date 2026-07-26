@@ -23,10 +23,9 @@ from src.branch_runner import (
 from src.fork_manager import ForkManager
 from src.env_controller import EnvController
 from src.episode_manager import EpisodeManager
-from src.alfred_parser import load_traj, extract_metadata, extract_low_actions
+from src.alfred_parser import TASK_TYPE_MAP, load_traj, extract_metadata, extract_low_actions
 from src.step_recorder import StepRecorder
 from src.action_adapter import resolve_object_ids, adapt
-from src.trap_planner import TrapPlanner
 
 
 @dataclass
@@ -48,6 +47,8 @@ class SchedulerConfig:
     enable_fork: bool = True
     memory_mode: str = "semantic"  # "semantic" | "geometric"
     no_traps: bool = False
+    max_worker_retries: int = 2
+    task_lanes: bool = False
 
 
 class Scheduler:
@@ -120,6 +121,11 @@ class Scheduler:
             if os.path.exists(out_file):
                 episode = EpisodeManager.load(out_file)
                 status = episode.data["status"]
+                main_outcome = (episode.data.get("final_outcome") or {}).get("main_branch")
+                if main_outcome and main_outcome.get("termination_reason"):
+                    if status != "completed":
+                        episode.set_status("completed")
+                    continue
                 if status == "completed":
                     continue
                 if status == "running":
@@ -149,62 +155,219 @@ class Scheduler:
     # ------------------------------------------------------------------
     def run(self):
         self.load_tasks()
+        if self.config.task_lanes:
+            self._run_task_lanes()
+            return
         total = len(self.queue)
         max_workers = max(1, self.config.max_parallel)
-        self.stats = {"completed": 0, "skipped": 0, "failed": 0}
+        self.stats = {
+            "terminal": 0,
+            "task_complete": 0,
+            "completed": 0,  # Backward-compatible alias for terminal.
+            "skipped": 0,
+            "failed": 0,
+        }
         self._lock = threading.Lock()
         self._semaphore = threading.Semaphore(max_workers)
         _fork_queue = queue.Queue()
-        for task in self.queue:
+        for index, task in enumerate(self.queue, start=1):
             task["_fork_queue"] = _fork_queue
+            task.setdefault("_display_index", index)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self._run_task_worker, task, i + 1, total): task
-                for i, task in enumerate(self.queue)
-            }
+            pending: deque[dict] = deque(self.queue)
+            futures: dict = {}
 
-            while futures:
+            def submit_available() -> None:
+                while pending and len(futures) < max_workers:
+                    task = pending.popleft()
+                    futures[executor.submit(
+                        self._run_task_worker, task, task.get("_display_index", 0), total,
+                    )] = task
+
+            submit_available()
+            while futures or pending:
+                submit_available()
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in done:
                     task = futures.pop(future)
                     try:
                         result = future.result()
                     except Exception as e:
-                        with self._lock:
-                            self.stats["failed"] += 1
-                        print(f"\nCRASH {task['episode_id']}: {e}")
-                        self._report(total)
-                        continue
+                        result = BranchResult(
+                            branch_id=task["branch_config"].branch_id,
+                            termination_reason=f"worker_crash:{e}",
+                            total_steps=0,
+                            fork_tasks=[],
+                            fork_source_step_ids=[],
+                        )
 
-                    if result.termination_reason == "skipped":
+                    if result.termination_reason.startswith("skipped"):
                         with self._lock:
                             self.stats["skipped"] += 1
                     elif result.termination_reason.startswith("worker_crash"):
-                        with self._lock:
-                            self.stats["failed"] += 1
+                        retries = task.get("_worker_retries", 0)
+                        is_main = task["branch_config"].branch_id == "main"
+                        if is_main and retries < self.config.max_worker_retries:
+                            retry_task = dict(task)
+                            retry_task["_worker_retries"] = retries + 1
+                            pending.appendleft(retry_task)
+                            print(
+                                f"\nRETRY {task['episode_id']}: "
+                                f"attempt {retries + 1}/{self.config.max_worker_retries} "
+                                f"after {result.termination_reason}"
+                            )
+                        else:
+                            with self._lock:
+                                self.stats["failed"] += 1
+                            if is_main:
+                                out_file = os.path.join(
+                                    self.config.output_dir, f"{task['episode_id']}.json"
+                                )
+                                if os.path.exists(out_file):
+                                    EpisodeManager.load(out_file).set_status("failed")
+                            print(f"\nCRASH {task['episode_id']}: {result.termination_reason}")
                     else:
                         with self._lock:
+                            self.stats["terminal"] += 1
                             self.stats["completed"] += 1
+                            if result.termination_reason == "task_complete":
+                                self.stats["task_complete"] += 1
 
                         for fork_task in result.fork_tasks:
                             entry = self._fork_entry(task, fork_task)
                             total += 1
-                            futures[executor.submit(
-                                self._run_task_worker, entry, 0, total,
-                            )] = entry
+                            pending.append(entry)
 
                     # Drain fork_queue for forks submitted mid-run via callback
                     while not _fork_queue.empty():
                         entry = _fork_queue.get_nowait()
                         total += 1
-                        futures[executor.submit(
-                            self._run_task_worker, entry, 0, total,
-                        )] = entry
+                        pending.append(entry)
                     self._report(total)
 
-        print(f"\n\nDone. {self.stats['completed']} branches, {self.stats['failed']} failed, "
-              f"{self.stats['skipped']} skipped.")
+        self._print_summary()
+
+    def _run_task_lanes(self):
+        """Keep one worker active for each raw ALFRED task type."""
+        lane_order = list(TASK_TYPE_MAP)
+        lanes: dict[str, deque[dict]] = {task_type: deque() for task_type in lane_order}
+        for task in self.queue:
+            task_type = task["meta"].get("alfred_task_type")
+            if task_type in lanes:
+                lanes[task_type].append(task)
+
+        empty_lanes = [task_type for task_type, tasks in lanes.items() if not tasks]
+        if empty_lanes:
+            raise RuntimeError(f"No trajectories for task lanes: {', '.join(empty_lanes)}")
+        if self.config.max_parallel < len(lane_order):
+            raise ValueError(
+                f"task_lanes requires at least {len(lane_order)} workers; "
+                f"got {self.config.max_parallel}"
+            )
+
+        total = len(self.queue)
+        self.stats = {
+            "terminal": 0,
+            "task_complete": 0,
+            "completed": 0,  # Backward-compatible alias for terminal.
+            "skipped": 0,
+            "failed": 0,
+        }
+        self._lock = threading.Lock()
+        self._semaphore = threading.Semaphore(len(lane_order))
+        fork_queue = queue.Queue()
+        for index, task in enumerate(self.queue, start=1):
+            task["_fork_queue"] = fork_queue
+            task.setdefault("_display_index", index)
+
+        print(f"Running {len(lane_order)} task lanes: {', '.join(lane_order)}")
+        with ThreadPoolExecutor(max_workers=len(lane_order)) as executor:
+            futures: dict = {}
+            active_lanes: set[str] = set()
+
+            def submit_lane(task_type: str) -> None:
+                if task_type in active_lanes or not lanes[task_type]:
+                    return
+                task = lanes[task_type].popleft()
+                active_lanes.add(task_type)
+                futures[executor.submit(
+                    self._run_task_worker,
+                    task,
+                    task.get("_display_index", 0),
+                    total,
+                )] = (task_type, task)
+
+            for task_type in lane_order:
+                submit_lane(task_type)
+
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    task_type, task = futures.pop(future)
+                    active_lanes.remove(task_type)
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        result = BranchResult(
+                            branch_id=task["branch_config"].branch_id,
+                            termination_reason=f"worker_crash:{e}",
+                            total_steps=0,
+                            fork_tasks=[],
+                            fork_source_step_ids=[],
+                        )
+
+                    if result.termination_reason.startswith("skipped"):
+                        with self._lock:
+                            self.stats["skipped"] += 1
+                    elif result.termination_reason.startswith("worker_crash"):
+                        retries = task.get("_worker_retries", 0)
+                        is_main = task["branch_config"].branch_id == "main"
+                        if is_main and retries < self.config.max_worker_retries:
+                            retry_task = dict(task)
+                            retry_task["_worker_retries"] = retries + 1
+                            lanes[task_type].appendleft(retry_task)
+                            print(
+                                f"\nRETRY {task['episode_id']} ({task_type}): "
+                                f"attempt {retries + 1}/{self.config.max_worker_retries}"
+                            )
+                        else:
+                            with self._lock:
+                                self.stats["failed"] += 1
+                            if is_main:
+                                out_file = os.path.join(
+                                    self.config.output_dir, f"{task['episode_id']}.json"
+                                )
+                                if os.path.exists(out_file):
+                                    EpisodeManager.load(out_file).set_status("failed")
+                            print(f"\nCRASH {task['episode_id']} ({task_type}): {result.termination_reason}")
+                    else:
+                        with self._lock:
+                            self.stats["terminal"] += 1
+                            self.stats["completed"] += 1
+                            if result.termination_reason == "task_complete":
+                                self.stats["task_complete"] += 1
+                        for fork_task in reversed(result.fork_tasks):
+                            entry = self._fork_entry(task, fork_task)
+                            entry["_lane_type"] = task_type
+                            lanes[task_type].appendleft(entry)
+                            total += 1
+
+                    while not fork_queue.empty():
+                        entry = fork_queue.get_nowait()
+                        entry_task_type = entry.get("_lane_type") or entry["meta"].get("alfred_task_type")
+                        if entry_task_type in lanes:
+                            entry["_lane_type"] = entry_task_type
+                            lanes[entry_task_type].appendleft(entry)
+                            total += 1
+
+                    submit_lane(task_type)
+                    self._report(total)
+
+                for lane in lane_order:
+                    submit_lane(lane)
+
+        self._print_summary()
 
     def _run_task_worker(self, task: dict, n: int, total: int) -> BranchResult:
         with self._semaphore:
@@ -258,13 +421,12 @@ class Scheduler:
                     fork_callback=_on_fork,
                 )
             else:
-                trap_planner = None if self.config.no_traps else TrapPlanner()
                 result = run_single_branch(
                     traj_path=task["traj_path"],
                     eb_agent=eb_agent,
                     oracle_agent=oracle_agent,
                     output_dir=self.config.output_dir,
-                    trap_planner=trap_planner,
+                    enable_phase2=not self.config.no_traps,
                     enable_fork=self.config.enable_fork,
                     executor_agent=executor_agent,
                     memory_mode=self.config.memory_mode,
@@ -316,7 +478,6 @@ class Scheduler:
         if not os.path.exists(out_file):
             raise FileNotFoundError(f"Episode not found: {out_file}")
         ep = EpisodeManager.load(out_file)
-        ep.set_status("running", os.getpid())
         print(f"\n[fork] Starting {config.branch_id} (parent={config.parent_branch_id}) on {ep_id}")
 
         # 收集共享 step
@@ -331,7 +492,10 @@ class Scheduler:
         try:
             # 1. Replay 共享上下文
             env.reset_to_alfred_scene(ep.data["alfred_scene"])
-            replay_steps(env, shared_steps, skip_failed=True)
+            replay_steps(
+                env, shared_steps, skip_failed=True,
+                pddl_params=ep.data.get("pddl_params", {}),
+            )
 
             # 2. 执行 fork 替代动作
             alt_action = fc.get("alternative_action", {})
@@ -467,7 +631,21 @@ class Scheduler:
         return entry
 
     def _report(self, total: int):
-        done = self.stats["completed"] + self.stats["failed"] + self.stats["skipped"]
+        done = self.stats["terminal"] + self.stats["failed"] + self.stats["skipped"]
         remaining = total - done
-        print(f"\r[{done}/{total}] {self.stats['completed']} ok, {remaining} remaining, "
-              f"{self.stats['failed']} failed, {self.stats['skipped']} skipped", end="", flush=True)
+        non_success_terminal = self.stats["terminal"] - self.stats["task_complete"]
+        print(
+            f"\r[{done}/{total}] {self.stats['task_complete']} task_complete, "
+            f"{non_success_terminal} terminal_non_success, {remaining} remaining, "
+            f"{self.stats['failed']} worker_failed, {self.stats['skipped']} skipped",
+            end="",
+            flush=True,
+        )
+
+    def _print_summary(self):
+        non_success_terminal = self.stats["terminal"] - self.stats["task_complete"]
+        print(
+            f"\n\nDone. {self.stats['task_complete']} task_complete, "
+            f"{non_success_terminal} terminal_non_success, "
+            f"{self.stats['failed']} worker_failed, {self.stats['skipped']} skipped."
+        )

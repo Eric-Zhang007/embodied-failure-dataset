@@ -174,6 +174,6 @@ class ExecutorAgent:
             user_text=prompt,
             image=image,
             required_fields=("actions", "status", "reasoning", "status_reason"),
-            max_tokens=16384,
+            max_tokens=2048,
         )
         return result

@@ -1,7 +1,8 @@
+import atexit
 import os
 import subprocess
+import threading
 import time
-import atexit
 
 import numpy as np
 from ai2thor.controller import Controller
@@ -17,8 +18,13 @@ from src.alfred_scene import (
 
 
 class EnvController:
+    _xvfb_proc = None
+    _xvfb_display = ":99"
+    _xvfb_lock = threading.Lock()
+
     def __init__(self, scene: str, width: int = 300, height: int = 300):
         self._start_xvfb()
+        self._closed = False
         self.width = width
         self.height = height
         self.scene = scene
@@ -28,6 +34,8 @@ class EnvController:
             width=width,
             height=height,
             makeAgentsVisible=False,
+            renderInstanceSegmentation=True,
+            x_display=self._xvfb_display,
         )
 
     def step(self, action: str, **params) -> dict:
@@ -45,7 +53,7 @@ class EnvController:
         }
 
     def get_state_snapshot(self) -> dict:
-        """返回当前帧和环境状态的完整快照。"""
+        """Return the current frame and full environment state."""
         event = self.controller.step(action="Pass")
         self._fix_visible_bounds(event)
         return {
@@ -56,15 +64,14 @@ class EnvController:
 
     @staticmethod
     def _fix_visible_bounds(event):
-        """AI2-THOR 5.0.0 bug: process_visible_bounds2D runs before
-        instance_detections2D is populated. Manually set visibleBounds2D."""
-        det = event.instance_detections2D
-        if det is None:
+        """Populate visibleBounds2D for AI2-THOR 5.0.0 events."""
+        detections = event.instance_detections2D
+        if detections is None:
             return
         for obj in event.metadata["objects"]:
             obj["visibleBounds2D"] = (
                 obj.get("visible", False)
-                and obj["objectId"] in det
+                and obj["objectId"] in detections
             )
 
     def reset_scene(self, scene: str = None):
@@ -79,46 +86,38 @@ class EnvController:
         apply_init_action(self.controller, scene_state.get("init_action"))
 
     def close(self):
-        self.controller.stop()
+        if self._closed:
+            return
+        self._closed = True
+        controller, self.controller = self.controller, None
+        if controller is not None:
+            controller.stop()
 
-    # ------------------------------------------------------------------
-    # Xvfb management
-    # ------------------------------------------------------------------
-    _xvfb_proc = None
-    _xvfb_display = ":99"
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @classmethod
     def _start_xvfb(cls):
-        if cls._xvfb_proc is not None:
-            return
-        # DISPLAY already set — use it
-        if os.environ.get("DISPLAY"):
-            return
-        # WSLg provides XWayland at :0
-        for display in (":0", ":0.0"):
-            try:
-                subprocess.check_call(
-                    ["xdpyinfo", "-display", display],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                os.environ["DISPLAY"] = display
+        with cls._xvfb_lock:
+            if cls._xvfb_proc is not None and cls._xvfb_proc.poll() is None:
+                os.environ["DISPLAY"] = cls._xvfb_display
                 return
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                pass
-        # Fallback: Xvfb headless
-        cls._xvfb_proc = subprocess.Popen(
-            ["Xvfb", cls._xvfb_display, "-screen", "0", "1024x768x24", "-ac"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        os.environ["DISPLAY"] = cls._xvfb_display
-        time.sleep(0.3)
-        atexit.register(cls._stop_xvfb)
+            cls._xvfb_proc = subprocess.Popen(
+                ["Xvfb", cls._xvfb_display, "-screen", "0", "1024x768x24", "-ac"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            os.environ["DISPLAY"] = cls._xvfb_display
+            time.sleep(0.3)
+            atexit.register(cls._stop_xvfb)
 
     @classmethod
     def _stop_xvfb(cls):
-        if cls._xvfb_proc is not None:
-            cls._xvfb_proc.terminate()
-            cls._xvfb_proc.wait()
-            cls._xvfb_proc = None
+        with cls._xvfb_lock:
+            proc, cls._xvfb_proc = cls._xvfb_proc, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            proc.wait()

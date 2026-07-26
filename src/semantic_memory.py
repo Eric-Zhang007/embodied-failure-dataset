@@ -14,8 +14,9 @@ Distinguishes itself from GeometricMemory by:
 from __future__ import annotations
 
 import math, re
+from copy import deepcopy
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict
 
 from src.memory_interface import MemoryInterface
 from src.geometric_memory import (
@@ -55,8 +56,95 @@ class SemanticMemory(MemoryInterface):
 
         # Searched markers (type → count)
         self._searched_types: dict[str, int] = {}
+        self._state_change_callback = None
 
     # ── core update ──────────────────────────────────────────────────
+
+    def export_state(self) -> dict:
+        """Return the complete semantic state in a JSON-safe form."""
+        tracker = self._stuck_tracker
+        return {
+            "objects": {oid: asdict(entry) for oid, entry in self._objects.items()},
+            "obstacles": [asdict(obstacle) for obstacle in self._obstacles],
+            "step_counter": self._step_counter,
+            "last_error": self._last_error,
+            "agent": {"x": self._agent_x, "z": self._agent_z, "rot_y": self._agent_rot_y},
+            "area_label": self._area_label,
+            "task": {
+                "type": self._task_type,
+                "target": self._task_target,
+                "receptacle": self._task_receptacle,
+            },
+            "receptacle_visit_counts": dict(self.receptacle_visit_counts),
+            "receptacle_open_counts": dict(self.receptacle_open_counts),
+            "objects_found_by_receptacle": dict(self.objects_found_by_receptacle),
+            "object_state": deepcopy(self._object_state),
+            "searched_types": dict(self._searched_types),
+            "stuck_tracker": {
+                "intent_failure": self._pack_tuple_map(tracker._intent_failure),
+                "intent_last_step": self._pack_tuple_map(tracker._intent_last_step),
+                "consecutive_failures": tracker._consecutive_failures,
+                "blocked_directions": self._pack_tuple_map(tracker._blocked_directions),
+                "block_dir_last_step": self._pack_tuple_map(tracker._block_dir_last_step),
+                "obstacle_intent_blocks": self._pack_tuple_map(tracker._obstacle_intent_blocks),
+                "obs_last_step": self._pack_tuple_map(tracker._obs_last_step),
+            },
+        }
+
+    @classmethod
+    def from_state(cls, state: dict) -> "SemanticMemory":
+        """Restore a memory instance previously produced by export_state()."""
+        memory = cls()
+        memory._objects = {
+            oid: _ObjectEntry(**entry)
+            for oid, entry in state.get("objects", {}).items()
+        }
+        memory._obstacles = [
+            _ObstacleEntry(**obstacle)
+            for obstacle in state.get("obstacles", [])
+        ]
+        memory._step_counter = state.get("step_counter", 0)
+        memory._last_error = state.get("last_error")
+        agent = state.get("agent", {})
+        memory._agent_x = agent.get("x", 0.0)
+        memory._agent_z = agent.get("z", 0.0)
+        memory._agent_rot_y = agent.get("rot_y", 0.0)
+        memory._area_label = state.get("area_label", "")
+        task = state.get("task", {})
+        memory._task_type = task.get("type", "")
+        memory._task_target = task.get("target", "")
+        memory._task_receptacle = task.get("receptacle", "")
+        memory.receptacle_visit_counts = dict(state.get("receptacle_visit_counts", {}))
+        memory.receptacle_open_counts = dict(state.get("receptacle_open_counts", {}))
+        memory.objects_found_by_receptacle = dict(state.get("objects_found_by_receptacle", {}))
+        memory._object_state = deepcopy(state.get("object_state", {}))
+        memory._searched_types = dict(state.get("searched_types", {}))
+
+        tracker_state = state.get("stuck_tracker", {})
+        tracker = memory._stuck_tracker
+        tracker._intent_failure = cls._unpack_tuple_map(tracker_state.get("intent_failure", []))
+        tracker._intent_last_step = cls._unpack_tuple_map(tracker_state.get("intent_last_step", []))
+        tracker._consecutive_failures = tracker_state.get("consecutive_failures", 0)
+        tracker._blocked_directions = cls._unpack_tuple_map(tracker_state.get("blocked_directions", []))
+        tracker._block_dir_last_step = cls._unpack_tuple_map(tracker_state.get("block_dir_last_step", []))
+        tracker._obstacle_intent_blocks = cls._unpack_tuple_map(tracker_state.get("obstacle_intent_blocks", []))
+        tracker._obs_last_step = cls._unpack_tuple_map(tracker_state.get("obs_last_step", []))
+        return memory
+
+    def set_state_change_callback(self, callback) -> None:
+        self._state_change_callback = callback
+
+    def _state_changed(self) -> None:
+        if self._state_change_callback is not None:
+            self._state_change_callback(self.export_state())
+
+    @staticmethod
+    def _pack_tuple_map(values: dict[tuple, int]) -> list[dict]:
+        return [{"key": list(key), "value": value} for key, value in values.items()]
+
+    @staticmethod
+    def _unpack_tuple_map(values: list[dict]) -> dict[tuple, int]:
+        return {tuple(item["key"]): item["value"] for item in values}
 
     def update(
         self,
@@ -77,8 +165,19 @@ class SemanticMemory(MemoryInterface):
 
         self._extract_task_info(task_criteria)
         inventory = metadata.get("inventoryObjects") or []
-        held_types = {o.get("objectType", "") for o in inventory}
+        held_ids = {o.get("objectId") for o in inventory if o.get("objectId")}
+        # AI2-THOR inventory entries include objectId. Retain a type-based
+        # fallback only for incomplete metadata from older recordings.
+        held_types_without_id = {
+            o.get("objectType", "")
+            for o in inventory
+            if o.get("objectType") and not o.get("objectId")
+        }
 
+        held_before_action = (
+            {oid for oid, entry in self._objects.items() if entry.status == "held"}
+            if action == "PutObject" and success else set()
+        )
         current_ids: set[str] = set()
         for obj in visible_objects:
             oid = obj.get("objectId", "")
@@ -106,7 +205,7 @@ class SemanticMemory(MemoryInterface):
             )
             is_recep = obj.get("receptacle", False)
             is_task_recep = is_recep and otype == self._task_receptacle
-            is_held = otype in held_types
+            is_held = oid in held_ids or otype in held_types_without_id
             parent_id = (obj.get("parentReceptacles") or [None])[0]
 
             status = "held" if is_held else "visible"
@@ -138,17 +237,26 @@ class SemanticMemory(MemoryInterface):
             if oid not in current_ids and entry.status == "visible":
                 entry.status = "remembered"
 
-        for held_type in held_types:
-            for entry in self._objects.values():
-                if entry.object_type == held_type and entry.status != "held":
-                    entry.status = "held"
-                    entry.last_seen_step = self._step_counter
-
         if action == "PutObject" and success:
-            for entry in self._objects.values():
-                if entry.status == "held":
+            for oid in held_before_action:
+                entry = self._objects.get(oid)
+                if entry:
                     entry.status = "placed"
                     entry.last_seen_step = self._step_counter
+        else:
+            for held_id in held_ids:
+                entry = self._objects.get(held_id)
+                if entry:
+                    entry.status = "held"
+                    entry.last_seen_step = self._step_counter
+            for held_type in held_types_without_id:
+                for entry in self._objects.values():
+                    if entry.object_type == held_type:
+                        entry.status = "held"
+                        entry.last_seen_step = self._step_counter
+            for oid, entry in self._objects.items():
+                if entry.status == "held" and oid not in held_ids and oid not in current_ids:
+                    entry.status = "remembered"
 
         blocker = None
         blocker_dir = None
@@ -160,6 +268,8 @@ class SemanticMemory(MemoryInterface):
                 obs.last_block_step = self._step_counter
                 blocker_dir = obs.direction
             self._last_error = self._compress_error(action, error_message)
+        elif success:
+            self._last_error = None
 
         intent_parts = intent.split(maxsplit=1)
         intent_verb = intent_parts[0] if intent_parts else ""
@@ -173,6 +283,7 @@ class SemanticMemory(MemoryInterface):
         self._age_entries()
         if self._step_counter % 5 == 0 or not self._area_label:
             self._update_area_label(metadata)
+        self._state_changed()
 
     # ── render ───────────────────────────────────────────────────────
 
@@ -488,12 +599,24 @@ class SemanticMemory(MemoryInterface):
         m = re.search(r'(?:Heat|Cool|Clean|Pick up)\s+(?:the\s+)?(\w+)', criteria, re.IGNORECASE)
         if m:
             self._task_target = m.group(1)
+        else:
+            # BranchRunner passes completion criteria such as
+            # "  - Apple must be inside Cabinet", not natural-language goals.
+            m = re.search(
+                r'(?:^|\n)\s*(?:[-*]\s*)?(?:Two\s+)?(\w+)\s+must be\b',
+                criteria,
+                re.IGNORECASE,
+            )
+            if m:
+                self._task_target = m.group(1)
 
         # Extract receptacle
-        if "inside " in criteria:
-            self._task_receptacle = criteria.split("inside ")[-1].strip().rstrip(".")
-        elif "on " in criteria and "put it" in lower:
-            self._task_receptacle = criteria.split("on ")[-1].strip().rstrip(".")
+        inside_targets = re.findall(r'\binside\s+(?:the\s+)?(\w+)', criteria, re.IGNORECASE)
+        on_targets = re.findall(r'\bon\s+(?:the\s+)?(\w+)', criteria, re.IGNORECASE)
+        if inside_targets:
+            self._task_receptacle = inside_targets[-1]
+        elif on_targets and "put it" in lower:
+            self._task_receptacle = on_targets[-1]
 
         if self._task_type and not self._task_target:
             # Bare task: "heat the apple"
@@ -636,21 +759,26 @@ class SemanticMemory(MemoryInterface):
                     count += 1
         if object_type:
             self._searched_types[object_type] = self._searched_types.get(object_type, 0) + 1
+        self._state_changed()
         return count
 
     def unmark_searched(self, object_type: str) -> int:
+        had_type_marker = object_type in self._searched_types
         count = 0
         for e in self._objects.values():
             if e.object_type == object_type and e.searched:
                 e.searched = False
                 count += 1
         self._searched_types.pop(object_type, None)
+        if count or had_type_marker:
+            self._state_changed()
         return count
 
     def unmark_searched_by_id(self, object_id: str) -> int:
         e = self._objects.get(object_id)
         if e and e.searched:
             e.searched = False
+            self._state_changed()
             return 1
         return 0
 
@@ -659,16 +787,19 @@ class SemanticMemory(MemoryInterface):
     def record_receptacle_visit(self, receptacle_type: str) -> None:
         self.receptacle_visit_counts[receptacle_type] = \
             self.receptacle_visit_counts.get(receptacle_type, 0) + 1
+        self._state_changed()
 
     def record_receptacle_open(self, receptacle_type: str) -> None:
         self.receptacle_open_counts[receptacle_type] = \
             self.receptacle_open_counts.get(receptacle_type, 0) + 1
         self.receptacle_visit_counts[receptacle_type] = \
             self.receptacle_visit_counts.get(receptacle_type, 0) + 1
+        self._state_changed()
 
     def record_object_discovered_in(self, receptacle_type: str) -> None:
         self.objects_found_by_receptacle[receptacle_type] = \
             self.objects_found_by_receptacle.get(receptacle_type, 0) + 1
+        self._state_changed()
 
     def get_receptacle_entries_for_curiosity(self) -> list[dict]:
         entries = []
@@ -750,9 +881,12 @@ class SemanticMemory(MemoryInterface):
     def _age_entries(self):
         threshold = self._step_counter - self.AGING_THRESHOLD
         to_remove = [oid for oid, e in self._objects.items()
-                     if e.last_seen_step <= threshold and e.status == "remembered"]
+                     if e.last_seen_step <= threshold
+                     and e.status in {"remembered", "placed"}
+                     and e.object_type not in {self._task_target, self._task_receptacle}]
         for oid in to_remove:
             del self._objects[oid]
+            self._object_state.pop(oid, None)
 
     def _update_area_label(self, metadata: dict):
         scene = metadata.get("sceneName", "")

@@ -6,6 +6,7 @@ EB Agent（具身 Agent）。
 - Phase 3: 遇到失败后进行诊断、恢复推理、可选的的反事实推理
 """
 
+import json
 import math
 import re
 import numpy as np
@@ -53,7 +54,7 @@ Object interaction — use objectType from the visible objects list. Must be wit
   OpenObject(objectType) / CloseObject(objectType)
   ToggleObjectOn(objectType) / ToggleObjectOff(objectType)
   SliceObject(objectType) / BreakObject(objectType)
-  FillObjectWithLiquid(objectType) / EmptyLiquidFromObject(objectType)
+  FillObjectWithLiquid(objectType, fillLiquid="water") / EmptyLiquidFromObject(objectType)
   DropHandObject
 
 Multi-step movement:
@@ -272,6 +273,8 @@ Your job is to:
 2. Propose a recovery action to get back on track — this should address the SPECIFIC failure cause.
 3. Optionally, provide a counterfactual: "If I had done X instead of Y earlier, this failure would not have occurred."
 
+If the user prompt contains an ENVIRONMENT-CONFIRMED RUNTIME TRAP with status "triggered", its recovery_action has been verified against the current scene. Use that exact recovery action before retrying the failed task action.
+
 AVAILABLE ACTIONS (use EXACTLY these names, do NOT invent new ones):
 
 NAVIGATION:
@@ -285,7 +288,7 @@ NAVIGATION:
 - LookDown: tilt camera down (-60° max from horizon).
 
 OBJECT INTERACTION — use objectType (plain type name, no coordinates):
-- PickupObject(objectType), OpenObject(objectType), CloseObject(objectType), ToggleObjectOn(objectType), ToggleObjectOff(objectType), SliceObject(objectType), BreakObject(objectType), FillObjectWithLiquid(objectType), EmptyLiquidFromObject(objectType)
+- PickupObject(objectType), OpenObject(objectType), CloseObject(objectType), ToggleObjectOn(objectType), ToggleObjectOff(objectType), SliceObject(objectType), BreakObject(objectType), FillObjectWithLiquid(objectType, fillLiquid="water"), EmptyLiquidFromObject(objectType)
 - PutObject(objectType, receptacleType): place held object INTO a receptacle. objectType=held type, receptacleType=target receptacle type (look for "(receptacle)" in the list). BOTH required.
 - DropHandObject: drop held object.
 
@@ -334,6 +337,7 @@ def build_phase3_prompt(
     task_criteria: str = "",
     memory_text: str = "",
     current_intent: str = "",
+    trap_state: list[dict] | None = None,
 ) -> str:
     lines = [f"Task goal: {task_goal}\n"]
 
@@ -352,8 +356,24 @@ def build_phase3_prompt(
     if cascade_description:
         lines.append(f"Context: {cascade_description}\n")
 
+    triggered_traps = [
+        {
+            "expected_failure": trap.get("expected_failure"),
+            "recovery_action": trap.get("recovery_action"),
+        }
+        for trap in (trap_state or [])
+        if trap.get("status") == "triggered"
+    ]
+    if triggered_traps:
+        lines.append(
+            "ENVIRONMENT-CONFIRMED RUNTIME TRAP — recover with its exact "
+            "recovery_action before retrying:\n"
+            + json.dumps(triggered_traps, ensure_ascii=False, sort_keys=True)
+            + "\n"
+        )
+
     if visible_objects:
-        visible = [o for o in visible_objects if o.get("visibleBounds2D")]
+        visible = [o for o in visible_objects if o.get("visible")]
         if visible:
             lines.append("Objects currently in view — use the TYPE name. Direction shown relative to your facing:")
             for o in visible:
@@ -1751,6 +1771,7 @@ OUTPUT — valid JSON only:
         task_criteria: str = "",
         memory_text: str = "",
         current_intent: str = "",
+        trap_state: list[dict] | None = None,
     ) -> dict:
         """Phase 3: 诊断失败并提议恢复。"""
         if cascade_level > 1:
@@ -1762,7 +1783,8 @@ OUTPUT — valid JSON only:
 
         prompt = build_phase3_prompt(task_goal, action_history, error_message, desc,
                                      visible_objects, agent_pos, agent_rot_y, inventory_objects, task_criteria,
-                                     memory_text=memory_text, current_intent=current_intent)
+                                     memory_text=memory_text, current_intent=current_intent,
+                                     trap_state=trap_state)
         result = self.client.chat_with_image_json(
             system_prompt=PHASE3_SYSTEM,
             user_text=prompt,

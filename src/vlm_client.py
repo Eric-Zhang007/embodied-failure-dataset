@@ -27,6 +27,19 @@ LOG_FULL_API = os.environ.get("EFD_LOG_FULL_API", "1") != "0"
 _api_log_dir: Path | None = None
 
 
+def _openai_request_policy() -> tuple[float, int]:
+    """Read bounded transport limits without baking collection policy into code."""
+    try:
+        timeout_s = float(os.environ.get("EFD_API_TIMEOUT_S", "30"))
+    except ValueError:
+        timeout_s = 30.0
+    try:
+        max_attempts = int(os.environ.get("EFD_API_MAX_ATTEMPTS", "5"))
+    except ValueError:
+        max_attempts = 5
+    return max(1.0, timeout_s), max(1, max_attempts)
+
+
 def _get_api_log_path() -> Path:
     """Return the api_calls.jsonl path. Uses per-test dir if set, else global."""
     base = _api_log_dir or LOG_DIR
@@ -373,10 +386,9 @@ class VLMClient:
                      self.model, "json" if json_mode else "text", body_size, msg_summary)
 
         last_conn_error = None
-        timeout = 30
+        timeout, max_transport = _openai_request_policy()
         tried_without_reasoning = False
         transport_attempt = 0
-        max_transport = 5
         while transport_attempt < max_transport:
             transport_attempt += 1
             try:

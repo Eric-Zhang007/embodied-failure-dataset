@@ -51,11 +51,11 @@ def resolve_object_ids(action: str, params: dict, visible_objects: list[dict]):
         rt = p.pop("receptacleType")
         candidates = [o for o in visible_objects
                       if o["objectType"] == rt and o.get("receptacle") and o.get("visibleBounds2D")]
-        if not candidates:
-            candidates = [o for o in visible_objects
-                      if o["objectType"] == rt and o.get("receptacle")]
         if candidates:
             p["receptacleId"] = candidates[0]["objectId"]
+            # AI2-THOR otherwise rejects valid visible receptacles with its
+            # random placement sampler.
+            p.setdefault("forceAction", True)
         else:
             warnings.append(
                 f"receptacleType '{rt}' NOT FOUND in visible objects. "

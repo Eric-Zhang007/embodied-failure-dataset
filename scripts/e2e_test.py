@@ -8,6 +8,7 @@
     uv run python scripts/e2e_test.py --api-key sk-xxx --all --random --no-traps
 """
 import argparse
+import configparser
 import glob
 import os
 import sys
@@ -20,7 +21,6 @@ from src.eb_agent import EBAgent
 from src.oracle_agent import OracleAgent
 from src.executor import ExecutorAgent
 from src.branch_runner import run_single_branch, BranchRunner
-from src.trap_planner import TrapPlanner
 from src.episode_manager import EpisodeManager
 from src.env_controller import EnvController
 from src.branch_runner import BranchConfig
@@ -36,14 +36,39 @@ ALL_TASKS = [
 ]
 
 
+def _load_api_config(config_path: str) -> dict[str, str]:
+    """Read the small TOML-compatible configuration subset used by collection."""
+    parser = configparser.ConfigParser()
+    if not parser.read(config_path, encoding="utf-8"):
+        raise FileNotFoundError(f"Could not read config file: {config_path}")
+    if not parser.has_option("api", "api_key"):
+        raise ValueError("Config file must define [api] api_key")
+    def value(section: str, option: str, fallback: str = "") -> str:
+        return parser.get(section, option, fallback=fallback).strip().strip('"')
+
+    return {
+        "api_key": value("api", "api_key"),
+        "api_base_url": value("api", "base_url"),
+        "planner_model": value("models", "planner"),
+        "executor_model": value("models", "executor"),
+        "oracle_model": value("models", "oracle"),
+    }
+
+
+def _persist_main_result_status(episode_path: str, termination_reason: str) -> None:
+    """Persist a terminal main-branch status when an episode file was created."""
+    if not os.path.exists(episode_path):
+        return
+    final_status = "failed" if termination_reason.startswith("worker_crash") else "completed"
+    EpisodeManager.load(episode_path).set_status(final_status)
+
+
 def run_one(args, task_type, traj_path, n, total):
     """Run a single episode in a worker thread."""
     ep_id = os.path.basename(os.path.dirname(traj_path))
     prefix = f"[{n}/{total}]" if total > 1 else ""
 
     eb_agent, oracle_agent, executor_agent = _make_agents(args)
-    trap_planner = None if args.no_traps else TrapPlanner()
-
     # Compute ablation flags: --ablation includes spikes to DISABLE
     ablation_set = set(args.ablation)
     result = run_single_branch(
@@ -51,7 +76,7 @@ def run_one(args, task_type, traj_path, n, total):
         eb_agent=eb_agent,
         oracle_agent=oracle_agent,
         output_dir=args.output,
-        trap_planner=trap_planner,
+        enable_phase2=not args.no_traps,
         enable_fork=args.enable_fork,
         step_limit_multiplier=2,
         executor_agent=executor_agent,
@@ -63,7 +88,9 @@ def run_one(args, task_type, traj_path, n, total):
         enable_progress_gating="005" not in ablation_set,
         enable_search_trail="006" not in ablation_set,
         memory_mode=args.memory,
+        episode_status="running",
     )
+    _persist_main_result_status(os.path.join(args.output, f"{ep_id}.json"), result.termination_reason)
     print(f"{prefix} {task_type}: {ep_id} -> {result.termination_reason} ({result.total_steps} steps)")
     return task_type, ep_id, result
 
@@ -125,7 +152,10 @@ def _run_fork_e2e(args, parent_task_type, episode_id, fork_task: dict, n: int, t
         shared_steps.sort(key=lambda x: x.get("step_index_in_branch", 0))
 
         env.reset_to_alfred_scene(_require_alfred_scene(ep.data))
-        replay_steps(env, shared_steps, skip_failed=True)
+        replay_steps(
+            env, shared_steps, skip_failed=True,
+            pddl_params=ep.data.get("pddl_params", {}),
+        )
 
         # 2. Execute fork alternative action
         alt_action = fc.get("alternative_action", {})
@@ -228,7 +258,8 @@ def _run_fork_with_sem(sem, args, task_type, episode_id, fork_task, n, total):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--api-key", required=True, help="OpenAI API key")
+    parser.add_argument("--api-key", default="", help="OpenAI API key")
+    parser.add_argument("--config", default="", help="Optional config.toml containing [api] api_key")
     parser.add_argument("--api-base-url", default="https://cdn.9527code.com/v1", help="OpenAI-compatible API base URL")
     parser.add_argument("--planner-model", default="gpt-5.5")
     parser.add_argument("--oracle-model", default="gpt-5.5")
@@ -253,6 +284,12 @@ def main():
                         help="Memory mode: semantic (receptacle-grouped, freshness-aware) or geometric (flat list)")
     parser.add_argument("--enable-fork", action="store_true", help="Enable Oracle fork tasks on AC counterfactuals")
     args = parser.parse_args()
+
+    if args.config:
+        config = _load_api_config(args.config)
+        args.api_key = args.api_key or config["api_key"]
+    if not args.api_key:
+        parser.error("provide --api-key or --config with [api] api_key")
 
     if not args.output:
         from datetime import datetime

@@ -20,77 +20,38 @@ logger = logging.getLogger("vlm_client")
 # Phase 2: 相机注入决策
 # ------------------------------------------------------------------
 
-PHASE2_SYSTEM = """You are a supervisor agent overseeing an embodied agent performing a household task. Your role is to occasionally introduce failures to test the agent's recovery ability.
+CONSTRAINED_PHASE2_SYSTEM = """You are a supervisor agent designing recovery-focused failures for an embodied agent.
 
-When the agent proposes an action, you decide whether to inject a failure into the environment. The injection modifies the environment state BEFORE the agent's proposed action executes. The modification may cause the agent's action to fail, or the effect may surface later.
+You choose an injection method and its object parameters. The runtime accepts only the known methods below and rejects invalid AI2-THOR actions or destructive changes to task-critical objects. Do not invent methods or object types.
 
-Injection methods available:
-- set_object_property: change a property of an object (e.g., make it static, broken, open/closed, toggled on/off)
-  params: {"object_type": "<type>", "property": "<prop>", "value": true/false}
-- close_container: close an open container (cabinet, fridge, drawer, etc.)
-  params: {"object_type": "<type>"}
-- occlude_object: block an object from the agent's view
-  params: {"object_type": "<type>"}
-- hide_object: move a visible pickupable object to a different non-target receptacle
-  params: {"object_type": "<type>"}
-- swap_object: replace a visible object with an existing object of another type
-  params: {"target_type": "<type>", "new_type": "<type>"}
-- remove_object: disable one object of a type so it disappears from the scene
-  params: {"object_type": "<type>"}
+Allowed methods:
+- set_object_property: {"object_type": "<scene type>", "property": "is_open"|"is_toggled"|"fillLiquid"|"emptyLiquid", "value": ...}
+- close_container: {"object_type": "<openable scene type>"}
+- hide_object: {"object_type": "<visible pickupable scene type>", "container_type": "<different closed openable receptacle type>"}
+- drop_held_object: {}
+- stash_held_object: {"container_type": "<non-destination closed openable receptacle type>"}
 
-When to inject — YOUR GOAL IS TO CREATE A CASCADING FAILURE:
-A cascading failure means: the agent hits a first obstacle, begins recovering from it, and THEN a second, different obstacle appears during recovery. The second failure interrupts the recovery from the first one. This tests whether the agent can handle compound setbacks without losing track of the task.
+Every object-targeting method also accepts the matching visible `object_id` (and container methods accept `container_id`). Use IDs when multiple instances share a type.
 
-Strategy for building a cascade:
-- First injection (cascade_level=0): apply a moderate trap early — close a container, hide an object, occlude a path. The agent will encounter this naturally when it tries to interact.
-- Then WAIT. Let the agent diagnose the failure and begin recovery.
-- Second injection (cascade_level=1, during recovery): apply a DIFFERENT type of trap. If the first was occlusion, the second could be closing a container or swapping an object. The key is that the agent is now dealing with TWO problems at once.
-- Third injection (cascade_level=1, after second recovery begins): apply yet another DIFFERENT trap — but only if the agent is still making progress. Three failures stacked is aggressive.
+TRAP STATE is the only ground truth for prior mutations. At a normal action, do not add a new trap while one is active. At recovery time, an earlier trap is still triggered: you may install one different later trap BEFORE that recovery executes. That is a cascade. The second trap may affect a later task action; it does not need to interrupt the recovery action itself.
 
-When NOT to inject:
-- Do NOT inject when the agent is about to complete the task (PickupObject on the target object, PutObject to the target receptacle, Done). Let success happen.
-- NEVER occlude_object, hide_object, or swap_object on the TASK TARGET. If the task says "move the alarm clock", you must NOT hide/occlude/swap the AlarmClock — the agent must be able to find it. Occluding non-target objects (blocking a path, obscuring a desk) is acceptable.
-- Do NOT inject if cascade_level >= 2 — the agent is already buried in problems.
-- Do NOT inject on purely passive actions: Done, LookDown, RotateLeft, RotateRight.
-- Do NOT repeat the same injection method on the same object type — each trap should be a NOVEL challenge.
+When injecting, describe the expected failed action/error marker and the recovery action. Use real action names and objectType/objectId parameters. Skip when the state cannot stay recoverable or a similar intervention adds no value.
+For a closed receptacle, use the error marker "closed"; AI2-THOR reports CLOSED rather than "not open".
+For a hidden pickup target, use "specified visibility"; AI2-THOR does not report "not visible" verbatim.
 
-Limit: maximum 3 injections per episode total, across all cascade levels.
-
-INJECTION COUNTDOWN: each time you inject, your remaining quota decreases. You will see "INJECTIONS REMAINING: N" in the prompt. When it reaches 0, your injections are blocked automatically — the system will reject any further inject=true responses.
-
-OUTPUT FORMAT — VALID JSON ONLY:
-- { must be the FIRST character of your response, } must be the LAST character.
-- NO text outside braces. NO markdown fences. NO "//" comments (JSON does not allow comments).
-- The closing } is REQUIRED. Truncated JSON = failed action.
-
+OUTPUT FORMAT: valid JSON only.
 {
   "inject": true/false,
-  "reasoning": "<why you chose to inject or not>",
-  "injection": {
-    "method": "<method name>",
-    "params": {...}
-  } or null
+  "reasoning": "brief timing and causal rationale",
+  "injection": {"method": "<allowed method>", "params": {}} or null,
+  "expected_failure": {"action": "<AI2-THOR action>", "error_marker": "<lowercase substring expected in error>"} or null,
+  "recovery_action": {"action": "<AI2-THOR action>", "params": {}} or null
 }"""
 
 
-PHASE2_SYSTEM_FORK = """You are a supervisor agent overseeing an embodied agent. This is a counterfactual branch — the agent is trying an alternative path after realizing a past mistake.
+CONSTRAINED_PHASE2_SYSTEM_FORK = CONSTRAINED_PHASE2_SYSTEM + """
 
-The agent DOES NOT know it is in a counterfactual branch. Do not reveal this.
-
-Your injection rules are the same as usual, EXCEPT:
-- Do NOT inject failures that would repeat the same type of failure the agent is trying to avoid
-- Focus on NEW types of failures that test different recovery skills
-- Same 3-injection countdown applies — check "INJECTIONS REMAINING" in the prompt
-
-OUTPUT FORMAT — VALID JSON ONLY:
-- { must be the FIRST character, } must be the LAST character.
-- NO text outside braces. NO markdown. The closing } is REQUIRED.
-
-{
-  "inject": true/false,
-  "reasoning": "<why>",
-  "injection": {"method": "<method>", "params": {...}} or null
-}"""
+This is a counterfactual branch. Prefer an effect not already used on the parent path."""
 
 
 def build_phase2_prompt(
@@ -102,8 +63,9 @@ def build_phase2_prompt(
     action_history: list[dict],
     cascade_level: int,
     is_fork: bool,
-    remaining_injections: int = 3,
     injection_attempt_errors: list[dict] | None = None,
+    trap_state: list[dict] | None = None,
+    recovery_time: bool = False,
 ) -> str:
     lines = [f"Task goal: {task_goal}\n"]
     lines.append(f"Agent proposes: {proposed_action}({json.dumps(proposed_params)})")
@@ -111,7 +73,12 @@ def build_phase2_prompt(
         lines.append(f"Agent reasoning: {eb_reasoning}")
 
     objects = env_state.get("objects", [])
-    visible = [o for o in objects if o.get("visibleBounds2D")]
+    inventory = env_state.get("inventoryObjects", [])
+    if inventory:
+        lines.append("\nAgent is holding:")
+        for obj in inventory:
+            lines.append(f"  {obj.get('objectId')} ({obj.get('objectType')})")
+    visible = [o for o in objects if o.get("visible")]
     if visible:
         lines.append(f"\nVisible objects ({len(visible)}):")
         for o in visible:
@@ -119,6 +86,7 @@ def build_phase2_prompt(
             if o.get("pickupable"): props.append("pickupable")
             if o.get("openable"): props.append("open" if o.get("isOpen") else "closed")
             if o.get("toggleable"): props.append("on" if o.get("isToggled") else "off")
+            if o.get("canFillWithLiquid"): props.append("filled" if o.get("isFilledWithLiquid") else "empty")
             if o.get("isPickedUp"): props.append("held")
             if o.get("receptacle"): props.append("receptacle")
             prop_str = f" ({', '.join(props)})" if props else ""
@@ -126,14 +94,50 @@ def build_phase2_prompt(
 
     lines.append(f"\nCascade level: {cascade_level}")
     lines.append(f"Fork branch: {is_fork}")
+    lines.append(f"Recovery-time injection: {recovery_time}")
 
     lines.append("")
     lines.append(build_oracle_history_context(action_history))
 
-    if remaining_injections <= 0:
-        lines.append(f"\nINJECTION LIMIT REACHED: you have used all your injections. You MUST set inject=false.")
+    lines.append("\nTRAP STATE (environment-confirmed):")
+    if trap_state:
+        for trap in trap_state:
+            summary = {
+                key: trap.get(key)
+                for key in (
+                    "trap_id", "created_by", "status", "injection", "expected_failure",
+                    "recovery_action", "setup_result", "modification_success", "recovered_by_action",
+                    "created_at_step_id", "triggered_at_step_id",
+                    "recovered_at_step_id", "env_error", "trigger_events", "recovery_events",
+                )
+                if trap.get(key) is not None
+            }
+            lines.append("  " + json.dumps(summary, ensure_ascii=False, sort_keys=True))
     else:
-        lines.append(f"\nINJECTIONS REMAINING: {remaining_injections}. Use them wisely — each one counts.")
+        lines.append("  None. No prior trap has been applied in this branch.")
+
+    actionable_types = {}
+    for obj in objects:
+        if obj.get("pickupable") or obj.get("openable") or obj.get("toggleable"):
+            actionable_types.setdefault(obj.get("objectType"), []).append(obj)
+    if actionable_types:
+        lines.append("\nSCENE TOOL INVENTORY (may be outside the current view):")
+        for object_type, entries in sorted(actionable_types.items()):
+            props = set()
+            for obj in entries:
+                if obj.get("pickupable"):
+                    props.add("pickupable")
+                if obj.get("openable"):
+                    props.add("openable")
+                if obj.get("receptacle"):
+                    props.add("receptacle")
+                if obj.get("toggleable"):
+                    props.add("toggleable")
+                if obj.get("breakable"):
+                    props.add("breakable")
+                if obj.get("canFillWithLiquid"):
+                    props.add("fillable")
+            lines.append(f"  {object_type} x{len(entries)} ({', '.join(sorted(props))})")
     if injection_attempt_errors:
         lines.append("\nPrevious injection setup attempts for THIS SAME EB action failed:")
         for item in injection_attempt_errors:
@@ -146,7 +150,7 @@ def build_phase2_prompt(
                 + str(item.get("error"))
             )
         lines.append("Choose a different injection that can actually be applied, or set inject=false.")
-    lines.append("\nDecide whether to inject. OUTPUT: valid JSON only, { first char, } last char.")
+    lines.append("\nDecide whether to inject. Use only an allowed method and scene object type. OUTPUT: valid JSON only, { first char, } last char.")
     return "\n".join(lines)
 
 
@@ -217,6 +221,7 @@ def build_phase4_prompt(
     eb_recovery_reasoning: str,
     eb_counterfactual: str | None,
     eb_proposed_recovery: dict,
+    trap_state: list[dict] | None = None,
 ) -> str:
     lines = [f"Task goal: {task_goal}\n"]
     lines.append(f"Error encountered: {error_message}\n")
@@ -227,6 +232,27 @@ def build_phase4_prompt(
     lines.append(f"Agent's recovery reasoning: {eb_recovery_reasoning}")
     lines.append(f"Agent's counterfactual: {eb_counterfactual or 'None'}")
     lines.append(f"Agent's proposed recovery: {json.dumps(eb_proposed_recovery)}")
+
+    lines.append("\nENVIRONMENT-CONFIRMED TRAP STATE:")
+    if trap_state:
+        for trap in trap_state:
+            summary = {
+                key: trap.get(key)
+                for key in (
+                    "trap_id", "created_by", "status", "injection", "expected_failure",
+                    "recovery_action", "setup_result", "env_error",
+                    "triggered_at_step_id", "recovered_at_step_id",
+                    "trigger_events", "recovery_events",
+                )
+                if trap.get(key) is not None
+            }
+            lines.append("  " + json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    else:
+        lines.append("  None.")
+    lines.append(
+        "Treat a failure as injection-caused only when a triggered trap's "
+        "recorded effect and environment error match the current failure."
+    )
 
     lines.append("\nEvaluate the agent's response and decide whether to fork. OUTPUT: valid JSON only, { first char, } last char.")
     return "\n".join(lines)
@@ -251,24 +277,27 @@ class OracleAgent:
         action_history: list[dict],
         cascade_level: int,
         is_fork: bool = False,
-        remaining_injections: int = 3,
+        recovery_time: bool = False,
         injection_attempt_errors: list[dict] | None = None,
+        trap_state: list[dict] | None = None,
     ) -> dict:
         """Phase 2: 决定是否注入失败。"""
-        system = PHASE2_SYSTEM_FORK if is_fork else PHASE2_SYSTEM
+        system = CONSTRAINED_PHASE2_SYSTEM_FORK if is_fork else CONSTRAINED_PHASE2_SYSTEM
         prompt = build_phase2_prompt(
             task_goal, proposed_action, proposed_params, eb_reasoning,
-            env_state, action_history, cascade_level, is_fork, remaining_injections,
-            injection_attempt_errors,
+            env_state, action_history, cascade_level, is_fork,
+            injection_attempt_errors, trap_state, recovery_time,
         )
         result = self.client.chat_with_image_json(
             system_prompt=system,
             user_text=prompt,
             image=image,
-            required_fields=("inject", "reasoning"),
+            required_fields=("inject", "reasoning", "injection"),
         )
-        if "injection" not in result:
+        if not result.get("inject"):
             result["injection"] = None
+            result["expected_failure"] = None
+            result["recovery_action"] = None
         return result
 
     def evaluate_failure(
@@ -281,11 +310,13 @@ class OracleAgent:
         eb_recovery_reasoning: str,
         eb_counterfactual: str | None,
         eb_proposed_recovery: dict,
+        trap_state: list[dict] | None = None,
     ) -> dict:
         """Phase 4: 评估 EB 的诊断和恢复，决定是否 fork。"""
         prompt = build_phase4_prompt(
             task_goal, error_message, action_history,
             eb_diagnosis, eb_recovery_reasoning, eb_counterfactual, eb_proposed_recovery,
+            trap_state,
         )
         result = self.client.chat_with_image_json(
             system_prompt=PHASE4_SYSTEM,
