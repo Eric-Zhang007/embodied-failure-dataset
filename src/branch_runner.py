@@ -3061,27 +3061,39 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                     objects = env.controller.last_event.metadata.get("objects", [])
                     resolved, warn = resolve_object_ids(a, sp, objects)
                     if warn:
+                        if step_success or not skip_failed:
+                            raise RuntimeError(
+                                f"Replay divergence at {s.get('step_id')}: recorded "
+                                f"{action} could not resolve {a}: {warn}"
+                            )
                         logging.warning(
-                            "replay: MoveSequence step %s (%s) objectId resolution failed at %s: %s",
+                            "replay: expected MoveSequence failure %s (%s) at %s: %s",
                             a, sp.get("objectType", "?"), s.get("step_id"), warn,
                         )
+                        all_ok = False
                         break  # object not found → stop, matches original behavior
                     a, sp = adapt(a, resolved)
                 for _ in range(st.get("repeat", 1)):
                     r = env.step(a, **sp)
                     if not r["success"]:
-                        if skip_failed:
+                        if not step_success and skip_failed:
                             logging.warning(
-                                "replay: MoveSequence step %s skipped at %s: %s",
+                                "replay: expected MoveSequence failure %s at %s: %s",
                                 a, s.get("step_id"), r.get("error", "unknown"),
                             )
                             all_ok = False
                             break
                         raise RuntimeError(
-                            f"Replay MoveSequence step {a} failed at {s.get('step_id')}: {r['error']}"
+                            f"Replay divergence at {s.get('step_id')}: recorded successful "
+                            f"MoveSequence step {a} failed: {r['error']}"
                         )
                 if not all_ok:
                     break
+            if not step_success and all_ok:
+                raise RuntimeError(
+                    f"Replay divergence at {s.get('step_id')}: recorded failed "
+                    "MoveSequence completed successfully"
+                )
             if memory and task_criteria:
                 meta = env.controller.last_event.metadata
                 memory.update(meta, meta.get("objects", []),
@@ -3103,9 +3115,14 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
         else:
             objects = env.controller.last_event.metadata.get("objects", [])
             resolved, warn = resolve_object_ids(action, params, objects)
-            if warn and skip_failed:
+            if warn:
+                if step_success or not skip_failed:
+                    raise RuntimeError(
+                        f"Replay divergence at {s.get('step_id')}: recorded {action} "
+                        f"could not resolve: {warn}"
+                    )
                 logging.warning(
-                    "replay: single action %s (%s) objectId resolution failed at %s: %s",
+                    "replay: expected single-action failure %s (%s) at %s: %s",
                     action, params.get("objectType", "?"), s.get("step_id"), warn,
                 )
                 if memory and task_criteria:
@@ -3122,15 +3139,19 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                           action, r.get("success", False),
                           r.get("error"), task_criteria)
         if not r["success"]:
-            if skip_failed:
+            if not step_success and skip_failed:
                 logging.warning(
-                    "replay: single action %s skipped at %s: %s",
+                    "replay: expected single-action failure %s at %s: %s",
                     action, s.get("step_id"), r.get("error", "unknown"),
                 )
                 continue
             raise RuntimeError(
-                f"Replay failed at {s.get('step_id')}: {action}({s.get('action_params', {})}) "
-                f"-> {r['error']}"
+                f"Replay divergence at {s.get('step_id')}: recorded successful "
+                f"{action}({s.get('action_params', {})}) failed: {r['error']}"
+            )
+        if not step_success:
+            raise RuntimeError(
+                f"Replay divergence at {s.get('step_id')}: recorded failed {action} succeeded"
             )
 
 
