@@ -22,7 +22,7 @@ function Invoke-CollectorWslQuery {
 
     switch ($Kind) {
         'pipeline' {
-            $command = 'ps -eo pid=,comm=,args= | awk ''/[.]venv\/bin\/python scripts\/run_pipeline\.py/ && /--task-lanes/ && /output_collector_7lane_20260726/ {print}'''
+            $command = 'ps -eo pid=,comm=,args= | awk ''/[.]venv\/bin\/python scripts\/run_pipeline\.py/ && /--task-lanes/ && /--output/ {print}'''
         }
         'unity' {
             if ($PipelinePid -le 0) {
@@ -349,7 +349,8 @@ function Invoke-CollectorControl {
 
     Start-Sleep -Seconds 1
     Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchdogPath, '-Once'
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchdogPath, '-Once',
+        '-OutputDir', (Split-Path -Leaf $OutputDir)
     )
     Write-Host 'Collector restart requested through the watchdog.' -ForegroundColor Green
 }
