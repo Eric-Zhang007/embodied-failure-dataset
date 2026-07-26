@@ -259,9 +259,11 @@ class SemanticMemory(MemoryInterface):
                     entry.status = "remembered"
 
         blocker = None
+        blocker_id = None
         blocker_dir = None
         if not success and error_message:
             blocker = self._parse_blocker(error_message)
+            blocker_id = self._parse_blocker_id(error_message)
             if blocker:
                 obs = self._find_or_create_obstacle(blocker)
                 obs.block_count += 1
@@ -276,7 +278,7 @@ class SemanticMemory(MemoryInterface):
         intent_target = intent_parts[1] if len(intent_parts) > 1 else ""
         self._stuck_tracker.update(
             step=self._step_counter, intent=intent_verb, target=intent_target,
-            success=success, blocked_by=blocker, blocked_dir=blocker_dir,
+            success=success, blocked_by=blocker_id or blocker, blocked_dir=blocker_dir,
             action=action,
         )
 
@@ -854,8 +856,9 @@ class SemanticMemory(MemoryInterface):
         return f"a {cleaned.lower()}"
 
     def _parse_blocker(self, error: str) -> str | None:
-        if " is blocking " in error:
-            return self._normalize_entity(error.split(" is blocking ")[0].strip())
+        blocker_id = self._parse_blocker_id(error)
+        if blocker_id:
+            return self._normalize_entity(blocker_id)
         if "blocking" in error.lower():
             parts = error.split(" blocking")
             if parts:
@@ -863,6 +866,14 @@ class SemanticMemory(MemoryInterface):
                 if before:
                     return self._normalize_entity(before[-1].rstrip("."))
         return None
+
+    @staticmethod
+    def _parse_blocker_id(error: str) -> str | None:
+        """Extract the simulator's obstacle ID without MoveSequence prose."""
+        if " is blocking " not in error:
+            return None
+        raw = error.split(" is blocking ", 1)[0].strip()
+        return raw.rsplit(": ", 1)[-1].strip() or None
 
     def _compress_error(self, action: str, error: str) -> str:
         blocker = self._parse_blocker(error)

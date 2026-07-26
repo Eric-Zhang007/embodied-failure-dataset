@@ -124,6 +124,17 @@ class StuckTracker:
             return ""
         return "SITUATION SUMMARY:\n" + "\n".join(f"  {ln}" for ln in lines) + "\n"
 
+    def repeated_obstacle(self, threshold: int = 3) -> str | None:
+        """Return an obstacle repeated across changing intents, if any."""
+        totals: dict[str, int] = {}
+        for (obstacle, _intent, _target), count in self._obstacle_intent_blocks.items():
+            totals[obstacle] = totals.get(obstacle, 0) + count
+        repeated = [
+            (count, obstacle) for obstacle, count in totals.items()
+            if count >= threshold
+        ]
+        return max(repeated)[1] if repeated else None
+
     @staticmethod
     def _age_dicts(last_step: dict, age_limit: int, current_step: int, *dicts):
         stale = [k for k, s in last_step.items() if current_step - s > age_limit]
@@ -338,9 +349,11 @@ class GeometricMemory(MemoryInterface):
 
         # Handle failures: track obstacles
         blocker = None
+        blocker_id = None
         blocker_dir = None
         if not success and error_message:
             blocker = self._parse_blocker(error_message)
+            blocker_id = self._parse_blocker_id(error_message)
             if blocker:
                 obs = self._find_or_create_obstacle(blocker)
                 obs.block_count += 1
@@ -357,7 +370,7 @@ class GeometricMemory(MemoryInterface):
             intent=intent_verb,
             target=intent_target,
             success=success,
-            blocked_by=blocker,
+            blocked_by=blocker_id or blocker,
             blocked_dir=blocker_dir,
             action=action,
         )
@@ -472,9 +485,9 @@ class GeometricMemory(MemoryInterface):
         return f"a {cleaned.lower()}"
 
     def _parse_blocker(self, error: str) -> str | None:
-        if " is blocking " in error:
-            raw = error.split(" is blocking ")[0].strip()
-            return self._normalize_entity(raw)
+        blocker_id = self._parse_blocker_id(error)
+        if blocker_id:
+            return self._normalize_entity(blocker_id)
         if "blocking" in error.lower():
             parts = error.split(" blocking")
             if parts:
@@ -482,6 +495,14 @@ class GeometricMemory(MemoryInterface):
                 if before:
                     return self._normalize_entity(before[-1].rstrip("."))
         return None
+
+    @staticmethod
+    def _parse_blocker_id(error: str) -> str | None:
+        """Extract the simulator's obstacle ID without MoveSequence prose."""
+        if " is blocking " not in error:
+            return None
+        raw = error.split(" is blocking ", 1)[0].strip()
+        return raw.rsplit(": ", 1)[-1].strip() or None
 
     def _compress_error(self, action: str, error: str) -> str:
         blocker = self._parse_blocker(error)

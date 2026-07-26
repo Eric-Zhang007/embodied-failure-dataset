@@ -114,6 +114,7 @@ def _matching_active_trap_id(
     branch_id: str,
     action_or_error: str | None,
     error_message: str | None = None,
+    action_params: dict | None = None,
 ) -> str | None:
     proposed_action = action_or_error if error_message is not None else None
     if error_message is None:
@@ -127,8 +128,16 @@ def _matching_active_trap_id(
             expected_action = expected_failure.get("action")
             if proposed_action and expected_action and proposed_action != expected_action:
                 continue
+            expected_object_id = (trap.get("injection") or {}).get("params", {}).get("object_id")
+            actual_object_id = (action_params or {}).get("objectId")
+            if expected_object_id and actual_object_id and actual_object_id != expected_object_id:
+                continue
             marker = expected_failure.get("error_marker", "").lower()
-            marker_matches = marker and marker in error_text
+            marker_matches = (
+                "already open" in error_text
+                if marker in {"open", "opened", "already open"}
+                else marker and marker in error_text
+            )
             closed_receptacle_matches = (
                 "closed" in error_text and marker in {"not open", "not opened"}
             )
@@ -147,6 +156,15 @@ def _matching_active_trap_id(
         if any(marker and marker in error_text for marker in markers):
             return trap["trap_id"]
     return None
+
+
+def _is_ambiguous_legacy_open_trigger(trap: dict) -> bool:
+    """Identify old bare-'open' traps falsely matched by 'not openable' errors."""
+    if trap.get("status") != "triggered":
+        return False
+    marker = ((trap.get("expected_failure") or {}).get("error_marker") or "").strip().lower()
+    error = (trap.get("env_error") or "").lower()
+    return marker in {"open", "opened"} and "already open" not in error
 
 
 def _branch_trap_state(ep: EpisodeManager, branch_id: str) -> list[dict]:
@@ -489,6 +507,13 @@ class BranchRunner:
 
             memory.set_state_change_callback(semantic_state_callback)
             semantic_state_callback(memory.export_state())
+
+        for trap in _branch_trap_state(ep, config.branch_id):
+            if _is_ambiguous_legacy_open_trigger(trap):
+                ep.invalidate_runtime_trap(
+                    trap["trap_id"],
+                    "legacy bare open marker did not match an already-open error",
+                )
 
         # A resumed episode restores its previous memory snapshot before it
         # replays the physical trap mutation. Reconcile every unresolved trap
@@ -1425,15 +1450,33 @@ class BranchRunner:
                     metadata = seq_result["metadata"]
                     continue
                 elif seq_result.get("partial") or not seq_result.get("all_succeeded"):
+                    if seq_result.get("model_error"):
+                        last_error = "Your previous proposal was not executed. " + seq_msg
+                        nonexecuted_retry_count += 1
+                        self._write_failure_log(failure_log_path, {
+                            "step_index": step_index,
+                            "branch_id": config.branch_id,
+                            "failure_type": "model_invalid_action",
+                            "proposed_action": proposed_action,
+                            "proposed_params": proposed_params,
+                            "error_message": seq_msg,
+                        })
+                        if nonexecuted_retry_count >= max_nonexecuted_retries:
+                            raise RuntimeError(last_error)
+                        continue
                     # MoveSequence failed — build pending step, then Phase 3+4 below
                     cascade_level += 1
                     last_error = seq_msg
-                    image = seq_result.get("frame", image)
-                    metadata = seq_result.get("metadata", metadata)
+                    image = seq_result.get("frame") or image
+                    metadata = seq_result.get("metadata") or metadata
                     result = {"success": False, "error": seq_msg,
                               "frame": image, "metadata": metadata}
                     triggered_trap_id = _matching_active_trap_id(
-                        ep, config.branch_id, seq_msg,
+                        ep,
+                        config.branch_id,
+                        seq_result.get("failed_action"),
+                        seq_msg,
+                        action_params=seq_result.get("failed_params"),
                     )
                     if triggered_trap_id:
                         ep.trigger_runtime_trap(
@@ -1515,6 +1558,19 @@ class BranchRunner:
                     stuck_summary = memory._stuck_tracker.render_summary(step_index) if hasattr(memory, '_stuck_tracker') else ""
                     if stuck_summary:
                         stuck_escalation_count += 1
+                    repeated_obstacle = self._repeated_collision_obstacle(
+                        memory, ep, config.branch_id,
+                    )
+                    if repeated_obstacle:
+                        result_br = BranchResult(
+                            branch_id=config.branch_id,
+                            termination_reason=f"permanent_stuck:{repeated_obstacle}",
+                            total_steps=step_index,
+                            fork_tasks=fork_tasks,
+                            fork_source_step_ids=fork_source_ids,
+                        )
+                        self._finalize(ep, config, result_br, fork_source_ids)
+                        return result_br
                     if stuck_escalation_count >= 5:
                         result_br = BranchResult(branch_id=config.branch_id, termination_reason="permanent_stuck", total_steps=step_index, fork_tasks=fork_tasks, fork_source_step_ids=fork_source_ids)
                         self._finalize(ep, config, result_br, fork_source_ids)
@@ -1584,10 +1640,13 @@ class BranchRunner:
                             recovery_time=True,
                             memory=memory,
                         )
-                        recovery_error = self._validate_standalone_action(
-                            rec_name,
-                            rec_params,
-                            metadata.get("agent", {}).get("cameraHorizon", 0.0),
+                        recovery_error = (
+                            None if rec_name == "LookAround" else
+                            self._validate_standalone_action(
+                                rec_name,
+                                rec_params,
+                                metadata.get("agent", {}).get("cameraHorizon", 0.0),
+                            )
                         )
                         if recovery_error:
                             self._write_failure_log(failure_log_path, {
@@ -1599,26 +1658,29 @@ class BranchRunner:
                             })
                             raise RuntimeError(recovery_error)
 
-                        resolved, warn = resolve_object_ids(
-                            rec_name, rec_params, metadata.get("objects", [])
-                        )
-                        if warn and rec_name in _OBJECT_ACTIONS:
-                            recovery_error = "Your recovery action was not executed. " + warn
-                            self._write_failure_log(failure_log_path, {
-                                "step_index": step_index,
-                                "branch_id": config.branch_id,
-                                "failure_type": "model_unresolved_recovery_object",
-                                "proposed_recovery": rec_action,
-                                "error_message": recovery_error,
-                            })
-                            raise RuntimeError(recovery_error)
-
-                        rec_act, rec_adapt_params = adapt(rec_name, resolved)
-                        rec_result = env.step(rec_act, **rec_adapt_params)
+                        if rec_name == "LookAround":
+                            rec_act, rec_adapt_params = "LookAround", {}
+                            rec_result = self._execute_recovery_lookaround(env)
+                        else:
+                            resolved, warn = resolve_object_ids(
+                                rec_name, rec_params, metadata.get("objects", [])
+                            )
+                            if warn and rec_name in _OBJECT_ACTIONS:
+                                recovery_error = "Your recovery action was not executed. " + warn
+                                self._write_failure_log(failure_log_path, {
+                                    "step_index": step_index,
+                                    "branch_id": config.branch_id,
+                                    "failure_type": "model_unresolved_recovery_object",
+                                    "proposed_recovery": rec_action,
+                                    "error_message": recovery_error,
+                                })
+                                raise RuntimeError(recovery_error)
+                            rec_act, rec_adapt_params = adapt(rec_name, resolved)
+                            rec_result = env.step(rec_act, **rec_adapt_params)
                         recovery_triggered_trap_id = None
                         if not rec_result["success"]:
                             recovery_triggered_trap_id = _matching_active_trap_id(
-                                ep, config.branch_id, rec_act, rec_result.get("error"),
+                                ep, config.branch_id, rec_act, rec_result.get("error"), rec_adapt_params,
                             )
                             if recovery_triggered_trap_id:
                                 ep.trigger_runtime_trap(
@@ -1764,7 +1826,7 @@ class BranchRunner:
             nonexecuted_retry_count = 0
 
             triggered_trap_id = _matching_active_trap_id(
-                ep, config.branch_id, act, result.get("error"),
+                ep, config.branch_id, act, result.get("error"), params,
             )
             if triggered_trap_id:
                 ep.trigger_runtime_trap(
@@ -1851,6 +1913,19 @@ class BranchRunner:
             stuck_summary = memory._stuck_tracker.render_summary(step_index) if hasattr(memory, '_stuck_tracker') else ""
             if stuck_summary:
                 stuck_escalation_count += 1
+            repeated_obstacle = self._repeated_collision_obstacle(
+                memory, ep, config.branch_id,
+            )
+            if repeated_obstacle:
+                result_br = BranchResult(
+                    branch_id=config.branch_id,
+                    termination_reason=f"permanent_stuck:{repeated_obstacle}",
+                    total_steps=step_index,
+                    fork_tasks=fork_tasks,
+                    fork_source_step_ids=fork_source_ids,
+                )
+                self._finalize(ep, config, result_br, fork_source_ids)
+                return result_br
             if stuck_escalation_count >= 5:
                 result_br = BranchResult(
                     branch_id=config.branch_id, termination_reason="permanent_stuck",
@@ -1940,10 +2015,13 @@ class BranchRunner:
                     recovery_time=True,
                     memory=memory,
                 )
-                recovery_error = self._validate_standalone_action(
-                    rec_name,
-                    rec_params,
-                    metadata.get("agent", {}).get("cameraHorizon", 0.0),
+                recovery_error = (
+                    None if rec_name == "LookAround" else
+                    self._validate_standalone_action(
+                        rec_name,
+                        rec_params,
+                        metadata.get("agent", {}).get("cameraHorizon", 0.0),
+                    )
                 )
                 if recovery_error:
                     self._write_failure_log(failure_log_path, {
@@ -1955,26 +2033,29 @@ class BranchRunner:
                     })
                     raise RuntimeError(recovery_error)
 
-                resolved, warn = resolve_object_ids(
-                    rec_name, rec_params, metadata.get("objects", [])
-                )
-                if warn and rec_name in _OBJECT_ACTIONS:
-                    recovery_error = "Your recovery action was not executed. " + warn
-                    self._write_failure_log(failure_log_path, {
-                        "step_index": step_index,
-                        "branch_id": config.branch_id,
-                        "failure_type": "model_unresolved_recovery_object",
-                        "proposed_recovery": rec_action,
-                        "error_message": recovery_error,
-                    })
-                    raise RuntimeError(recovery_error)
-
-                rec_act, rec_adapt_params = adapt(rec_name, resolved)
-                rec_result = env.step(rec_act, **rec_adapt_params)
+                if rec_name == "LookAround":
+                    rec_act, rec_adapt_params = "LookAround", {}
+                    rec_result = self._execute_recovery_lookaround(env)
+                else:
+                    resolved, warn = resolve_object_ids(
+                        rec_name, rec_params, metadata.get("objects", [])
+                    )
+                    if warn and rec_name in _OBJECT_ACTIONS:
+                        recovery_error = "Your recovery action was not executed. " + warn
+                        self._write_failure_log(failure_log_path, {
+                            "step_index": step_index,
+                            "branch_id": config.branch_id,
+                            "failure_type": "model_unresolved_recovery_object",
+                            "proposed_recovery": rec_action,
+                            "error_message": recovery_error,
+                        })
+                        raise RuntimeError(recovery_error)
+                    rec_act, rec_adapt_params = adapt(rec_name, resolved)
+                    rec_result = env.step(rec_act, **rec_adapt_params)
                 recovery_triggered_trap_id = None
                 if not rec_result["success"]:
                     recovery_triggered_trap_id = _matching_active_trap_id(
-                        ep, config.branch_id, rec_act, rec_result.get("error"),
+                        ep, config.branch_id, rec_act, rec_result.get("error"), rec_adapt_params,
                     )
                     if recovery_triggered_trap_id:
                         ep.trigger_runtime_trap(
@@ -2281,8 +2362,10 @@ class BranchRunner:
             (obj for obj in metadata.get("objects", []) if obj.get("objectId") == object_id),
             None,
         )
-        if not target or not target.get("openable"):
+        if not target:
             return None
+        if not target.get("openable"):
+            return f"{target.get('objectType', object_id)} is not openable; choose a valid receptacle."
         is_open = target.get("isOpen")
         if action == "OpenObject" and is_open is True:
             return f"{target.get('objectType', object_id)} is already open; choose the next distinct action."
@@ -2389,6 +2472,41 @@ class BranchRunner:
                 if obj_type:
                     self.critic_guard.mark_receptacle_searched(obj_type)
 
+    @staticmethod
+    def _execute_recovery_lookaround(env) -> dict:
+        """Run the meta recovery action as one complete, pose-preserving scan."""
+        last_result = None
+        for _ in range(4):
+            result = env.step("RotateLeft")
+            if not result.get("success"):
+                return result
+            last_result = result
+        return {
+            "success": True,
+            "error": None,
+            "frame": last_result.get("frame"),
+            "metadata": last_result.get("metadata", {}),
+        }
+
+    @staticmethod
+    def _repeated_collision_obstacle(memory, ep=None, branch_id: str | None = None) -> str | None:
+        """Find a repeated collision using both live memory and resumed history."""
+        tracker = getattr(memory, "_stuck_tracker", None)
+        if ep is not None and branch_id:
+            counts: dict[str, int] = {}
+            for step in ep.get_steps_for_branch(branch_id)[-20:]:
+                error = step.get("error_message") or step.get("error") or ""
+                if " is blocking " not in error:
+                    continue
+                raw = error.split(" is blocking ", 1)[0].strip()
+                obstacle = raw.rsplit(": ", 1)[-1].strip()
+                if obstacle:
+                    counts[obstacle] = counts.get(obstacle, 0) + 1
+            repeated = [(count, obstacle) for obstacle, count in counts.items() if count >= 3]
+            if repeated:
+                return max(repeated)[1]
+        return tracker.repeated_obstacle() if tracker else None
+
     def _execute_move_sequence(self, params, env, metadata, failure_log_path,
                                 branch_id, step_index, episode_id,
                                 eb_reasoning, injection_decision):
@@ -2475,6 +2593,20 @@ class BranchRunner:
                     msg,
                 )
 
+            interaction_error = self._redundant_interaction_error(
+                act, params, final_metadata or metadata,
+            )
+            if interaction_error:
+                desc = " → ".join(executed) if executed else "(nothing)"
+                msg = f"MoveSequence: {desc} did not execute {act}: {interaction_error}"
+                return (
+                    {"success": False, "error": msg, "model_error": True,
+                     "executed": executed, "failed_action": action,
+                     "failed_params": params, "frame": final_frame,
+                     "metadata": final_metadata or metadata},
+                    msg,
+                )
+
             repeat = step.get("repeat", 1)
 
             succeeded = 0
@@ -2519,6 +2651,7 @@ class BranchRunner:
                         )
                         return (
                             {"success": False, "error": msg, "partial": False,
+                             "failed_action": action,
                              "failed_params": params,
                              "frame": result["frame"], "metadata": result["metadata"]},
                             msg,

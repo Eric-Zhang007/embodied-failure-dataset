@@ -92,6 +92,18 @@ class EpisodeManager:
 
         self._mutate(mark_triggered)
 
+    def invalidate_runtime_trap(self, trap_id: str, reason: str):
+        """Retain a legacy false trigger as evidence without treating it as recovered."""
+        def mark_invalid(data):
+            for trap in data["runtime_traps"]:
+                if trap.get("trap_id") == trap_id:
+                    trap["status"] = "invalidated"
+                    trap["invalidation_reason"] = reason
+                    return
+            raise ValueError(f"Runtime trap not found: {trap_id}")
+
+        self._mutate(mark_invalid)
+
     def recover_runtime_trap(
         self,
         branch_id: str,

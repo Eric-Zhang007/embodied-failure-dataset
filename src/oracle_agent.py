@@ -38,6 +38,7 @@ TRAP STATE is the only ground truth for prior mutations. At a normal action, do 
 When injecting, describe the expected failed action/error marker and the recovery action. Use real action names and objectType/objectId parameters. Skip when the state cannot stay recoverable or a similar intervention adds no value.
 For a closed receptacle, use the error marker "closed"; AI2-THOR reports CLOSED rather than "not open".
 For a hidden pickup target, use "specified visibility"; AI2-THOR does not report "not visible" verbatim.
+For an already-open or already-closed state trap, use exactly "already open" or "already closed". Never use bare "open" or "closed" as a marker because those words also occur in unrelated errors such as "not openable".
 
 OUTPUT FORMAT: valid JSON only.
 {
