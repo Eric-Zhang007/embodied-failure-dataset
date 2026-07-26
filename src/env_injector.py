@@ -178,9 +178,11 @@ def _hide_object(
     object_id: str | None = None,
     container_id: str | None = None,
     pddl_params: dict | None = None,
+    require_visible: bool = True,
 ):
     target = _find_first(
-        _objects(controller), object_type, object_id=object_id, visible=True,
+        _objects(controller), object_type, object_id=object_id,
+        visible=True if require_visible else None,
     )
     if not target.get("pickupable"):
         raise ValueError(f"{target['objectId']} is not pickupable")

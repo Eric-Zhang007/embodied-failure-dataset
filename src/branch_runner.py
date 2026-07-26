@@ -66,6 +66,11 @@ def _normalize_recovery_verdict(verdict: object) -> str:
     return "recoverable" if normalized == "recovered" else normalized
 
 
+def _value_or_fallback(value, fallback):
+    """Use fallback only for a missing result, never by testing array truthiness."""
+    return fallback if value is None else value
+
+
 def _sync_memory_after_injection(memory, injection_decision: dict | None) -> None:
     """Keep remembered target locations consistent with successful mutations."""
     if not injection_decision or not injection_decision.get("modification_success"):
@@ -1467,8 +1472,8 @@ class BranchRunner:
                     # MoveSequence failed — build pending step, then Phase 3+4 below
                     cascade_level += 1
                     last_error = seq_msg
-                    image = seq_result.get("frame") or image
-                    metadata = seq_result.get("metadata") or metadata
+                    image = _value_or_fallback(seq_result.get("frame"), image)
+                    metadata = _value_or_fallback(seq_result.get("metadata"), metadata)
                     result = {"success": False, "error": seq_msg,
                               "frame": image, "metadata": metadata}
                     triggered_trap_id = _matching_active_trap_id(
@@ -3016,8 +3021,13 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                 raise RuntimeError(
                     f"Replay injection is malformed at {s.get('step_id')}: {injection!r}"
                 )
+            replay_params = dict(params)
+            if method == "hide_object":
+                # Prior replayed navigation can diverge after a collision. The
+                # saved exact ID still identifies the initial-scene object.
+                replay_params["require_visible"] = False
             injection_result = inject(
-                env.controller, method=method, pddl_params=pddl_params or {}, **params,
+                env.controller, method=method, pddl_params=pddl_params or {}, **replay_params,
             )
             if not injection_result.get("success"):
                 raise RuntimeError(
