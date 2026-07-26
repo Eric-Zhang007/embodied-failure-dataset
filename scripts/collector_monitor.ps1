@@ -334,7 +334,7 @@ function Invoke-CollectorControl {
         foreach ($pidText in $collectorPids) {
             $pid = [int]$pidText
             if (Test-CollectorPidTarget -TargetPid $pid -CollectorPids $collectorPids) {
-                & wsl.exe --distribution Ubuntu --exec bash -lc "kill -INT $pid" 2>$null
+                & wsl.exe --distribution Ubuntu --exec bash -lc "kill -TERM $pid" 2>$null
             }
         }
     }
