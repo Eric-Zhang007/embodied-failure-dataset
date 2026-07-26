@@ -67,6 +67,11 @@ def resolve_object_ids(action: str, params: dict, visible_objects: list[dict]):
     # Resolve objectType → objectId
     if action in _OBJECT_ACTIONS and "objectType" in p:
         ot = p.pop("objectType")
+        # A recovery action may carry both fields: objectType is useful to the
+        # model, while objectId identifies the environment-confirmed object.
+        # Never replace that exact target with the first same-type object.
+        if "objectId" in p:
+            return p, "\n".join(warnings) if warnings else None
         # Prioritize: visible + pickupable, then visible, then pickupable, then any
         candidates = [o for o in visible_objects
                       if o["objectType"] == ot and o.get("visibleBounds2D") and o.get("pickupable")]
