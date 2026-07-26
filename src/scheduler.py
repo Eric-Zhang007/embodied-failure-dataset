@@ -167,10 +167,12 @@ class Scheduler:
             "completed": 0,  # Backward-compatible alias for terminal.
             "skipped": 0,
             "failed": 0,
+            "fork_duplicates": 0,
         }
         self._lock = threading.Lock()
         self._semaphore = threading.Semaphore(max_workers)
         _fork_queue = queue.Queue()
+        admitted_branch_keys = {self._branch_key(task) for task in self.queue}
         for index, task in enumerate(self.queue, start=1):
             task["_fork_queue"] = _fork_queue
             task.setdefault("_display_index", index)
@@ -237,14 +239,16 @@ class Scheduler:
 
                         for fork_task in result.fork_tasks:
                             entry = self._fork_entry(task, fork_task)
-                            total += 1
-                            pending.append(entry)
+                            if self._admit_fork_entry(entry, admitted_branch_keys):
+                                total += 1
+                                pending.append(entry)
 
                     # Drain fork_queue for forks submitted mid-run via callback
                     while not _fork_queue.empty():
                         entry = _fork_queue.get_nowait()
-                        total += 1
-                        pending.append(entry)
+                        if self._admit_fork_entry(entry, admitted_branch_keys):
+                            total += 1
+                            pending.append(entry)
                     self._report(total)
 
         self._print_summary()
@@ -274,10 +278,12 @@ class Scheduler:
             "completed": 0,  # Backward-compatible alias for terminal.
             "skipped": 0,
             "failed": 0,
+            "fork_duplicates": 0,
         }
         self._lock = threading.Lock()
         self._semaphore = threading.Semaphore(len(lane_order))
         fork_queue = queue.Queue()
+        admitted_branch_keys = {self._branch_key(task) for task in self.queue}
         for index, task in enumerate(self.queue, start=1):
             task["_fork_queue"] = fork_queue
             task.setdefault("_display_index", index)
@@ -351,16 +357,18 @@ class Scheduler:
                         for fork_task in reversed(result.fork_tasks):
                             entry = self._fork_entry(task, fork_task)
                             entry["_lane_type"] = task_type
-                            lanes[task_type].appendleft(entry)
-                            total += 1
+                            if self._admit_fork_entry(entry, admitted_branch_keys):
+                                lanes[task_type].appendleft(entry)
+                                total += 1
 
                     while not fork_queue.empty():
                         entry = fork_queue.get_nowait()
                         entry_task_type = entry.get("_lane_type") or entry["meta"].get("alfred_task_type")
                         if entry_task_type in lanes:
                             entry["_lane_type"] = entry_task_type
-                            lanes[entry_task_type].appendleft(entry)
-                            total += 1
+                            if self._admit_fork_entry(entry, admitted_branch_keys):
+                                lanes[entry_task_type].appendleft(entry)
+                                total += 1
 
                     submit_lane(task_type)
                     self._report(total)
@@ -479,6 +487,18 @@ class Scheduler:
         if not os.path.exists(out_file):
             raise FileNotFoundError(f"Episode not found: {out_file}")
         ep = EpisodeManager.load(out_file)
+        if ep.get_steps_for_branch(config.branch_id):
+            logging.warning(
+                "DUPLICATE_FORK_SUPPRESSED episode=%s branch=%s persisted_steps=%d",
+                ep_id, config.branch_id, len(ep.get_steps_for_branch(config.branch_id)),
+            )
+            return BranchResult(
+                branch_id=config.branch_id,
+                termination_reason="skipped_duplicate_fork",
+                total_steps=0,
+                fork_tasks=[],
+                fork_source_step_ids=[],
+            )
         print(f"\n[fork] Starting {config.branch_id} (parent={config.parent_branch_id}) on {ep_id}")
 
         # 收集共享 step
@@ -631,6 +651,29 @@ class Scheduler:
         }
         return entry
 
+    @staticmethod
+    def _branch_key(task: dict) -> tuple[str, str]:
+        config: BranchConfig = task["branch_config"]
+        return config.episode_id, config.branch_id
+
+    def _admit_fork_entry(self, entry: dict, admitted_branch_keys: set[tuple[str, str]]) -> bool:
+        """Allow each persisted branch identity to execute exactly once per run.
+
+        BranchRunner reports a new fork twice: once immediately via its callback
+        and once in its final BranchResult.  Both paths are intentional, but they
+        must converge before a worker starts writing the branch trajectory.
+        """
+        key = self._branch_key(entry)
+        if key in admitted_branch_keys:
+            self.stats["fork_duplicates"] += 1
+            logging.warning(
+                "DUPLICATE_FORK_SUPPRESSED episode=%s branch=%s",
+                key[0], key[1],
+            )
+            return False
+        admitted_branch_keys.add(key)
+        return True
+
     def _report(self, total: int):
         done = self.stats["terminal"] + self.stats["failed"] + self.stats["skipped"]
         remaining = total - done
@@ -638,7 +681,8 @@ class Scheduler:
         print(
             f"\r[{done}/{total}] {self.stats['task_complete']} task_complete, "
             f"{non_success_terminal} terminal_non_success, {remaining} remaining, "
-            f"{self.stats['failed']} worker_failed, {self.stats['skipped']} skipped",
+            f"{self.stats['failed']} worker_failed, {self.stats['skipped']} skipped, "
+            f"{self.stats['fork_duplicates']} fork_duplicates",
             end="",
             flush=True,
         )
@@ -648,5 +692,6 @@ class Scheduler:
         print(
             f"\n\nDone. {self.stats['task_complete']} task_complete, "
             f"{non_success_terminal} terminal_non_success, "
-            f"{self.stats['failed']} worker_failed, {self.stats['skipped']} skipped."
+            f"{self.stats['failed']} worker_failed, {self.stats['skipped']} skipped, "
+            f"{self.stats['fork_duplicates']} fork_duplicates."
         )
