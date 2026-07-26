@@ -2908,9 +2908,9 @@ def _check_and_mark_searched(
     Called at intent transition. Triggers when:
     - Old intent had a target (old_target != "").
     - New intent targets something different (old_target != new_target).
-    - The intent involved receptacle interaction (OpenObject/CloseObject)
-      OR the intent phrase suggests approach/check/open/close/search behaviour
-      AND the last step succeeded (prevents marking on failures).
+    - The intent actually interacted with a receptacle (OpenObject/CloseObject).
+      A completed approach records a visit, but does not claim the receptacle
+      was searched.
 
     C1 fix: resolves the specific objectId from the intent's step history
     before marking, so that only the interacted-with instance is marked,
@@ -2920,8 +2920,6 @@ def _check_and_mark_searched(
 
     old_target = completed_intent.get("target", "")
     old_intent = completed_intent.get("intent", "")
-    completed_ok = completed_intent.get("completed", False)
-
     if not old_target:
         return
     if old_target == new_target:
@@ -2943,37 +2941,31 @@ def _check_and_mark_searched(
         if had_receptacle_interaction:
             break
 
-    # ----- detect approach / already-open patterns -----
-    _RECEPTACLE_INTENT_KW = ("approach", "open", "close", "check", "search", "look")
-    is_receptacle_intent = any(
-        kw in old_intent.lower() for kw in _RECEPTACLE_INTENT_KW
-    )
+    if not had_receptacle_interaction:
+        if enable_curiosity:
+            memory.record_receptacle_visit(old_target)
+        return
 
-    if had_receptacle_interaction or (is_receptacle_intent and completed_ok):
+    if had_receptacle_interaction:
         # C1: resolve to specific objectId when possible
         specific_id = _extract_object_id_from_intent(completed_intent)
         if specific_id:
             count = memory.mark_searched(object_id=specific_id)
             if count > 0:
                 logging.debug(
-                    "marked objectId '%s' as SEARCHED "
-                    "(intent='%s' completed=%s interaction=%s)",
-                    specific_id, old_intent, completed_ok, had_receptacle_interaction,
+                    "marked objectId '%s' as SEARCHED (intent='%s')",
+                    specific_id, old_intent,
                 )
         else:
-            count = memory.mark_searched(object_type=old_target)
-            if count > 0:
-                logging.warning(
-                    "C1 fallback: no specific objectId found for intent '%s' "
-                    "target='%s' — marked %d instance(s) by objectType only",
-                    old_intent, old_target, count,
-                )
+            logging.debug(
+                "C1 skipped searched marker without exact objectId "
+                "(intent='%s', target='%s')",
+                old_intent, old_target,
+            )
 
         # ── Spike 003: Curiosity Scoreboard visitation tracking ──
         if enable_curiosity:
-            memory.record_receptacle_visit(old_target)
-            if had_receptacle_interaction:
-                memory.record_receptacle_open(old_target)
+            memory.record_receptacle_open(old_target)
 
 
 # ======================================================================
