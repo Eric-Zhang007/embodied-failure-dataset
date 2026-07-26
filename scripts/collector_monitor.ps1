@@ -223,7 +223,7 @@ function Get-CollectorSnapshot {
     if (Test-Path -LiteralPath $logPath) {
         $recentEvents = @(
             Get-Content -LiteralPath $logPath -Tail 1000 -ErrorAction SilentlyContinue |
-                Where-Object { $_ -match '\[fork\]|RETRY |CRASH |Worker for |TIMEOUT_EXHAUSTED' } |
+                Where-Object { $_ -match '\[fork\]|RETRY |CRASH |Worker for |TIMEOUT_EXHAUSTED|API_OUTAGE' } |
                 Select-Object -Last 6
         )
     }

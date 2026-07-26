@@ -60,6 +60,7 @@ class Scheduler:
             config.planner_model, config.api_key,
             base_url=config.api_base_url,
             reasoning_effort=config.planner_reasoning_effort,
+            recover_api_outages=False,
         )
         _t0 = _time.time()
         try:

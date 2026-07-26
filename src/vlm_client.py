@@ -96,12 +96,13 @@ class VLMClient:
         _api_log_dir = Path(log_dir) if log_dir else None
 
     def __init__(self, backend: str, model: str, base_url: str = None, api_key: str = None,
-                 reasoning_effort: str | None = None):
+                 reasoning_effort: str | None = None, recover_api_outages: bool = True):
         self.backend = backend
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.reasoning_effort = reasoning_effort  # "low" | "medium" | "high" | "xhigh" | "max"
+        self.recover_api_outages = recover_api_outages
 
     # ------------------------------------------------------------------
     # 工厂方法
@@ -120,11 +121,13 @@ class VLMClient:
 
     @classmethod
     def openai(cls, model: str = "gpt-5", api_key: str = None, base_url: str = None,
-               reasoning_effort: str | None = None) -> "VLMClient":
+               reasoning_effort: str | None = None,
+               recover_api_outages: bool = True) -> "VLMClient":
         key = api_key or os.environ.get("OPENAI_API_KEY", "")
         url = base_url or "https://api.openai.com/v1"
         return cls(backend="openai", model=model, base_url=url, api_key=key,
-                   reasoning_effort=reasoning_effort)
+                   reasoning_effort=reasoning_effort,
+                   recover_api_outages=recover_api_outages)
 
     @classmethod
     def siliconflow(cls, model: str, api_key: str,
@@ -482,6 +485,8 @@ class VLMClient:
                         logger.warning("RATE_LIMIT retry %d/%d wait %ds", transport_attempt, max_transport, wait)
                         time.sleep(wait)
                         continue
+                    if not self.recover_api_outages:
+                        resp.raise_for_status()
                     backoff_s = _api_outage_backoff_s()
                     logger.warning(
                         "API_OUTAGE rate limit exhausted short retries; retrying in %.1fs",
@@ -499,7 +504,9 @@ class VLMClient:
                                        transport_attempt, max_transport, resp.status_code, wait)
                         time.sleep(wait)
                         continue
-                    # Keep the task alive while an unavailable endpoint recovers.
+                    # Keep collection tasks alive while an unavailable endpoint recovers.
+                    if not self.recover_api_outages:
+                        resp.raise_for_status()
                     backoff_s = _api_outage_backoff_s()
                     logger.warning(
                         "API_OUTAGE status=%d exhausted short retries; retrying in %.1fs",
@@ -516,7 +523,7 @@ class VLMClient:
                                    transport_attempt, max_transport, resp.status_code, wait)
                     time.sleep(wait)
                     continue
-                if resp.status_code in {401, 402, 403}:
+                if resp.status_code in {401, 402, 403} and self.recover_api_outages:
                     backoff_s = _api_outage_backoff_s()
                     logger.warning(
                         "API_OUTAGE status=%d exhausted short retries; retrying in %.1fs",
@@ -536,6 +543,8 @@ class VLMClient:
                 if transport_attempt < max_transport:
                     time.sleep(min(transport_attempt * 0.5, 3.0))
                     continue
+                if not self.recover_api_outages:
+                    break
                 backoff_s = _api_outage_backoff_s()
                 logger.warning(
                     "API_OUTAGE connection exhausted short retries; retrying in %.1fs",
@@ -552,6 +561,8 @@ class VLMClient:
                               self.model, transport_attempt, max_transport, timeout, elapsed)
                 if transport_attempt < max_transport:
                     continue
+                if not self.recover_api_outages:
+                    raise
                 backoff_s = _api_outage_backoff_s()
                 logger.warning(
                     "API_OUTAGE timeout exhausted short retries; retrying in %.1fs",
