@@ -176,8 +176,7 @@ Your job:
 6. Decide whether to create a fork branch to test the counterfactual
 
 Recovery verdict meanings:
-- "recovered": the proposed recovery action successfully resolves the current failure
-- "recoverable": recovery not yet achieved but the task is still achievable
+- "recoverable": the proposed recovery action should resolve the current failure and the task is still achievable
 - "unrecoverable": the task goal is permanently unreachable OR the agent is stuck in a dead loop.
 
 DEAD LOOP DETECTION: If the agent has repeated the SAME failed action 5+ times in recent history (e.g., MoveAhead blocked by the same obstacle 5+ times, or PickupObject failing on the same objectId 3+ times), and continues to try the same approach without changing strategy, the task is UNRECOVERABLE. A stuck agent that cannot adapt its behavior is effectively deadlocked. Mark such cases as "unrecoverable".
@@ -207,7 +206,7 @@ OUTPUT FORMAT — VALID JSON ONLY:
     "alternative_action": {"action": "<action>", "params": {}},
     "reasoning": "<1 sentence: why this would have prevented the failure>"
   } or null,
-  "recovery_verdict": "recovered" / "recoverable" / "unrecoverable",
+  "recovery_verdict": "recoverable" / "unrecoverable",
   "should_fork": true/false,
   "fork_reasoning": "<why fork or not>" or null
 }"""

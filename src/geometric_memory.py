@@ -736,6 +736,17 @@ class GeometricMemory(MemoryInterface):
         self.objects_found_by_receptacle[receptacle_type] = \
             self.objects_found_by_receptacle.get(receptacle_type, 0) + 1
 
+    def record_hidden_object(self, object_id: str, container_id: str) -> bool:
+        """Move a remembered object to the container used by a successful trap."""
+        entry = self._objects.get(object_id)
+        if entry is None:
+            return False
+        entry.parent_receptacle_id = container_id
+        entry.status = "remembered"
+        entry.last_seen_step = self._step_counter
+        entry.searched = False
+        return True
+
     def get_receptacle_entries_for_curiosity(self) -> list[dict]:
         """Return all known receptacle entries as a list of dicts suitable for
         consumption by curiosity_scorer.build_curiosity_table_text().

@@ -80,6 +80,9 @@ class MemoryInterface:
     def record_object_discovered_in(self, receptacle_type: str) -> None:
         pass
 
+    def record_hidden_object(self, object_id: str, container_id: str) -> bool:
+        return False
+
     def get_receptacle_entries_for_curiosity(self) -> list[dict]:
         return []
 

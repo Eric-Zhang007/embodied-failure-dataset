@@ -60,6 +60,27 @@ def _requires_oracle_injection(action: str, params: dict | None) -> bool:
     )
 
 
+def _normalize_recovery_verdict(verdict: object) -> str:
+    """Normalize the Oracle's legacy success label before control flow uses it."""
+    normalized = str(verdict or "").strip().lower()
+    return "recoverable" if normalized == "recovered" else normalized
+
+
+def _sync_memory_after_injection(memory, injection_decision: dict | None) -> None:
+    """Keep remembered target locations consistent with successful mutations."""
+    if not injection_decision or not injection_decision.get("modification_success"):
+        return
+    injection = injection_decision.get("injection") or {}
+    if injection.get("method") != "hide_object":
+        return
+    params = injection.get("params") or {}
+    object_id = params.get("object_id")
+    container_id = params.get("container_id")
+    record_hidden_object = getattr(memory, "record_hidden_object", None)
+    if object_id and container_id and callable(record_hidden_object):
+        record_hidden_object(object_id, container_id)
+
+
 def _initial_state_satisfies_goal(metadata: dict, meta: dict) -> bool:
     """Identify trajectories whose reset scene already satisfies their goal."""
     complete, _ = check_task_complete(metadata, meta)
@@ -279,6 +300,7 @@ class BranchRunner:
         cascade_level: int,
         failure_log_path: str,
         recovery_time: bool,
+        memory,
     ) -> dict | None:
         """Ask Oracle for one raw mutation and persist its factual setup result."""
         if not self.enable_phase2:
@@ -372,6 +394,10 @@ class BranchRunner:
                 "modification_error": result.get("error"),
             }
 
+        _sync_memory_after_injection(memory, {
+            "modification_success": True,
+            "injection": injection,
+        })
         trap = {
             "trap_id": f"trap_{config.branch_id}_{step_index}_{len(trap_state)}",
             "branch_id": config.branch_id,
@@ -463,6 +489,13 @@ class BranchRunner:
 
             memory.set_state_change_callback(semantic_state_callback)
             semantic_state_callback(memory.export_state())
+
+        # A resumed episode restores its previous memory snapshot before it
+        # replays the physical trap mutation. Reconcile every unresolved trap
+        # so an old snapshot cannot keep pointing at the pre-trap location.
+        for trap in _branch_trap_state(ep, config.branch_id):
+            if trap.get("status") in {"active", "triggered"}:
+                _sync_memory_after_injection(memory, trap)
 
         def defer_semantic_snapshot():
             if semantic_state_callback:
@@ -1208,6 +1241,7 @@ class BranchRunner:
                 cascade_level=cascade_level,
                 failure_log_path=failure_log_path,
                 recovery_time=False,
+                memory=memory,
             )
             # ==========================================================
             # LookAround: 站原地旋转 4 次，截 4 张图发给 EB 做多图综合分析。
@@ -1460,6 +1494,9 @@ class BranchRunner:
                         eb_proposed_recovery=eb_phase3.get("proposed_recovery_action", {}),
                         trap_state=_branch_trap_state(ep, config.branch_id),
                     )
+                    oracle_phase4["recovery_verdict"] = _normalize_recovery_verdict(
+                        oracle_phase4.get("recovery_verdict")
+                    )
                     step_entry = pending_step
                     step_entry["eb_diagnosis"] = eb_phase3.get("diagnosis")
                     step_entry["eb_recovery_reasoning"] = eb_phase3.get("recovery_reasoning")
@@ -1545,6 +1582,7 @@ class BranchRunner:
                             cascade_level=cascade_level,
                             failure_log_path=failure_log_path,
                             recovery_time=True,
+                            memory=memory,
                         )
                         recovery_error = self._validate_standalone_action(
                             rec_name,
@@ -1792,6 +1830,9 @@ class BranchRunner:
                 eb_proposed_recovery=eb_phase3.get("proposed_recovery_action", {}),
                 trap_state=_branch_trap_state(ep, config.branch_id),
             )
+            oracle_phase4["recovery_verdict"] = _normalize_recovery_verdict(
+                oracle_phase4.get("recovery_verdict")
+            )
 
             step_entry = pending_step
             step_entry["eb_diagnosis"] = eb_phase3.get("diagnosis")
@@ -1897,6 +1938,7 @@ class BranchRunner:
                     cascade_level=cascade_level,
                     failure_log_path=failure_log_path,
                     recovery_time=True,
+                    memory=memory,
                 )
                 recovery_error = self._validate_standalone_action(
                     rec_name,

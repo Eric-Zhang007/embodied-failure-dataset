@@ -390,10 +390,10 @@ class SemanticMemory(MemoryInterface):
                 f"{age} steps ago" if age < 30 else "a long time ago"
             )
             parent = self._lookup_parent_label(e.parent_receptacle_id)
-            loc = f"inside {parent}" if parent else f"{e.egocentric_dir}, ~{e.egocentric_dist:.1f}m"
+            loc = f"at {parent}" if parent else f"{e.egocentric_dir}, ~{e.egocentric_dist:.1f}m"
             lines.append(f"  ▸ {e.object_type} — last seen {freshness} {loc}.")
             if parent and not self._is_receptacle_visible(parent):
-                lines.append(f"    I should try opening {parent} and looking inside.")
+                lines.append(f"    I should re-locate it around {parent} before interacting.")
 
         # ── Failure saturation: if I've failed to interact with the target at
         #     its last known location repeatedly, append a confidence-lowering hint.
@@ -800,6 +800,19 @@ class SemanticMemory(MemoryInterface):
         self.objects_found_by_receptacle[receptacle_type] = \
             self.objects_found_by_receptacle.get(receptacle_type, 0) + 1
         self._state_changed()
+
+    def record_hidden_object(self, object_id: str, container_id: str) -> bool:
+        """Record a successful hide-object mutation without retaining its old location."""
+        entry = self._objects.get(object_id)
+        if entry is None:
+            return False
+        entry.parent_receptacle_id = container_id
+        entry.status = "remembered"
+        entry.last_seen_step = self._step_counter
+        entry.searched = False
+        self._searched_types.pop(entry.object_type, None)
+        self._state_changed()
+        return True
 
     def get_receptacle_entries_for_curiosity(self) -> list[dict]:
         entries = []
