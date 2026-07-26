@@ -3050,7 +3050,6 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
 
         # MoveSequence: expand and replay individual steps
         if action == "MoveSequence":
-            objects = env.controller.last_event.metadata.get("objects", [])
             seq_steps = params.get("steps", [])
             all_ok = True
             for st in seq_steps:
@@ -3059,6 +3058,7 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                 if a in _META_ACTIONS:
                     break  # meta-action in sequence → stop, matches _execute_move_sequence
                 if a not in _MOVEMENT:
+                    objects = env.controller.last_event.metadata.get("objects", [])
                     resolved, warn = resolve_object_ids(a, sp, objects)
                     if warn:
                         logging.warning(
@@ -3067,18 +3067,21 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                         )
                         break  # object not found → stop, matches original behavior
                     a, sp = adapt(a, resolved)
-                r = env.step(a, **sp)
-                if not r["success"]:
-                    if skip_failed:
-                        logging.warning(
-                            "replay: MoveSequence step %s skipped at %s: %s",
-                            a, s.get("step_id"), r.get("error", "unknown"),
+                for _ in range(st.get("repeat", 1)):
+                    r = env.step(a, **sp)
+                    if not r["success"]:
+                        if skip_failed:
+                            logging.warning(
+                                "replay: MoveSequence step %s skipped at %s: %s",
+                                a, s.get("step_id"), r.get("error", "unknown"),
+                            )
+                            all_ok = False
+                            break
+                        raise RuntimeError(
+                            f"Replay MoveSequence step {a} failed at {s.get('step_id')}: {r['error']}"
                         )
-                        all_ok = False
-                        break  # partial execution accepted, stop here
-                    raise RuntimeError(
-                        f"Replay MoveSequence step {a} failed at {s.get('step_id')}: {r['error']}"
-                    )
+                if not all_ok:
+                    break
             if memory and task_criteria:
                 meta = env.controller.last_event.metadata
                 memory.update(meta, meta.get("objects", []),
