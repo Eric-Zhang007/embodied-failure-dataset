@@ -40,6 +40,15 @@ def _openai_request_policy() -> tuple[float, int]:
     return max(1.0, timeout_s), max(1, max_attempts)
 
 
+def _api_outage_backoff_s() -> float:
+    """Return the wait before probing a temporarily unavailable API again."""
+    try:
+        backoff_s = float(os.environ.get("EFD_API_OUTAGE_BACKOFF_S", "120"))
+    except ValueError:
+        backoff_s = 120.0
+    return max(1.0, backoff_s)
+
+
 def _get_api_log_path() -> Path:
     """Return the api_calls.jsonl path. Uses per-test dir if set, else global."""
     base = _api_log_dir or LOG_DIR
@@ -468,9 +477,18 @@ class VLMClient:
                 # 429: rate limited - wait and retry
                 if resp.status_code == 429:
                     self._write_api_exchange(body, 429, resp.text, elapsed, transport_attempt)
-                    wait = 5 * transport_attempt
-                    logger.warning("RATE_LIMIT retry %d/%d wait %ds", transport_attempt, max_transport, wait)
-                    time.sleep(wait)
+                    if transport_attempt < max_transport:
+                        wait = 5 * transport_attempt
+                        logger.warning("RATE_LIMIT retry %d/%d wait %ds", transport_attempt, max_transport, wait)
+                        time.sleep(wait)
+                        continue
+                    backoff_s = _api_outage_backoff_s()
+                    logger.warning(
+                        "API_OUTAGE rate limit exhausted short retries; retrying in %.1fs",
+                        backoff_s,
+                    )
+                    time.sleep(backoff_s)
+                    transport_attempt = 0
                     continue
                 # 5xx: server errors (502/503/504/524) — transient, retry with backoff
                 if resp.status_code >= 500:
@@ -481,9 +499,15 @@ class VLMClient:
                                        transport_attempt, max_transport, resp.status_code, wait)
                         time.sleep(wait)
                         continue
-                    # All retries exhausted — dump and raise
-                    self._dump_failure(body, resp.status_code, resp.text, elapsed)
-                    resp.raise_for_status()
+                    # Keep the task alive while an unavailable endpoint recovers.
+                    backoff_s = _api_outage_backoff_s()
+                    logger.warning(
+                        "API_OUTAGE status=%d exhausted short retries; retrying in %.1fs",
+                        resp.status_code, backoff_s,
+                    )
+                    time.sleep(backoff_s)
+                    transport_attempt = 0
+                    continue
                 # Other errors (4xx client errors / relay glitches): retry, then dump and raise
                 self._write_api_exchange(body, resp.status_code, resp.text, elapsed, transport_attempt)
                 if transport_attempt < max_transport:
@@ -491,6 +515,15 @@ class VLMClient:
                     logger.warning("CLIENT_ERR retry %d/%d status=%d wait=%ds",
                                    transport_attempt, max_transport, resp.status_code, wait)
                     time.sleep(wait)
+                    continue
+                if resp.status_code in {401, 402, 403}:
+                    backoff_s = _api_outage_backoff_s()
+                    logger.warning(
+                        "API_OUTAGE status=%d exhausted short retries; retrying in %.1fs",
+                        resp.status_code, backoff_s,
+                    )
+                    time.sleep(backoff_s)
+                    transport_attempt = 0
                     continue
                 self._dump_failure(body, resp.status_code, resp.text, elapsed)
                 resp.raise_for_status()
@@ -502,6 +535,15 @@ class VLMClient:
                 logger.warning("CONN_ERR model=%s attempt=%d/%d error=%s", self.model, transport_attempt, max_transport, e)
                 if transport_attempt < max_transport:
                     time.sleep(min(transport_attempt * 0.5, 3.0))
+                    continue
+                backoff_s = _api_outage_backoff_s()
+                logger.warning(
+                    "API_OUTAGE connection exhausted short retries; retrying in %.1fs",
+                    backoff_s,
+                )
+                time.sleep(backoff_s)
+                transport_attempt = 0
+                continue
 
             except requests.exceptions.Timeout:
                 elapsed = time.time() - t_start
@@ -510,14 +552,16 @@ class VLMClient:
                               self.model, transport_attempt, max_transport, timeout, elapsed)
                 if transport_attempt < max_transport:
                     continue
-                self._dump_failure(body, "TIMEOUT_EXHAUSTED",
-                                   f"All retries exhausted, last timeout={timeout}s", elapsed)
-                raise
+                backoff_s = _api_outage_backoff_s()
+                logger.warning(
+                    "API_OUTAGE timeout exhausted short retries; retrying in %.1fs",
+                    backoff_s,
+                )
+                time.sleep(backoff_s)
+                transport_attempt = 0
+                continue
 
-        # ConnectionError 重试全部失败
-        elapsed = time.time() - t_start
-        self._dump_failure(body, "CONNECTION_EXHAUSTED", str(last_conn_error), elapsed)
-        raise RuntimeError(f"API unreachable after {max_transport} attempts: {last_conn_error}")
+        raise RuntimeError(f"API request ended unexpectedly: {last_conn_error}")
 
     def _dump_failure(self, body: dict, status, response_text: str, elapsed: float):
         """失败时把完整请求体写到日志文件。"""
