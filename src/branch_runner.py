@@ -22,6 +22,7 @@ from src.context_builder import build_branch_history
 from src.egocentric_memory import EgocentricMemory, SearchTrail
 from src.semantic_memory import SemanticMemory
 from src.critic_guard import CriticGuard
+from src.collision_guard import CollisionGuard
 
 _VALID_ACTIONS = {
     "MoveAhead", "MoveBack", "MoveLeft", "MoveRight", "RotateLeft", "RotateRight", "LookUp", "LookDown",
@@ -488,6 +489,7 @@ class BranchRunner:
         fork_tasks: list[dict] = []
         fork_source_ids: list[str] = []
         last_error: Optional[str] = None
+        collision_guard = CollisionGuard()
 
         # ── Propagate ablation flags to eb_agent ──
         self.eb_agent.enable_intent_dedup = self.enable_intent_dedup
@@ -1446,6 +1448,34 @@ class BranchRunner:
                 if horizon_error:
                     raise RuntimeError(horizon_error)
 
+                collision_error = self._collision_guard_error(
+                    collision_guard, proposed_action, proposed_params, metadata,
+                )
+                if collision_error:
+                    last_error = "Your previous proposal was not executed. " + collision_error
+                    nonexecuted_retry_count += 1
+                    self._write_failure_log(failure_log_path, {
+                        "step_index": step_index,
+                        "branch_id": config.branch_id,
+                        "failure_type": "policy_guard_repeated_collision",
+                        "proposed_action": proposed_action,
+                        "proposed_params": proposed_params,
+                        "eb_reasoning": eb_reasoning,
+                        "error_message": last_error,
+                        "retry_attempt": nonexecuted_retry_count,
+                    })
+                    if nonexecuted_retry_count >= max_nonexecuted_retries:
+                        result_br = BranchResult(
+                            branch_id=config.branch_id,
+                            termination_reason="policy_guard_repeated_collision",
+                            total_steps=step_index,
+                            fork_tasks=fork_tasks,
+                            fork_source_step_ids=fork_source_ids,
+                        )
+                        self._finalize(ep, config, result_br, fork_source_ids)
+                        return result_br
+                    continue
+
                 seq_result, seq_msg = self._execute_move_sequence(
                     proposed_params, env, metadata, failure_log_path,
                     config.branch_id, step_index, ep.episode_id,
@@ -1495,6 +1525,9 @@ class BranchRunner:
                     last_error = seq_msg
                     image = _value_or_fallback(seq_result.get("frame"), image)
                     metadata = _value_or_fallback(seq_result.get("metadata"), metadata)
+                    collision_guard.record_navigation_failure(
+                        seq_result.get("failed_action", ""), seq_msg, metadata,
+                    )
                     result = {"success": False, "error": seq_msg,
                               "frame": image, "metadata": metadata}
                     triggered_trap_id = _matching_active_trap_id(
@@ -1702,6 +1735,36 @@ class BranchRunner:
                                 })
                                 raise RuntimeError(recovery_error)
                             rec_act, rec_adapt_params = adapt(rec_name, resolved)
+                            recovery_collision_error = self._collision_guard_error(
+                                collision_guard, rec_act, rec_adapt_params, metadata,
+                            )
+                            if recovery_collision_error:
+                                last_error = (
+                                    "Your recovery action was not executed. "
+                                    + recovery_collision_error
+                                )
+                                nonexecuted_retry_count += 1
+                                self._write_failure_log(failure_log_path, {
+                                    "step_index": step_index,
+                                    "branch_id": config.branch_id,
+                                    "failure_type": "policy_guard_repeated_recovery_collision",
+                                    "proposed_recovery": rec_action,
+                                    "action": rec_act,
+                                    "action_params": rec_adapt_params,
+                                    "error_message": last_error,
+                                    "retry_attempt": nonexecuted_retry_count,
+                                })
+                                if nonexecuted_retry_count >= max_nonexecuted_retries:
+                                    result_br = BranchResult(
+                                        branch_id=config.branch_id,
+                                        termination_reason="policy_guard_repeated_collision",
+                                        total_steps=step_index,
+                                        fork_tasks=fork_tasks,
+                                        fork_source_step_ids=fork_source_ids,
+                                    )
+                                    self._finalize(ep, config, result_br, fork_source_ids)
+                                    return result_br
+                                continue
                             rec_result = env.step(rec_act, **rec_adapt_params)
                         recovery_triggered_trap_id = None
                         if not rec_result["success"]:
@@ -1717,6 +1780,10 @@ class BranchRunner:
                         if rec_result.get("frame") is None:
                             rec_result["frame"] = image
                         rec_metadata = rec_result.get("metadata", metadata)
+                        if not rec_result["success"]:
+                            collision_guard.record_navigation_failure(
+                                rec_act, rec_result.get("error"), rec_metadata,
+                            )
                         defer_semantic_snapshot()
                         memory.update(
                             rec_metadata, rec_metadata.get("objects", []), rec_act,
@@ -1805,6 +1872,36 @@ class BranchRunner:
                     raise RuntimeError(last_error)
                 continue
 
+            collision_error = self._collision_guard_error(
+                collision_guard, act, params, metadata,
+            )
+            if collision_error:
+                last_error = "Your previous proposal was not executed. " + collision_error
+                nonexecuted_retry_count += 1
+                self._write_failure_log(failure_log_path, {
+                    "step_index": step_index,
+                    "branch_id": config.branch_id,
+                    "failure_type": "policy_guard_repeated_collision",
+                    "proposed_action": proposed_action,
+                    "proposed_params": proposed_params,
+                    "action": act,
+                    "action_params": params,
+                    "eb_reasoning": eb_reasoning,
+                    "error_message": last_error,
+                    "retry_attempt": nonexecuted_retry_count,
+                })
+                if nonexecuted_retry_count >= max_nonexecuted_retries:
+                    result_br = BranchResult(
+                        branch_id=config.branch_id,
+                        termination_reason="policy_guard_repeated_collision",
+                        total_steps=step_index,
+                        fork_tasks=fork_tasks,
+                        fork_source_step_ids=fork_source_ids,
+                    )
+                    self._finalize(ep, config, result_br, fork_source_ids)
+                    return result_br
+                continue
+
             try:
                 result = env.step(act, **params)
             except Exception as exc:
@@ -1864,6 +1961,7 @@ class BranchRunner:
             last_error = result["error"]
             image = result.get("frame", image)
             metadata = result.get("metadata", metadata)
+            collision_guard.record_navigation_failure(act, result.get("error"), metadata)
             defer_semantic_snapshot()
             memory.update(result.get("metadata", metadata), result.get("metadata", metadata).get("objects", []), act, False, result["error"], task_criteria, f"{intent} {intent_target}".strip())
 
@@ -2077,6 +2175,36 @@ class BranchRunner:
                         })
                         raise RuntimeError(recovery_error)
                     rec_act, rec_adapt_params = adapt(rec_name, resolved)
+                    recovery_collision_error = self._collision_guard_error(
+                        collision_guard, rec_act, rec_adapt_params, metadata,
+                    )
+                    if recovery_collision_error:
+                        last_error = (
+                            "Your recovery action was not executed. "
+                            + recovery_collision_error
+                        )
+                        nonexecuted_retry_count += 1
+                        self._write_failure_log(failure_log_path, {
+                            "step_index": step_index,
+                            "branch_id": config.branch_id,
+                            "failure_type": "policy_guard_repeated_recovery_collision",
+                            "proposed_recovery": rec_action,
+                            "action": rec_act,
+                            "action_params": rec_adapt_params,
+                            "error_message": last_error,
+                            "retry_attempt": nonexecuted_retry_count,
+                        })
+                        if nonexecuted_retry_count >= max_nonexecuted_retries:
+                            result_br = BranchResult(
+                                branch_id=config.branch_id,
+                                termination_reason="policy_guard_repeated_collision",
+                                total_steps=step_index,
+                                fork_tasks=fork_tasks,
+                                fork_source_step_ids=fork_source_ids,
+                            )
+                            self._finalize(ep, config, result_br, fork_source_ids)
+                            return result_br
+                        continue
                     rec_result = env.step(rec_act, **rec_adapt_params)
                 recovery_triggered_trap_id = None
                 if not rec_result["success"]:
@@ -2092,6 +2220,10 @@ class BranchRunner:
                 if rec_result.get("frame") is None:
                     rec_result["frame"] = image
                 rec_metadata = rec_result.get("metadata", metadata)
+                if not rec_result["success"]:
+                    collision_guard.record_navigation_failure(
+                        rec_act, rec_result.get("error"), rec_metadata,
+                    )
                 defer_semantic_snapshot()
                 memory.update(
                     rec_metadata, rec_metadata.get("objects", []), rec_act,
@@ -2298,6 +2430,19 @@ class BranchRunner:
     def _write_failure_log(self, path: str, event: dict):
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _collision_guard_error(
+        collision_guard: CollisionGuard,
+        action: str,
+        params: dict | None,
+        metadata: dict,
+    ) -> str | None:
+        """Block only an exact retry of a confirmed physical collision."""
+        if action == "MoveSequence":
+            steps = params.get("steps") if isinstance(params, dict) else None
+            return collision_guard.blocked_sequence_reason(steps, metadata)
+        return collision_guard.blocked_action_reason(action, metadata)
 
     def _invalid_action_message(self, proposed_action: str) -> str:
         return (
