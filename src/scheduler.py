@@ -118,10 +118,26 @@ class Scheduler:
             traj = load_traj(f)
             meta = extract_metadata(traj)
             episode_id = os.path.basename(os.path.dirname(f))
+            low_actions = extract_low_actions(traj)
+            base_step_count = len(low_actions)
             out_file = os.path.join(self.config.output_dir, f"{episode_id}.json")
             if os.path.exists(out_file):
                 episode = EpisodeManager.load(out_file)
                 status = episode.data["status"]
+                if status == "running":
+                    pid = episode.data.get("pid")
+                    if pid and self._pid_is_alive(pid):
+                        continue
+                    episode.set_status("interrupted")
+                    status = "interrupted"
+                for fork_task in episode.get_pending_fork_tasks():
+                    self.queue.append({
+                        "traj_path": f,
+                        "episode_id": episode_id,
+                        "meta": meta,
+                        "base_step_count": base_step_count,
+                        "branch_config": BranchConfig(**fork_task),
+                    })
                 main_outcome = (episode.data.get("final_outcome") or {}).get("main_branch")
                 if main_outcome and main_outcome.get("termination_reason"):
                     if status != "completed":
@@ -129,13 +145,6 @@ class Scheduler:
                     continue
                 if status == "completed":
                     continue
-                if status == "running":
-                    pid = episode.data.get("pid")
-                    if pid and self._pid_is_alive(pid):
-                        continue
-                    episode.set_status("interrupted")
-            low_actions = extract_low_actions(traj)
-            base_step_count = len(low_actions)
 
             self.queue.append({
                 "traj_path": f,
@@ -426,6 +435,7 @@ class Scheduler:
                     executor_agent=executor_agent,
                     output_dir=self.config.output_dir,
                     enable_fork=self.config.enable_fork,
+                    enable_phase2=not self.config.no_traps,
                     memory_mode=self.config.memory_mode,
                     fork_callback=_on_fork,
                 )
@@ -487,7 +497,37 @@ class Scheduler:
         if not os.path.exists(out_file):
             raise FileNotFoundError(f"Episode not found: {out_file}")
         ep = EpisodeManager.load(out_file)
+        ep.mark_pending_fork_running(config.branch_id)
         if ep.get_steps_for_branch(config.branch_id):
+            pending_branch_ids = {
+                entry.get("branch_id") for entry in ep.data.get("pending_forks", [])
+            }
+            existing_fork = next(
+                (
+                    entry for entry in (ep.data.get("final_outcome") or {}).get("forks", [])
+                    if entry.get("branch_id") == config.branch_id
+                ),
+                None,
+            )
+            if existing_fork is None and config.branch_id in pending_branch_ids:
+                total_steps = len(ep.get_steps_for_branch(config.branch_id))
+                ep.update_final_outcome(
+                    {
+                        "branch_id": config.branch_id,
+                        "termination_reason": "fork_incomplete_before_restart",
+                        "total_steps": total_steps,
+                    },
+                    is_main=False,
+                    fork_source_step_id=fc.get("origin_step_id", "?"),
+                    counterfactual_verified=False,
+                )
+                return BranchResult(
+                    branch_id=config.branch_id,
+                    termination_reason="fork_incomplete_before_restart",
+                    total_steps=total_steps,
+                    fork_tasks=[],
+                    fork_source_step_ids=[],
+                )
             logging.warning(
                 "DUPLICATE_FORK_SUPPRESSED episode=%s branch=%s persisted_steps=%d",
                 ep_id, config.branch_id, len(ep.get_steps_for_branch(config.branch_id)),
@@ -590,6 +630,16 @@ class Scheduler:
                     "reasoning_rewritten_by": "oracle",
                 }
                 ep.add_step(fork_root)
+                ep.update_final_outcome(
+                    {
+                        "branch_id": config.branch_id,
+                        "termination_reason": "fork_failed",
+                        "total_steps": 1,
+                    },
+                    is_main=False,
+                    fork_source_step_id=fc.get("origin_step_id", "?"),
+                    counterfactual_verified=False,
+                )
                 return BranchResult(
                     branch_id=config.branch_id, termination_reason="fork_failed",
                     total_steps=1, fork_tasks=[], fork_source_step_ids=[],
@@ -642,6 +692,7 @@ class Scheduler:
             branch_runner = BranchRunner(
                 eb_agent, oracle_agent, self.config.output_dir,
                 enable_fork=self.config.enable_fork,
+                enable_phase2=not self.config.no_traps,
                 executor_agent=executor_agent,
                 _fork_callback=_on_fork,
             )
@@ -653,7 +704,17 @@ class Scheduler:
             return result
         except KeyboardInterrupt:
             raise
-        except Exception:
+        except Exception as exc:
+            ep.update_final_outcome(
+                {
+                    "branch_id": config.branch_id,
+                    "termination_reason": f"worker_crash:{exc}",
+                    "total_steps": len(ep.get_steps_for_branch(config.branch_id)),
+                },
+                is_main=False,
+                fork_source_step_id=fc.get("origin_step_id", "?"),
+                counterfactual_verified=False,
+            )
             raise
         finally:
             env.close()

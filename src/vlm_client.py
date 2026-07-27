@@ -49,6 +49,12 @@ def _api_outage_backoff_s() -> float:
     return max(1.0, backoff_s)
 
 
+def _fail_fast_auth_errors() -> bool:
+    return os.environ.get("EFD_FAIL_FAST_AUTH_ERRORS", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _get_api_log_path() -> Path:
     """Return the api_calls.jsonl path. Uses per-test dir if set, else global."""
     base = _api_log_dir or LOG_DIR
@@ -523,6 +529,9 @@ class VLMClient:
                                    transport_attempt, max_transport, resp.status_code, wait)
                     time.sleep(wait)
                     continue
+                if resp.status_code in {401, 403} and _fail_fast_auth_errors():
+                    self._dump_failure(body, resp.status_code, resp.text, elapsed)
+                    resp.raise_for_status()
                 if resp.status_code in {401, 402, 403} and self.recover_api_outages:
                     backoff_s = _api_outage_backoff_s()
                     logger.warning(

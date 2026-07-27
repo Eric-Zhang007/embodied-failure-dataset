@@ -133,7 +133,18 @@ def _objects_with_name_and_prop(name: str, prop: str, metadata: dict) -> list[di
         return []
     return [
         obj for obj in metadata.get("objects", [])
-        if name in obj.get("objectId", "") and obj.get(prop)
+        if obj.get("objectType") == name and obj.get(prop)
+    ]
+
+
+def _target_pickupables(metadata: dict, target: str, *, sliced: bool) -> list[dict]:
+    """Return the concrete target instances that can satisfy this task."""
+    if not target:
+        return []
+    expected_type = f"{target}Sliced" if sliced else target
+    return [
+        obj for obj in metadata.get("objects", [])
+        if obj.get("pickupable") and obj.get("objectType") == expected_type
     ]
 
 
@@ -159,9 +170,11 @@ def _held_object_type(metadata: dict) -> str:
 def _pick_and_place_simple(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
     targets = _targets(pddl)
     receptacles = _objects_with_name_and_prop(targets["parent"], "receptacle", metadata)
-    pickupables = _objects_with_name_and_prop(targets["object"], "pickupable", metadata)
+    pickupables = _target_pickupables(
+        metadata, targets["object"], sliced=bool(pddl.get("object_sliced"))
+    )
 
-    if pddl.get("object_sliced") and _sliced_count(pickupables) < 1:
+    if pddl.get("object_sliced") and not pickupables:
         return False, f"{targets['object']} must be sliced before placing"
 
     if not receptacles:
@@ -179,9 +192,11 @@ def _pick_and_place_simple(metadata: dict, pddl: dict, task_state: dict) -> tupl
 def _pick_two(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
     targets = _targets(pddl)
     receptacles = _objects_with_name_and_prop(targets["parent"], "receptacle", metadata)
-    pickupables = _objects_with_name_and_prop(targets["object"], "pickupable", metadata)
+    pickupables = _target_pickupables(
+        metadata, targets["object"], sliced=bool(pddl.get("object_sliced"))
+    )
 
-    if pddl.get("object_sliced") and _sliced_count(pickupables) < 2:
+    if pddl.get("object_sliced") and len(pickupables) < 2:
         return False, f"Two {targets['object']} must be sliced before placing"
 
     if not receptacles:
@@ -205,10 +220,12 @@ def _pick_two(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
 def _look_at_obj_in_light(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
     targets = _targets(pddl)
     toggleables = _objects_with_name_and_prop(targets["toggle"], "toggleable", metadata)
-    pickupables = _objects_with_name_and_prop(targets["object"], "pickupable", metadata)
+    pickupables = _target_pickupables(
+        metadata, targets["object"], sliced=bool(pddl.get("object_sliced"))
+    )
     inventory = metadata.get("inventoryObjects") or []
 
-    if pddl.get("object_sliced") and _sliced_count(pickupables) < 1:
+    if pddl.get("object_sliced") and not pickupables:
         return False, f"{targets['object']} must be sliced"
 
     pickup_ids = {p["objectId"] for p in pickupables}
@@ -246,9 +263,11 @@ def _pick_clean_then_place(metadata: dict, pddl: dict, task_state: dict) -> tupl
 def _state_then_place(metadata: dict, pddl: dict, state_object_ids: set[str], state_name: str) -> tuple[bool, str]:
     targets = _targets(pddl)
     receptacles = _objects_with_name_and_prop(targets["parent"], "receptacle", metadata)
-    pickupables = _objects_with_name_and_prop(targets["object"], "pickupable", metadata)
+    pickupables = _target_pickupables(
+        metadata, targets["object"], sliced=bool(pddl.get("object_sliced"))
+    )
 
-    if pddl.get("object_sliced") and _sliced_count(pickupables) < 1:
+    if pddl.get("object_sliced") and not pickupables:
         return False, f"{targets['object']} must be sliced before placing"
 
     objs_in_place = [
@@ -280,29 +299,37 @@ def _state_then_place(metadata: dict, pddl: dict, state_object_ids: set[str], st
 def _pick_and_place_with_movable_recep(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
     targets = _targets(pddl)
     receptacles = _objects_with_name_and_prop(targets["parent"], "receptacle", metadata)
-    pickupables = _objects_with_name_and_prop(targets["object"], "pickupable", metadata)
+    pickupables = _target_pickupables(
+        metadata, targets["object"], sliced=bool(pddl.get("object_sliced"))
+    )
     movables = _objects_with_name_and_prop(targets["mrecep"], "pickupable", metadata)
 
-    if pddl.get("object_sliced") and _sliced_count(pickupables) < 1:
+    if pddl.get("object_sliced") and not pickupables:
         return False, f"{targets['object']} must be sliced before placing"
 
-    pickup_in_movable = [
-        p for p in pickupables
-        for m in movables
-        if p["objectId"] in (m.get("receptacleObjectIds") or [])
-    ]
-    movable_in_parent = [
-        m for m in movables
-        for r in receptacles
-        if m["objectId"] in (r.get("receptacleObjectIds") or [])
-    ]
+    target_ids = {obj["objectId"] for obj in pickupables}
+    complete_stack = any(
+        target_ids.intersection(movable.get("receptacleObjectIds") or [])
+        and any(
+            movable["objectId"] in (parent.get("receptacleObjectIds") or [])
+            for parent in receptacles
+        )
+        for movable in movables
+    )
 
     missing = []
-    if not pickup_in_movable:
+    if not any(
+        target_ids.intersection(movable.get("receptacleObjectIds") or [])
+        for movable in movables
+    ):
         missing.append(f"{targets['object']} must be inside {targets['mrecep']}")
-    if not movable_in_parent:
+    if not any(
+        movable["objectId"] in (parent.get("receptacleObjectIds") or [])
+        for movable in movables
+        for parent in receptacles
+    ):
         missing.append(f"{targets['mrecep']} must be inside {targets['parent']}")
-    if pickup_in_movable and movable_in_parent:
+    if complete_stack:
         return True, ""
     return False, ". ".join(missing)
 

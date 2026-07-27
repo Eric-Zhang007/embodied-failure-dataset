@@ -10,6 +10,7 @@
 
 import argparse
 import configparser
+import os
 
 from src.scheduler import Scheduler, SchedulerConfig
 from src.vlm_client import VLMClient
@@ -20,8 +21,6 @@ def _load_api_config(config_path: str) -> dict[str, str]:
     parser = configparser.ConfigParser()
     if not parser.read(config_path, encoding="utf-8"):
         raise FileNotFoundError(f"Could not read config file: {config_path}")
-    if not parser.has_option("api", "api_key"):
-        raise ValueError("Config file must define [api] api_key")
 
     def value(section: str, option: str, fallback: str = "") -> str:
         return parser.get(section, option, fallback=fallback).strip().strip('"')
@@ -32,6 +31,9 @@ def _load_api_config(config_path: str) -> dict[str, str]:
         "planner_model": value("models", "planner"),
         "executor_model": value("models", "executor"),
         "oracle_model": value("models", "oracle"),
+        "planner_reasoning_effort": value("reasoning_effort", "planner"),
+        "executor_reasoning_effort": value("reasoning_effort", "executor"),
+        "oracle_reasoning_effort": value("reasoning_effort", "oracle"),
     }
 
 
@@ -67,11 +69,22 @@ def main():
 
     if args.config:
         api_config = _load_api_config(args.config)
-        args.api_key = args.api_key or api_config["api_key"]
+        args.api_key = args.api_key or os.environ.get("EFD_API_KEY", "") or api_config["api_key"]
         args.api_base_url = api_config["api_base_url"] or args.api_base_url
         args.planner_model = api_config["planner_model"] or args.planner_model
         args.executor_model = api_config["executor_model"] or args.executor_model
         args.oracle_model = api_config["oracle_model"] or args.oracle_model
+        args.planner_reasoning_effort = (
+            api_config["planner_reasoning_effort"] or args.planner_reasoning_effort
+        )
+        args.executor_reasoning_effort = (
+            api_config["executor_reasoning_effort"] or args.executor_reasoning_effort
+        )
+        args.oracle_reasoning_effort = (
+            api_config["oracle_reasoning_effort"] or args.oracle_reasoning_effort
+        )
+    else:
+        args.api_key = args.api_key or os.environ.get("EFD_API_KEY", "")
     if not args.api_key:
         parser.error("provide --api-key or --config with [api] api_key")
 

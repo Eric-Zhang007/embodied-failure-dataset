@@ -28,6 +28,7 @@ class EpisodeManager:
             "initial_traps": metadata.get("initial_traps", []),
             "runtime_traps": [],
             "semantic_memory_states": {},
+            "pending_forks": [],
             "steps": [],
             "final_outcome": None,
             "status": "pending",
@@ -77,6 +78,41 @@ class EpisodeManager:
             data["runtime_traps"].append(trap)
 
         self._mutate(append_trap)
+
+    def add_pending_fork(self, fork_task: dict):
+        """Durably register a fork before the scheduler receives its callback."""
+        branch_id = fork_task.get("branch_id")
+        if not branch_id:
+            raise ValueError("Pending fork requires branch_id")
+
+        def append_if_new(data):
+            pending = data.setdefault("pending_forks", [])
+            if any(entry.get("branch_id") == branch_id for entry in pending):
+                return
+            pending.append({
+                "branch_id": branch_id,
+                "state": "pending",
+                "task": dict(fork_task),
+            })
+
+        self._mutate(append_if_new)
+
+    def get_pending_fork_tasks(self) -> list[dict]:
+        """Return fork jobs that a fresh scheduler must still account for."""
+        return [
+            dict(entry["task"])
+            for entry in self.data.get("pending_forks", [])
+            if entry.get("state") in {"pending", "running"} and entry.get("task")
+        ]
+
+    def mark_pending_fork_running(self, branch_id: str):
+        def mark_running(data):
+            for entry in data.get("pending_forks", []):
+                if entry.get("branch_id") == branch_id:
+                    entry["state"] = "running"
+                    return
+
+        self._mutate(mark_running)
 
     def trigger_runtime_trap(self, trap_id: str, step_id: str, error_message: str):
         def mark_triggered(data):
@@ -191,7 +227,21 @@ class EpisodeManager:
             else:
                 branch_entry["fork_source_step_id"] = fork_source_step_id
                 branch_entry["counterfactual_verified"] = counterfactual_verified
-                outcome["forks"].append(branch_entry)
+                forks = outcome["forks"]
+                existing = next(
+                    (index for index, entry in enumerate(forks)
+                     if entry.get("branch_id") == branch_entry.get("branch_id")),
+                    None,
+                )
+                if existing is None:
+                    forks.append(branch_entry)
+                else:
+                    forks[existing] = branch_entry
+                for pending in data.get("pending_forks", []):
+                    if pending.get("branch_id") == branch_entry.get("branch_id"):
+                        pending["state"] = "finished"
+                        pending["termination_reason"] = branch_entry.get("termination_reason")
+                        break
             data["final_outcome"] = outcome
         self._mutate(mutation)
 
@@ -243,6 +293,7 @@ class EpisodeManager:
             self.data["status"] = "completed" if self.data.get("final_outcome") else "interrupted"
         self.data.setdefault("pid", None)
         self.data.setdefault("semantic_memory_states", {})
+        self.data.setdefault("pending_forks", [])
 
     # ------------------------------------------------------------------
     # 静态工厂方法：从已有文件恢复

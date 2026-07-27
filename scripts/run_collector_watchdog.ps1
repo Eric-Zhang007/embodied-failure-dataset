@@ -23,7 +23,7 @@ function Get-CollectorPipelineCommand {
     if (-not (Test-CollectorOutputDirectory -OutputDir $OutputDir)) {
         throw "Collector output directory must be a simple repository-relative name: $OutputDir"
     }
-    return "flock -n /tmp/efbench-$OutputDir.lock env EFD_API_TIMEOUT_S=20 EFD_API_MAX_ATTEMPTS=2 .venv/bin/python scripts/run_pipeline.py --config config.toml --max 0 --parallel 7 --task-lanes --worker-retries 2 --output $OutputDir >> $OutputDir/collector.log 2>&1"
+    return "flock -n /tmp/efbench-$OutputDir.lock env EFD_API_TIMEOUT_S=20 EFD_API_MAX_ATTEMPTS=2 EFD_FAIL_FAST_AUTH_ERRORS=1 .venv/bin/python scripts/run_pipeline.py --config config.toml --max 0 --parallel 7 --task-lanes --worker-retries 2 --output $OutputDir >> $OutputDir/collector.log 2>&1"
 }
 
 if (-not (Test-CollectorOutputDirectory -OutputDir $OutputDir)) {
@@ -72,6 +72,7 @@ function Write-WatchdogLog {
 }
 
 function Start-Collector {
+    New-Item -ItemType Directory -Force -Path (Join-Path $PSScriptRoot "..\$OutputDir") | Out-Null
     $pipelineCommand = Get-CollectorPipelineCommand -OutputDir $OutputDir
     $argumentLine = "--distribution Ubuntu --cd $RepoPath bash -lc `"$pipelineCommand`""
     Start-Process -FilePath 'wsl.exe' -ArgumentList $argumentLine -WindowStyle Hidden

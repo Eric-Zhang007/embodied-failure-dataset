@@ -3053,7 +3053,7 @@ class BranchRunner:
             if s.get("step_id") == branches_from_id:
                 break
 
-        return {
+        fork_task = {
             "episode_id": config.episode_id,
             "branch_id": fork_branch_id,
             "parent_branch_id": config.branch_id,
@@ -3066,6 +3066,10 @@ class BranchRunner:
                 "counterfactual_text": cf_text,
             },
         }
+        register_pending = getattr(ep, "add_pending_fork", None)
+        if callable(register_pending):
+            register_pending(fork_task)
+        return fork_task
 
     def _finalize(self, ep, config, result, fork_source_ids):
         branch_entry = {
