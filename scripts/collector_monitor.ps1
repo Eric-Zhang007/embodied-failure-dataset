@@ -201,7 +201,9 @@ function Get-ActiveForks {
     }
 
     $active = @{}
-    $lines = Get-Content -LiteralPath $LogPath -Tail 20000 -ErrorAction SilentlyContinue
+    $lines = Select-CurrentCollectorRunLines -Lines @(
+        Get-Content -LiteralPath $LogPath -Tail 20000 -ErrorAction SilentlyContinue
+    )
     foreach ($line in $lines) {
         if ($line -match '^\[fork\] Starting (?<branch>\S+) \(parent=(?<parent>[^)]+)\) on (?<episode>\S+)(?: lane=(?<lane>\S+))?') {
             $key = "$($Matches.episode)|$($Matches.branch)"
@@ -223,6 +225,21 @@ function Get-ActiveForks {
         }
     }
     return @($active.Values)
+}
+
+function Select-CurrentCollectorRunLines {
+    param([object[]]$Lines)
+
+    $lastRunMarker = -1
+    for ($index = 0; $index -lt $Lines.Count; $index++) {
+        if ([string]$Lines[$index] -match '^Running 7 task lanes:') {
+            $lastRunMarker = $index
+        }
+    }
+    if ($lastRunMarker -lt 0) {
+        return @($Lines)
+    }
+    return @($Lines | Select-Object -Skip ($lastRunMarker + 1))
 }
 
 function Get-HostMemoryText {
@@ -312,9 +329,14 @@ function Get-CollectorSnapshot {
     $memoryLine = (@(& $WslQuery 'memory' $PipelinePid) | Select-Object -First 1) -join ' '
     $recentEvents = @()
     if (Test-Path -LiteralPath $logPath) {
+        $currentRunLines = Select-CurrentCollectorRunLines -Lines @(
+            Get-Content -LiteralPath $logPath -Tail 5000 -ErrorAction SilentlyContinue
+        )
         $recentEvents = @(
-            Get-Content -LiteralPath $logPath -Tail 1000 -ErrorAction SilentlyContinue |
-                Where-Object { $_ -match '\[fork\]|RETRY |CRASH |Worker for |TIMEOUT_EXHAUSTED|API_OUTAGE' } |
+            $currentRunLines |
+                Where-Object {
+                    $_ -cmatch '^\[fork\]|^WARNING:root:REPLAY_UNAVAILABLE|^\[\d+/\d+\] Finished .*replay_unavailable|^RETRY |^CRASH |^WARNING:root:Worker for |TIMEOUT_EXHAUSTED|API_OUTAGE'
+                } |
                 Select-Object -Last 6
         )
     }
