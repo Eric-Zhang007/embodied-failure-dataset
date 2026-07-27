@@ -14,11 +14,95 @@ $script:TaskTypes = @(
     'pick_two_obj_and_place'
 )
 
+function Get-CollectorProcfsQuery {
+    param(
+        [ValidateSet('pipeline', 'unity', 'memory')][string]$Kind,
+        [int]$PipelinePid = 0,
+        [string]$ProcRoot = '\\wsl.localhost\Ubuntu\proc'
+    )
+
+    if (-not (Test-Path -LiteralPath $ProcRoot)) {
+        return [pscustomobject]@{ Available = $false; Lines = @() }
+    }
+
+    try {
+        if ($Kind -eq 'memory') {
+            $memInfo = Get-Content -LiteralPath (Join-Path $ProcRoot 'meminfo') -Raw -ErrorAction Stop
+            $totalMatch = [regex]::Match($memInfo, '(?m)^MemTotal:\s*(\d+)\s+kB')
+            $availableMatch = [regex]::Match($memInfo, '(?m)^MemAvailable:\s*(\d+)\s+kB')
+            if (-not $totalMatch.Success -or -not $availableMatch.Success) {
+                return [pscustomobject]@{ Available = $true; Lines = @() }
+            }
+            $totalGiB = [math]::Round(([double]$totalMatch.Groups[1].Value) / 1MB, 1)
+            $availableGiB = [math]::Round(([double]$availableMatch.Groups[1].Value) / 1MB, 1)
+            $usedGiB = [math]::Round($totalGiB - $availableGiB, 1)
+            $culture = [Globalization.CultureInfo]::InvariantCulture
+            return [pscustomobject]@{
+                Available = $true
+                Lines = @(
+                    "$($totalGiB.ToString('F1', $culture))Gi " +
+                    "$($usedGiB.ToString('F1', $culture))Gi " +
+                    "$($availableGiB.ToString('F1', $culture))Gi"
+                )
+            }
+        }
+
+        if ($Kind -eq 'unity' -and $PipelinePid -le 0) {
+            return [pscustomobject]@{ Available = $true; Lines = @() }
+        }
+
+        $lines = @()
+        foreach ($entry in Get-ChildItem -LiteralPath $ProcRoot -Directory -ErrorAction Stop) {
+            if ($entry.Name -notmatch '^\d+$') {
+                continue
+            }
+            $cmdlinePath = Join-Path $entry.FullName 'cmdline'
+            if (-not (Test-Path -LiteralPath $cmdlinePath)) {
+                continue
+            }
+            try {
+                $cmdline = ((Get-Content -LiteralPath $cmdlinePath -Raw -ErrorAction Stop) -replace [string][char]0, ' ').Trim()
+            } catch {
+                continue
+            }
+
+            if ($Kind -eq 'pipeline') {
+                if ($cmdline -match '^[.]venv/bin/python\s+scripts/run_pipeline[.]py' -and $cmdline -match '--task-lanes') {
+                    $lines += "$($entry.Name) python $cmdline"
+                }
+                continue
+            }
+
+            if ($cmdline -notmatch '(^|\s)([^\s]*/)?thor-Linux64(-|\s|$)') {
+                continue
+            }
+            try {
+                $status = Get-Content -LiteralPath (Join-Path $entry.FullName 'status') -Raw -ErrorAction Stop
+            } catch {
+                continue
+            }
+            $parentMatch = [regex]::Match($status, '(?m)^PPid:\s*(\d+)')
+            if ($parentMatch.Success -and [int]$parentMatch.Groups[1].Value -eq $PipelinePid) {
+                $lines += $entry.Name
+            }
+        }
+        return [pscustomobject]@{ Available = $true; Lines = @($lines) }
+    } catch {
+        # Procfs is present but momentarily unreadable; keep the dashboard responsive.
+        return [pscustomobject]@{ Available = $true; Lines = @() }
+    }
+}
+
 function Invoke-CollectorWslQuery {
     param(
         [ValidateSet('pipeline', 'unity', 'memory')][string]$Kind,
         [int]$PipelinePid = 0
     )
+
+    $procfs = Get-CollectorProcfsQuery -Kind $Kind -PipelinePid $PipelinePid
+    if ($procfs.Available) {
+        return @($procfs.Lines)
+    }
 
     switch ($Kind) {
         'pipeline' {
