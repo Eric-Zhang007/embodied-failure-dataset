@@ -2554,7 +2554,9 @@ class BranchRunner:
         return {k: v for k, v in step.items() if k not in ("action", "repeat")}
 
     @classmethod
-    def _validate_action_contract(cls, action, params, source: str) -> str | None:
+    def _validate_action_contract(
+        cls, action, params, source: str, *, allow_explicit_object_id: bool = False,
+    ) -> str | None:
         """Validate one concrete action before resolution, adaptation, or stepping."""
         if action not in _EXECUTABLE_SEQUENCE_ACTIONS:
             return (
@@ -2565,14 +2567,30 @@ class BranchRunner:
             return f"Your {source} was not executed because params must be a JSON object."
         if action in _OBJECT_ACTIONS:
             object_type = params.get("objectType")
-            if not isinstance(object_type, str) or not object_type.strip():
+            object_id = params.get("objectId")
+            has_object_type = isinstance(object_type, str) and bool(object_type.strip())
+            has_explicit_object_id = (
+                allow_explicit_object_id
+                and isinstance(object_id, str)
+                and bool(object_id.strip())
+            )
+            if not has_object_type and not has_explicit_object_id:
                 return (
                     f"Your {source} was not executed because {action} requires a non-empty "
                     "objectType."
                 )
             if action == "PutObject":
                 receptacle_type = params.get("receptacleType")
-                if not isinstance(receptacle_type, str) or not receptacle_type.strip():
+                receptacle_id = params.get("receptacleId")
+                has_receptacle_type = (
+                    isinstance(receptacle_type, str) and bool(receptacle_type.strip())
+                )
+                has_explicit_receptacle_id = (
+                    allow_explicit_object_id
+                    and isinstance(receptacle_id, str)
+                    and bool(receptacle_id.strip())
+                )
+                if not has_receptacle_type and not has_explicit_receptacle_id:
                     return (
                         f"Your {source} was not executed because PutObject requires a non-empty "
                         "receptacleType."
@@ -2581,12 +2599,16 @@ class BranchRunner:
 
     @classmethod
     def _validate_standalone_action(
-        cls, action, params, camera_horizon, *, allow_meta: bool = False
+        cls, action, params, camera_horizon, *, allow_meta: bool = False,
+        allow_explicit_object_id: bool = False,
     ) -> str | None:
         """Validate a legacy, recovery, or post-scan standalone action."""
         if allow_meta and action in _META_ACTIONS:
             return None if isinstance(params, dict) else "Your action params must be a JSON object."
-        error = cls._validate_action_contract(action, params, "action")
+        error = cls._validate_action_contract(
+            action, params, "action",
+            allow_explicit_object_id=allow_explicit_object_id,
+        )
         if error:
             return error
         if action in {"LookUp", "LookDown"}:
@@ -2602,11 +2624,15 @@ class BranchRunner:
             return None if isinstance(params, dict) else "Your action params must be a JSON object."
         if action == "MoveSequence":
             steps = params.get("steps") if isinstance(params, dict) else None
-            sequence_error = cls._validate_action_sequence(steps, "recovery action")
+            sequence_error = cls._validate_action_sequence(
+                steps, "recovery action", allow_explicit_object_id=True,
+            )
             if sequence_error:
                 return sequence_error
             return cls._validate_camera_horizon_sequence(steps, camera_horizon)
-        return cls._validate_standalone_action(action, params, camera_horizon)
+        return cls._validate_standalone_action(
+            action, params, camera_horizon, allow_explicit_object_id=True,
+        )
 
     @staticmethod
     def _redundant_interaction_error(action: str, params: dict, metadata: dict) -> str | None:
@@ -2632,7 +2658,9 @@ class BranchRunner:
         return None
 
     @classmethod
-    def _validate_action_sequence(cls, steps, source: str) -> str | None:
+    def _validate_action_sequence(
+        cls, steps, source: str, *, allow_explicit_object_id: bool = False,
+    ) -> str | None:
         """Return an actionable error when a proposed sequence cannot run.
 
         Invalid sequences are model-output errors, not environment failures, so
@@ -2658,7 +2686,8 @@ class BranchRunner:
             action = step.get("action")
             params = cls._action_params(step)
             action_error = cls._validate_action_contract(
-                action, params, f"{source} action sequence step {index}"
+                action, params, f"{source} action sequence step {index}",
+                allow_explicit_object_id=allow_explicit_object_id,
             )
             if action_error:
                 return action_error
