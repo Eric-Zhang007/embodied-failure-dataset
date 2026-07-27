@@ -23,7 +23,7 @@ function Get-CollectorPipelineCommand {
     if (-not (Test-CollectorOutputDirectory -OutputDir $OutputDir)) {
         throw "Collector output directory must be a simple repository-relative name: $OutputDir"
     }
-    return "env EFD_API_TIMEOUT_S=20 EFD_API_MAX_ATTEMPTS=2 .venv/bin/python scripts/run_pipeline.py --config config.toml --max 0 --parallel 7 --task-lanes --worker-retries 2 --output $OutputDir >> $OutputDir/collector.log 2>&1"
+    return "flock -n /tmp/efbench-$OutputDir.lock env EFD_API_TIMEOUT_S=20 EFD_API_MAX_ATTEMPTS=2 .venv/bin/python scripts/run_pipeline.py --config config.toml --max 0 --parallel 7 --task-lanes --worker-retries 2 --output $OutputDir >> $OutputDir/collector.log 2>&1"
 }
 
 if (-not (Test-CollectorOutputDirectory -OutputDir $OutputDir)) {
@@ -33,7 +33,29 @@ if (-not (Test-CollectorOutputDirectory -OutputDir $OutputDir)) {
 $RepoPath = '/home/zjc/embodied-failure-dataset'
 $WatchdogLog = Join-Path $PSScriptRoot "..\\$OutputDir\\watchdog.log"
 
+function Test-CollectorWindowsFrontend {
+    param(
+        [string]$OutputDir,
+        [object[]]$Processes = $null
+    )
+
+    if ($null -eq $Processes) {
+        $Processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+    }
+    $outputPattern = "(?:^|\s)--output\s+$([regex]::Escape($OutputDir))(?=\s|[^A-Za-z0-9._-]|$)"
+    return [bool]($Processes | Where-Object {
+        $_.Name -ieq 'wsl.exe' -and
+        $_.CommandLine -match 'run_pipeline[.]py' -and
+        $_.CommandLine -match '--task-lanes' -and
+        $_.CommandLine -match $outputPattern
+    } | Select-Object -First 1)
+}
+
 function Test-CollectorRunning {
+    if (Test-CollectorWindowsFrontend -OutputDir $OutputDir) {
+        return $true
+    }
+
     $escapedOutputDir = [regex]::Escape($OutputDir)
     $pattern = "[.]venv/bin/python scripts/run_pipeline.py.*--task-lanes.*--output $escapedOutputDir"
     $lines = & wsl.exe --distribution Ubuntu --exec bash -lc "pgrep -f '$pattern'" 2>$null
