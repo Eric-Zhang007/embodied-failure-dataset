@@ -1699,13 +1699,10 @@ class BranchRunner:
                             recovery_time=True,
                             memory=memory,
                         )
-                        recovery_error = (
-                            None if rec_name == "LookAround" else
-                            self._validate_standalone_action(
-                                rec_name,
-                                rec_params,
-                                metadata.get("agent", {}).get("cameraHorizon", 0.0),
-                            )
+                        recovery_error = self._validate_recovery_action(
+                            rec_name,
+                            rec_params,
+                            metadata.get("agent", {}).get("cameraHorizon", 0.0),
                         )
                         if recovery_error:
                             self._write_failure_log(failure_log_path, {
@@ -1720,6 +1717,44 @@ class BranchRunner:
                         if rec_name == "LookAround":
                             rec_act, rec_adapt_params = "LookAround", {}
                             rec_result = self._execute_recovery_lookaround(env)
+                        elif rec_name == "MoveSequence":
+                            rec_act, rec_adapt_params = "MoveSequence", rec_params
+                            recovery_collision_error = self._collision_guard_error(
+                                collision_guard, rec_act, rec_adapt_params, metadata,
+                            )
+                            if recovery_collision_error:
+                                last_error = (
+                                    "Your recovery action was not executed. "
+                                    + recovery_collision_error
+                                )
+                                nonexecuted_retry_count += 1
+                                self._write_failure_log(failure_log_path, {
+                                    "step_index": step_index,
+                                    "branch_id": config.branch_id,
+                                    "failure_type": "policy_guard_repeated_recovery_collision",
+                                    "proposed_recovery": rec_action,
+                                    "action": rec_act,
+                                    "action_params": rec_adapt_params,
+                                    "error_message": last_error,
+                                    "retry_attempt": nonexecuted_retry_count,
+                                })
+                                if nonexecuted_retry_count >= max_nonexecuted_retries:
+                                    result_br = BranchResult(
+                                        branch_id=config.branch_id,
+                                        termination_reason="policy_guard_repeated_collision",
+                                        total_steps=step_index,
+                                        fork_tasks=fork_tasks,
+                                        fork_source_step_ids=fork_source_ids,
+                                    )
+                                    self._finalize(ep, config, result_br, fork_source_ids)
+                                    return result_br
+                                continue
+                            rec_result, _ = self._execute_move_sequence(
+                                rec_adapt_params, env, metadata, failure_log_path,
+                                config.branch_id, step_index, ep.episode_id,
+                                eb_phase3.get("recovery_reasoning", ""),
+                                recovery_injection_decision,
+                            )
                         else:
                             resolved, warn = resolve_object_ids(
                                 rec_name, rec_params, metadata.get("objects", [])
@@ -1782,7 +1817,9 @@ class BranchRunner:
                         rec_metadata = rec_result.get("metadata", metadata)
                         if not rec_result["success"]:
                             collision_guard.record_navigation_failure(
-                                rec_act, rec_result.get("error"), rec_metadata,
+                                rec_result.get("failed_action", rec_act),
+                                rec_result.get("error"),
+                                rec_metadata,
                             )
                         defer_semantic_snapshot()
                         memory.update(
@@ -2139,13 +2176,10 @@ class BranchRunner:
                     recovery_time=True,
                     memory=memory,
                 )
-                recovery_error = (
-                    None if rec_name == "LookAround" else
-                    self._validate_standalone_action(
-                        rec_name,
-                        rec_params,
-                        metadata.get("agent", {}).get("cameraHorizon", 0.0),
-                    )
+                recovery_error = self._validate_recovery_action(
+                    rec_name,
+                    rec_params,
+                    metadata.get("agent", {}).get("cameraHorizon", 0.0),
                 )
                 if recovery_error:
                     self._write_failure_log(failure_log_path, {
@@ -2160,6 +2194,44 @@ class BranchRunner:
                 if rec_name == "LookAround":
                     rec_act, rec_adapt_params = "LookAround", {}
                     rec_result = self._execute_recovery_lookaround(env)
+                elif rec_name == "MoveSequence":
+                    rec_act, rec_adapt_params = "MoveSequence", rec_params
+                    recovery_collision_error = self._collision_guard_error(
+                        collision_guard, rec_act, rec_adapt_params, metadata,
+                    )
+                    if recovery_collision_error:
+                        last_error = (
+                            "Your recovery action was not executed. "
+                            + recovery_collision_error
+                        )
+                        nonexecuted_retry_count += 1
+                        self._write_failure_log(failure_log_path, {
+                            "step_index": step_index,
+                            "branch_id": config.branch_id,
+                            "failure_type": "policy_guard_repeated_recovery_collision",
+                            "proposed_recovery": rec_action,
+                            "action": rec_act,
+                            "action_params": rec_adapt_params,
+                            "error_message": last_error,
+                            "retry_attempt": nonexecuted_retry_count,
+                        })
+                        if nonexecuted_retry_count >= max_nonexecuted_retries:
+                            result_br = BranchResult(
+                                branch_id=config.branch_id,
+                                termination_reason="policy_guard_repeated_collision",
+                                total_steps=step_index,
+                                fork_tasks=fork_tasks,
+                                fork_source_step_ids=fork_source_ids,
+                            )
+                            self._finalize(ep, config, result_br, fork_source_ids)
+                            return result_br
+                        continue
+                    rec_result, _ = self._execute_move_sequence(
+                        rec_adapt_params, env, metadata, failure_log_path,
+                        config.branch_id, step_index, ep.episode_id,
+                        eb_phase3.get("recovery_reasoning", ""),
+                        recovery_injection_decision,
+                    )
                 else:
                     resolved, warn = resolve_object_ids(
                         rec_name, rec_params, metadata.get("objects", [])
@@ -2222,7 +2294,9 @@ class BranchRunner:
                 rec_metadata = rec_result.get("metadata", metadata)
                 if not rec_result["success"]:
                     collision_guard.record_navigation_failure(
-                        rec_act, rec_result.get("error"), rec_metadata,
+                        rec_result.get("failed_action", rec_act),
+                        rec_result.get("error"),
+                        rec_metadata,
                     )
                 defer_semantic_snapshot()
                 memory.update(
@@ -2520,6 +2594,19 @@ class BranchRunner:
                 [{"action": action}], camera_horizon
             )
         return None
+
+    @classmethod
+    def _validate_recovery_action(cls, action, params, camera_horizon) -> str | None:
+        """Validate a recovery without rejecting supported action sequences."""
+        if action == "LookAround":
+            return None if isinstance(params, dict) else "Your action params must be a JSON object."
+        if action == "MoveSequence":
+            steps = params.get("steps") if isinstance(params, dict) else None
+            sequence_error = cls._validate_action_sequence(steps, "recovery action")
+            if sequence_error:
+                return sequence_error
+            return cls._validate_camera_horizon_sequence(steps, camera_horizon)
+        return cls._validate_standalone_action(action, params, camera_horizon)
 
     @staticmethod
     def _redundant_interaction_error(action: str, params: dict, metadata: dict) -> str | None:
