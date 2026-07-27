@@ -501,13 +501,31 @@ class Scheduler:
             )
         print(f"\n[fork] Starting {config.branch_id} (parent={config.parent_branch_id}) on {ep_id}")
 
-        # 收集共享 step
-        shared_ids = set(config.shared_context_step_ids)
-        shared_steps = [
-            s for s in ep.data["steps"]
-            if s.get("branch_id") == config.parent_branch_id and s["step_id"] in shared_ids
-        ]
-        shared_steps.sort(key=lambda x: x.get("step_index_in_branch", 0))
+        # A nested fork inherits its whole lineage, not only its direct parent
+        # branch. Keep the IDs' recorded order: branch-local step indexes reset
+        # at every fork and cannot order a mixed main/fork context correctly.
+        steps_by_id = {
+            step.get("step_id"): step
+            for step in ep.data["steps"]
+            if step.get("step_id")
+        }
+        shared_steps = []
+        missing_shared_ids = []
+        seen_shared_ids = set()
+        for step_id in config.shared_context_step_ids:
+            if not step_id or step_id in seen_shared_ids:
+                continue
+            seen_shared_ids.add(step_id)
+            step = steps_by_id.get(step_id)
+            if step is None:
+                missing_shared_ids.append(step_id)
+            else:
+                shared_steps.append(step)
+        if missing_shared_ids:
+            raise ValueError(
+                f"Fork {config.branch_id} is missing shared context steps: "
+                f"{missing_shared_ids}"
+            )
 
         env = EnvController(scene=meta["scene"])
         try:
