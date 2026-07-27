@@ -37,6 +37,7 @@ _EXECUTABLE_SEQUENCE_ACTIONS = _VALID_ACTIONS - _META_ACTIONS - {"MoveSequence"}
 _REPEATABLE_ACTIONS = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight"}
 _MAX_SEQUENCE_ACTIONS = 12
 _MAX_ACTION_REPEAT = 200
+_SCAN_FACE_ROTATIONS = {"right": 1, "behind": 2, "left": 3, "ahead": 0}
 
 _INJECTION_FAILURE_MARKERS = {
     "close_open_receptacle_before_put": ("closed",),
@@ -58,6 +59,26 @@ def _requires_oracle_injection(action: str, params: dict | None) -> bool:
         isinstance(step, dict) and step.get("action") in _OBJECT_ACTIONS
         for step in steps
     )
+
+
+def _turn_to_scan_facing(env, face_direction: object, context: str) -> list[dict]:
+    """Apply and persist the post-scan orientation selected by the VLM.
+
+    A LookAround step is a meta-action: its four capture rotations restore the
+    original heading.  Scan analysis may then deliberately rotate to the most
+    useful view.  That second rotation sequence changes physical state and
+    must be stored with the LookAround step so a fork can replay it exactly.
+    """
+    turns = _SCAN_FACE_ROTATIONS.get(str(face_direction or "ahead").lower(), 0)
+    actions = []
+    for _ in range(turns):
+        result = env.step("RotateLeft")
+        if not result.get("success"):
+            raise RuntimeError(
+                f"{context} post-scan RotateLeft failed: {result.get('error')}"
+            )
+        actions.append({"action": "RotateLeft", "action_params": {}})
+    return actions
 
 
 def _normalize_recovery_verdict(verdict: object) -> str:
@@ -598,26 +619,26 @@ class BranchRunner:
             # Also feed metadata from left/behind/right directions into memory
             for _d_label, _d_meta in look_metas[1:]:  # skip ahead (already done)
                 memory.update(_d_meta, _d_meta.get("objects", []), "LookAround", True, None, tc0, "initial scan")
-            write_step_with_semantic_snapshot(look_step)
-            eb_history.append(look_step)
-            self._record_trail(trail, metadata0)
-            step_index = 1
             # Use new scan analysis to get direction + intent (not old propose_action)
             scan_result = self.eb_agent.analyze_scan_room(
                 task_goal=ep.data["task_goal"],
                 look_images=look_images,
                 visible_objects=metadata0.get("objects", []),
-                action_history=eb_history,
+                action_history=eb_history + [look_step],
                 last_error=None,
                 inventory_objects=[],
                 task_criteria=tc0,
                 memory_text=memory.render(),
             )
-            # Rotate to face the determined direction
-            face_dir = scan_result.get("face_direction", "ahead")
-            dir_rotations = {"right": 1, "behind": 2, "left": 3, "ahead": 0}
-            for _ in range(dir_rotations.get(face_dir, 0)):
-                env.step("RotateLeft")
+            post_scan_actions = _turn_to_scan_facing(
+                env, scan_result.get("face_direction"), "Initial LookAround",
+            )
+            if post_scan_actions:
+                look_step["post_scan_actions"] = post_scan_actions
+            write_step_with_semantic_snapshot(look_step)
+            eb_history.append(look_step)
+            self._record_trail(trail, metadata0)
+            step_index = 1
             # Let the Planner→Executor cycle handle the first intent naturally
             proposed_action = ""  # cleared, so step 1 enters Planner→Executor cycle
             proposed_params = {}
@@ -859,27 +880,27 @@ class BranchRunner:
                     defer_semantic_snapshot()
                     memory.update(metadata, metadata.get("objects", []),
                                   "LookAround", True, None, task_criteria)
-                    write_step_with_semantic_snapshot(look_step)
-                    eb_history.append(look_step)
-                    parent_id = _sid(config.branch_id, step_index)
-                    step_index += 1
-                    self._record_trail(trail, metadata)
                     # 32B multi-image analysis -> direction + intent
                     scan_result = self.eb_agent.analyze_scan_room(
                         task_goal=ep.data["task_goal"],
                         look_images=look_images,
                         visible_objects=metadata.get("objects", []),
-                        action_history=eb_history,
+                        action_history=eb_history + [look_step],
                         last_error=last_error,
                         inventory_objects=inventory_objects,
                         task_criteria=task_criteria,
                         memory_text=memory.render(),
                     )
-                    # Rotate to face the determined direction
-                    face_dir = scan_result.get("face_direction", "ahead")
-                    dir_rotations = {"right": 1, "behind": 2, "left": 3, "ahead": 0}
-                    for _ in range(dir_rotations.get(face_dir, 0)):
-                        env.step("RotateLeft")
+                    post_scan_actions = _turn_to_scan_facing(
+                        env, scan_result.get("face_direction"), "Scan room",
+                    )
+                    if post_scan_actions:
+                        look_step["post_scan_actions"] = post_scan_actions
+                    write_step_with_semantic_snapshot(look_step)
+                    eb_history.append(look_step)
+                    parent_id = _sid(config.branch_id, step_index)
+                    step_index += 1
+                    self._record_trail(trail, metadata)
                     # Refresh state after rotation
                     snap = env.step("Pass")
                     image = snap["frame"]
@@ -3046,6 +3067,37 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                     meta = env.controller.last_event.metadata
                     memory.update(meta, meta.get("objects", []),
                                   "RotateLeft", r["success"], r.get("error"), task_criteria)
+            post_scan_actions = s.get("post_scan_actions", [])
+            if not isinstance(post_scan_actions, list):
+                raise RuntimeError(
+                    f"Replay post_scan_actions is malformed at {s.get('step_id')}: "
+                    f"{post_scan_actions!r}"
+                )
+            for post_action in post_scan_actions:
+                if not isinstance(post_action, dict):
+                    raise RuntimeError(
+                        f"Replay post_scan_actions is malformed at {s.get('step_id')}: "
+                        f"{post_action!r}"
+                    )
+                post_name = post_action.get("action")
+                post_params = post_action.get(
+                    "action_params", post_action.get("params", {}),
+                )
+                if post_name not in _MOVEMENT or not isinstance(post_params, dict):
+                    raise RuntimeError(
+                        f"Replay post_scan_actions is invalid at {s.get('step_id')}: "
+                        f"{post_action!r}"
+                    )
+                r = env.step(post_name, **post_params)
+                if not r.get("success"):
+                    raise RuntimeError(
+                        f"Replay post-scan action {post_name} failed at "
+                        f"{s.get('step_id')}: {r.get('error')}"
+                    )
+                if memory and task_criteria:
+                    meta = env.controller.last_event.metadata
+                    memory.update(meta, meta.get("objects", []),
+                                  post_name, r["success"], r.get("error"), task_criteria)
             continue
 
         # MoveSequence: expand and replay individual steps
