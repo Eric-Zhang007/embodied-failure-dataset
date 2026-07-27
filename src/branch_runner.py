@@ -38,7 +38,9 @@ _EXECUTABLE_SEQUENCE_ACTIONS = _VALID_ACTIONS - _META_ACTIONS - {"MoveSequence"}
 _REPEATABLE_ACTIONS = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight"}
 _MAX_SEQUENCE_ACTIONS = 12
 _MAX_ACTION_REPEAT = 200
-_SCAN_FACE_ROTATIONS = {"right": 1, "behind": 2, "left": 3, "ahead": 0}
+# LookAround captures each view by rotating left.  The post-scan turn must
+# therefore use the same left-turn count to face the selected capture.
+_SCAN_FACE_ROTATIONS = {"ahead": 0, "left": 1, "behind": 2, "right": 3}
 
 _INJECTION_FAILURE_MARKERS = {
     "close_open_receptacle_before_put": ("closed",),
@@ -3088,11 +3090,15 @@ class BranchRunner:
                 fork_source_ids[0] if fork_source_ids else
                 config.fork_config.get("origin_step_id", "?") if config.fork_config else "?"
             )
+            root_steps = ep.get_steps_for_branch(config.branch_id)
             counterfactual_verified = result.termination_reason == "task_complete"
             ep.update_final_outcome(
                 branch_entry, is_main=False,
                 fork_source_step_id=fork_source_step_id,
                 counterfactual_verified=counterfactual_verified,
+                counterfactual_root_feasible=bool(
+                    root_steps and root_steps[0].get("success")
+                ),
             )
 
 

@@ -215,7 +215,8 @@ class EpisodeManager:
 
     def update_final_outcome(self, branch_entry: dict, dedup_stats: dict = None,
                               is_main: bool = False, fork_source_step_id: str = "",
-                              counterfactual_verified: bool = False):
+                              counterfactual_verified: bool = False,
+                              counterfactual_root_feasible: bool | None = None):
         """Atomically read-modify-write final_outcome to prevent races
         when multiple forks update the same episode concurrently."""
         def mutation(data):
@@ -227,6 +228,8 @@ class EpisodeManager:
             else:
                 branch_entry["fork_source_step_id"] = fork_source_step_id
                 branch_entry["counterfactual_verified"] = counterfactual_verified
+                if counterfactual_root_feasible is not None:
+                    branch_entry["counterfactual_root_feasible"] = counterfactual_root_feasible
                 forks = outcome["forks"]
                 existing = next(
                     (index for index, entry in enumerate(forks)

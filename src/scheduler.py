@@ -639,6 +639,7 @@ class Scheduler:
                     is_main=False,
                     fork_source_step_id=fc.get("origin_step_id", "?"),
                     counterfactual_verified=False,
+                    counterfactual_root_feasible=False,
                 )
                 return BranchResult(
                     branch_id=config.branch_id, termination_reason="fork_failed",
