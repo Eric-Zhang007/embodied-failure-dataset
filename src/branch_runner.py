@@ -577,6 +577,61 @@ class BranchRunner:
         intent = ""
         intent_target = ""
 
+        def attempt_stuck_escape(current_metadata, current_image, criteria, intent_label):
+            """Reorient once before declaring a multi-direction collision permanent."""
+            nonlocal step_index, cascade_level, stuck_escalation_count
+            reorientation_steps = self._execute_stuck_reorientation(
+                collision_guard, env, current_metadata,
+            )
+            if reorientation_steps is None:
+                return None
+            escape_metadata = current_metadata
+            escape_image = current_image
+            for action, result in reorientation_steps:
+                success = bool(result.get("success"))
+                escape_metadata = _value_or_fallback(
+                    result.get("metadata"), escape_metadata,
+                )
+                escape_image = _value_or_fallback(result.get("frame"), escape_image)
+                escape_step = self._build_step_entry(
+                    ep.episode_id,
+                    config.branch_id,
+                    step_index,
+                    _last_branch_step_id(ep, config.branch_id),
+                    action,
+                    {},
+                    result,
+                    "[automatic recovery] Reorient to test the only untried physical direction.",
+                    None,
+                )
+                escape_step["recovery_step"] = True
+                escape_step["automatic_stuck_escape"] = True
+                defer_semantic_snapshot()
+                memory.update(
+                    escape_metadata,
+                    escape_metadata.get("objects", []),
+                    action,
+                    success,
+                    result.get("error"),
+                    criteria,
+                    intent_label,
+                )
+                write_step_with_semantic_snapshot(escape_step)
+                eb_history.append(escape_step)
+                current_intent["steps"].append(escape_step)
+                step_index += 1
+                if not success:
+                    return None
+            if not reorientation_steps:
+                logging.info(
+                    "AUTOMATIC_STUCK_ESCAPE branch=%s action=MoveAhead no_turn_needed",
+                    config.branch_id,
+                )
+            cascade_level = 0
+            stuck_escalation_count = 0
+            self._record_trail(trail, escape_metadata)
+            return escape_image, escape_metadata
+
         # ==========================================================
         # Initial LookAround: 开局强制四向扫描
         # ==========================================================
@@ -1466,7 +1521,10 @@ class BranchRunner:
                         "error_message": last_error,
                         "retry_attempt": nonexecuted_retry_count,
                     })
-                    if nonexecuted_retry_count >= max_nonexecuted_retries:
+                    if (
+                        nonexecuted_retry_count >= max_nonexecuted_retries
+                        and not collision_guard.consume_escape_replan_credit()
+                    ):
                         result_br = BranchResult(
                             branch_id=config.branch_id,
                             termination_reason="policy_guard_repeated_collision",
@@ -1623,6 +1681,16 @@ class BranchRunner:
                         memory, ep, config.branch_id,
                     )
                     if repeated_obstacle:
+                        escaped_state = attempt_stuck_escape(
+                            metadata,
+                            image,
+                            task_criteria,
+                            f"{intent} {intent_target}".strip(),
+                        )
+                        if escaped_state is not None:
+                            image, metadata = escaped_state
+                            last_error = None
+                            continue
                         result_br = BranchResult(
                             branch_id=config.branch_id,
                             termination_reason=f"permanent_stuck:{repeated_obstacle}",
@@ -1740,7 +1808,10 @@ class BranchRunner:
                                     "error_message": last_error,
                                     "retry_attempt": nonexecuted_retry_count,
                                 })
-                                if nonexecuted_retry_count >= max_nonexecuted_retries:
+                                if (
+                                    nonexecuted_retry_count >= max_nonexecuted_retries
+                                    and not collision_guard.consume_escape_replan_credit()
+                                ):
                                     result_br = BranchResult(
                                         branch_id=config.branch_id,
                                         termination_reason="policy_guard_repeated_collision",
@@ -1791,7 +1862,10 @@ class BranchRunner:
                                     "error_message": last_error,
                                     "retry_attempt": nonexecuted_retry_count,
                                 })
-                                if nonexecuted_retry_count >= max_nonexecuted_retries:
+                                if (
+                                    nonexecuted_retry_count >= max_nonexecuted_retries
+                                    and not collision_guard.consume_escape_replan_credit()
+                                ):
                                     result_br = BranchResult(
                                         branch_id=config.branch_id,
                                         termination_reason="policy_guard_repeated_collision",
@@ -1907,7 +1981,10 @@ class BranchRunner:
                     "error_message": last_error,
                     "retry_attempt": nonexecuted_retry_count,
                 })
-                if nonexecuted_retry_count >= max_nonexecuted_retries:
+                if (
+                    nonexecuted_retry_count >= max_nonexecuted_retries
+                    and not collision_guard.consume_escape_replan_credit()
+                ):
                     raise RuntimeError(last_error)
                 continue
 
@@ -2080,6 +2157,16 @@ class BranchRunner:
                 memory, ep, config.branch_id,
             )
             if repeated_obstacle:
+                escaped_state = attempt_stuck_escape(
+                    metadata,
+                    image,
+                    task_criteria,
+                    f"{intent} {intent_target}".strip(),
+                )
+                if escaped_state is not None:
+                    image, metadata = escaped_state
+                    last_error = None
+                    continue
                 result_br = BranchResult(
                     branch_id=config.branch_id,
                     termination_reason=f"permanent_stuck:{repeated_obstacle}",
@@ -2217,7 +2304,10 @@ class BranchRunner:
                             "error_message": last_error,
                             "retry_attempt": nonexecuted_retry_count,
                         })
-                        if nonexecuted_retry_count >= max_nonexecuted_retries:
+                        if (
+                            nonexecuted_retry_count >= max_nonexecuted_retries
+                            and not collision_guard.consume_escape_replan_credit()
+                        ):
                             result_br = BranchResult(
                                 branch_id=config.branch_id,
                                 termination_reason="policy_guard_repeated_collision",
@@ -2268,7 +2358,10 @@ class BranchRunner:
                             "error_message": last_error,
                             "retry_attempt": nonexecuted_retry_count,
                         })
-                        if nonexecuted_retry_count >= max_nonexecuted_retries:
+                        if (
+                            nonexecuted_retry_count >= max_nonexecuted_retries
+                            and not collision_guard.consume_escape_replan_credit()
+                        ):
                             result_br = BranchResult(
                                 branch_id=config.branch_id,
                                 termination_reason="policy_guard_repeated_collision",
@@ -2519,6 +2612,22 @@ class BranchRunner:
             steps = params.get("steps") if isinstance(params, dict) else None
             return collision_guard.blocked_sequence_reason(steps, metadata)
         return collision_guard.blocked_action_reason(action, metadata)
+
+    @staticmethod
+    def _execute_stuck_reorientation(
+        collision_guard: CollisionGuard, env, metadata: dict,
+    ) -> list[tuple[str, dict]] | None:
+        """Turn toward the only physical direction not yet blocked, if one exists."""
+        actions = collision_guard.reorientation_escape(metadata)
+        if actions is None:
+            return None
+        results = []
+        for action in actions:
+            result = env.step(action)
+            results.append((action, result))
+            if not result.get("success"):
+                break
+        return results
 
     def _invalid_action_message(self, proposed_action: str) -> str:
         return (
