@@ -9,6 +9,7 @@ import os
 import base64
 import io
 import time
+from urllib.parse import urlsplit, urlunsplit
 import logging
 from pathlib import Path
 from typing import Optional
@@ -105,10 +106,19 @@ class VLMClient:
                  reasoning_effort: str | None = None, recover_api_outages: bool = True):
         self.backend = backend
         self.model = model
-        self.base_url = base_url
+        self.base_url = self._normalize_base_url(backend, base_url)
         self.api_key = api_key
         self.reasoning_effort = reasoning_effort  # "low" | "medium" | "high" | "xhigh" | "max"
         self.recover_api_outages = recover_api_outages
+
+    @staticmethod
+    def _normalize_base_url(backend: str, base_url: str | None) -> str | None:
+        if backend != "openai" or not base_url:
+            return base_url
+        parts = urlsplit(base_url.rstrip("/"))
+        if parts.scheme and parts.netloc and not parts.path:
+            parts = parts._replace(path="/v1")
+        return urlunsplit(parts)
 
     # ------------------------------------------------------------------
     # 工厂方法
