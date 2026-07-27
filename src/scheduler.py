@@ -466,6 +466,38 @@ class Scheduler:
             if os.path.exists(out_file):
                 EpisodeManager.load(out_file).set_status("interrupted")
             raise
+        except ReplayUnavailable as exc:
+            total_steps = 0
+            if os.path.exists(out_file):
+                manager = EpisodeManager.load(out_file)
+                total_steps = len(manager.get_steps_for_branch("main"))
+                manager.update_final_outcome(
+                    {
+                        "branch_id": "main",
+                        "termination_reason": "replay_unavailable",
+                        "total_steps": total_steps,
+                        "replay_error": str(exc),
+                    },
+                    is_main=True,
+                )
+                manager.cancel_pending_descendants(
+                    "main", "main replay unavailable",
+                )
+                manager.set_status("completed")
+            logging.warning(
+                "REPLAY_UNAVAILABLE episode=%s branch=main: %s", ep_id, exc,
+            )
+            print(
+                f"[{n}/{total}] Finished {ep_id}: replay_unavailable "
+                f"({total_steps} steps)"
+            )
+            return BranchResult(
+                branch_id="main",
+                termination_reason="replay_unavailable",
+                total_steps=total_steps,
+                fork_tasks=[],
+                fork_source_step_ids=[],
+            )
         except Exception as e:
             logging.warning("Worker for %s crashed, marking interrupted: %s", ep_id, e)
             if os.path.exists(out_file):

@@ -268,11 +268,15 @@ function Get-CollectorSnapshot {
     foreach ($record in $records | Where-Object {
         $_.Status -eq 'running' -and $_.Pid -eq $PipelinePid -and $lanes.Contains($_.TaskType)
     }) {
+        $mainSteps = $record.Steps
+        if ($record.BranchSteps.ContainsKey('main')) {
+            $mainSteps = [int]$record.BranchSteps['main']
+        }
         $lanes[$record.TaskType] = [pscustomobject]@{
             State = 'main'
             EpisodeId = $record.EpisodeId
             Branch = 'main'
-            Steps = $record.Steps
+            Steps = $mainSteps
         }
     }
 
@@ -302,22 +306,9 @@ function Get-CollectorSnapshot {
     })
     $namedForkCount = @($lanes.Values | Where-Object { $_.State -eq 'fork' }).Count
     $mainLaneCount = @($lanes.Values | Where-Object { $_.State -eq 'main' }).Count
-    $inferredForkCount = [math]::Max(0, $unityPids.Count - $mainLaneCount - $namedForkCount)
-    $remainingInferredForks = $inferredForkCount
-    foreach ($taskType in $script:TaskTypes) {
-        if ($remainingInferredForks -le 0) {
-            break
-        }
-        if ($lanes[$taskType].State -eq 'idle') {
-            $lanes[$taskType] = [pscustomobject]@{
-                State = 'fork?'
-                EpisodeId = '-'
-                Branch = 'inferred from Unity'
-                Steps = 0
-            }
-            $remainingInferredForks--
-        }
-    }
+    $unattributedUnityCount = [math]::Max(
+        0, $unityPids.Count - $mainLaneCount - $namedForkCount
+    )
     $memoryLine = (@(& $WslQuery 'memory' $PipelinePid) | Select-Object -First 1) -join ' '
     $recentEvents = @()
     if (Test-Path -LiteralPath $logPath) {
@@ -337,7 +328,8 @@ function Get-CollectorSnapshot {
         HostMemory = Get-HostMemoryText
         WslMemory = if ($memoryLine) { "WSL used/available: $memoryLine" } else { 'WSL memory unavailable' }
         Lanes = $lanes
-        ForkCount = $namedForkCount + $inferredForkCount
+        ForkCount = $namedForkCount
+        UnattributedUnityCount = $unattributedUnityCount
         RecentEvents = $recentEvents
     }
 }
@@ -349,7 +341,7 @@ function Format-CollectorDashboardLines {
     $lines = @(
         'EF-Bench Collector Monitor',
         "Updated: $($Snapshot.Timestamp.ToString('yyyy-MM-dd HH:mm:ss'))    Collector: $collector",
-        "Unity workers: $($Snapshot.UnityCount)    Visible AI2-THOR windows: $($Snapshot.VisibleWindowCount)    Active forks: $($Snapshot.ForkCount)",
+        "Unity workers: $($Snapshot.UnityCount)    Visible AI2-THOR windows: $($Snapshot.VisibleWindowCount)    Active forks: $($Snapshot.ForkCount)    Unattributed Unity: $($Snapshot.UnattributedUnityCount)",
         "Memory: $($Snapshot.HostMemory)    $($Snapshot.WslMemory)",
         '',
         ('{0,-36} {1,-6} {2,-29} {3,-25} {4,5}' -f 'TASK TYPE', 'STATE', 'EPISODE', 'BRANCH', 'STEPS'),
