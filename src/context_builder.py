@@ -34,18 +34,30 @@ def build_branch_history(
     parent_branch_id: str | None = None,
     shared_step_ids: Iterable[str] | None = None,
 ) -> list[dict]:
-    """Return shared parent steps followed by current-branch steps."""
+    """Return the ordered ancestor lineage followed by current-branch steps."""
     steps = list(episode_steps)
-    shared_ids = set(shared_step_ids or [])
     history = []
+    seen_ids = set()
 
-    if parent_branch_id and shared_ids:
-        for step in steps:
-            if step.get("branch_id") == parent_branch_id and step.get("step_id") in shared_ids:
+    if parent_branch_id and shared_step_ids:
+        steps_by_id = {
+            step.get("step_id"): step
+            for step in steps
+            if step.get("step_id")
+        }
+        for step_id in shared_step_ids:
+            if not step_id or step_id in seen_ids:
+                continue
+            step = steps_by_id.get(step_id)
+            if step is not None:
                 history.append(step)
+                seen_ids.add(step_id)
 
     for step in steps:
-        if step.get("branch_id") == branch_id:
+        if (
+            step.get("branch_id") == branch_id
+            and step.get("step_id") not in seen_ids
+        ):
             history.append(step)
 
     return history

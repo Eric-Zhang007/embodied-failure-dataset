@@ -258,6 +258,10 @@ class BranchResult:
     fork_source_step_ids: list[str] = field(default_factory=list)
 
 
+class ReplayUnavailable(RuntimeError):
+    """The persisted episode does not contain a reproducible simulator state."""
+
+
 class BranchRunner:
     def __init__(
         self,
@@ -1589,7 +1593,8 @@ class BranchRunner:
                         seq_result.get("failed_action", ""), seq_msg, metadata,
                     )
                     result = {"success": False, "error": seq_msg,
-                              "frame": image, "metadata": metadata}
+                              "frame": image, "metadata": metadata,
+                              "execution_trace": seq_result.get("execution_trace", [])}
                     triggered_trap_id = _matching_active_trap_id(
                         ep,
                         config.branch_id,
@@ -2915,9 +2920,11 @@ class BranchRunner:
         Returns (result_dict, message_string).
         """
         steps = params.get("steps", [])
+        execution_trace = []
         if not steps:
             return (
-                {"success": False, "error": "MoveSequence has no steps"},
+                {"success": False, "error": "MoveSequence has no steps",
+                 "execution_trace": execution_trace},
                 "MoveSequence failed: empty steps list. Provide at least one movement step.",
             )
 
@@ -2945,7 +2952,8 @@ class BranchRunner:
                     {"success": False, "all_succeeded": False,
                      "error": msg,
                      "executed": executed, "frame": final_frame, "metadata": final_metadata,
-                     "failed_params": step.get("params", {})},
+                     "failed_params": step.get("params", {}),
+                     "execution_trace": execution_trace},
                     msg,
                 )
 
@@ -2963,7 +2971,8 @@ class BranchRunner:
                     return (
                         {"success": False, "error": msg, "partial": True,
                          "executed": executed, "frame": final_frame, "metadata": final_metadata,
-                         "failed_params": step_params},
+                         "failed_params": step_params,
+                         "execution_trace": execution_trace},
                         msg,
                     )
                 current_objs = (final_metadata or metadata).get("objects", [])
@@ -2974,7 +2983,8 @@ class BranchRunner:
                     return (
                         {"success": False, "error": msg, "partial": True,
                          "executed": executed, "frame": final_frame, "metadata": final_metadata,
-                         "failed_params": resolved},
+                         "failed_params": resolved,
+                         "execution_trace": execution_trace},
                         msg,
                     )
                 act, params = adapt(action, resolved)
@@ -2987,7 +2997,8 @@ class BranchRunner:
                 return (
                     {"success": False, "error": msg, "partial": True,
                      "executed": executed, "frame": final_frame, "metadata": final_metadata,
-                     "failed_params": step_params},
+                     "failed_params": step_params,
+                     "execution_trace": execution_trace},
                     msg,
                 )
 
@@ -3001,7 +3012,8 @@ class BranchRunner:
                     {"success": False, "error": msg, "model_error": True,
                      "executed": executed, "failed_action": action,
                      "failed_params": params, "frame": final_frame,
-                     "metadata": final_metadata or metadata},
+                     "metadata": final_metadata or metadata,
+                     "execution_trace": execution_trace},
                     msg,
                 )
 
@@ -3010,6 +3022,12 @@ class BranchRunner:
             succeeded = 0
             for r in range(repeat):
                 result = env.step(act, **params)
+                execution_trace.append({
+                    "action": act,
+                    "params": dict(params),
+                    "success": bool(result.get("success")),
+                    "error": result.get("error"),
+                })
                 if result["success"]:
                     succeeded += 1
                     final_frame = result["frame"]
@@ -3039,7 +3057,8 @@ class BranchRunner:
                              "failed_at_repeat": succeeded,
                              "failed_params": params,
                              "frame": (final_frame if final_frame is not None else result["frame"]),
-                             "metadata": (final_metadata if final_metadata is not None else result["metadata"])},
+                             "metadata": (final_metadata if final_metadata is not None else result["metadata"]),
+                             "execution_trace": execution_trace},
                             msg,
                         )
                     else:
@@ -3051,7 +3070,8 @@ class BranchRunner:
                             {"success": False, "error": msg, "partial": False,
                              "failed_action": action,
                              "failed_params": params,
-                             "frame": result["frame"], "metadata": result["metadata"]},
+                             "frame": result["frame"], "metadata": result["metadata"],
+                             "execution_trace": execution_trace},
                             msg,
                         )
                     break
@@ -3069,7 +3089,8 @@ class BranchRunner:
             return (
                 {"success": True, "error": None, "all_succeeded": True,
                  "executed": executed,
-                 "frame": final_frame, "metadata": final_metadata},
+                 "frame": final_frame, "metadata": final_metadata,
+                 "execution_trace": execution_trace},
                 msg,
             )
 
@@ -3411,7 +3432,7 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
             method = injection.get("method")
             params = injection.get("params")
             if not isinstance(method, str) or not isinstance(params, dict):
-                raise RuntimeError(
+                raise ReplayUnavailable(
                     f"Replay injection is malformed at {s.get('step_id')}: {injection!r}"
                 )
             replay_params = dict(params)
@@ -3423,7 +3444,7 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                 env.controller, method=method, pddl_params=pddl_params or {}, **replay_params,
             )
             if not injection_result.get("success"):
-                raise RuntimeError(
+                raise ReplayUnavailable(
                     f"Replay injection failed at {s.get('step_id')}: "
                     f"{method}({params}) -> {injection_result.get('error', 'unknown')}"
                 )
@@ -3440,7 +3461,7 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
             for _ in range(4):
                 r = env.step("RotateLeft")
                 if not r["success"]:
-                    raise RuntimeError(
+                    raise ReplayUnavailable(
                         f"Replay LookAround RotateLeft failed at {s.get('step_id')}: {r['error']}"
                     )
                 if memory and task_criteria:
@@ -3449,13 +3470,13 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                                   "RotateLeft", r["success"], r.get("error"), task_criteria)
             post_scan_actions = s.get("post_scan_actions", [])
             if not isinstance(post_scan_actions, list):
-                raise RuntimeError(
+                raise ReplayUnavailable(
                     f"Replay post_scan_actions is malformed at {s.get('step_id')}: "
                     f"{post_scan_actions!r}"
                 )
             for post_action in post_scan_actions:
                 if not isinstance(post_action, dict):
-                    raise RuntimeError(
+                    raise ReplayUnavailable(
                         f"Replay post_scan_actions is malformed at {s.get('step_id')}: "
                         f"{post_action!r}"
                     )
@@ -3464,13 +3485,13 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                     "action_params", post_action.get("params", {}),
                 )
                 if post_name not in _MOVEMENT or not isinstance(post_params, dict):
-                    raise RuntimeError(
+                    raise ReplayUnavailable(
                         f"Replay post_scan_actions is invalid at {s.get('step_id')}: "
                         f"{post_action!r}"
                     )
                 r = env.step(post_name, **post_params)
                 if not r.get("success"):
-                    raise RuntimeError(
+                    raise ReplayUnavailable(
                         f"Replay post-scan action {post_name} failed at "
                         f"{s.get('step_id')}: {r.get('error')}"
                     )
@@ -3482,6 +3503,49 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
 
         # MoveSequence: expand and replay individual steps
         if action == "MoveSequence":
+            execution_trace = s.get("execution_trace")
+            if isinstance(execution_trace, list):
+                trace_failed = False
+                for trace_index, trace_step in enumerate(execution_trace):
+                    if not isinstance(trace_step, dict):
+                        raise ReplayUnavailable(
+                            f"Replay trace is malformed at {s.get('step_id')} "
+                            f"item {trace_index}: {trace_step!r}"
+                        )
+                    trace_action = trace_step.get("action")
+                    trace_params = trace_step.get("params", {})
+                    trace_success = trace_step.get("success")
+                    if not isinstance(trace_action, str) or not isinstance(trace_params, dict):
+                        raise ReplayUnavailable(
+                            f"Replay trace is malformed at {s.get('step_id')} "
+                            f"item {trace_index}: {trace_step!r}"
+                        )
+                    if trace_success is not True:
+                        trace_failed = True
+                        continue
+                    if trace_failed:
+                        raise ReplayUnavailable(
+                            f"Replay trace has a successful action after failure at "
+                            f"{s.get('step_id')} item {trace_index}"
+                        )
+                    r = env.step(trace_action, **trace_params)
+                    if not r.get("success"):
+                        raise ReplayUnavailable(
+                            f"Replay divergence at {s.get('step_id')}: recorded successful "
+                            f"micro-action {trace_action} failed: {r.get('error', 'unknown')}"
+                        )
+                if step_success and trace_failed:
+                    raise ReplayUnavailable(
+                        f"Replay trace contradicts successful step {s.get('step_id')}"
+                    )
+                if memory and task_criteria:
+                    meta = env.controller.last_event.metadata
+                    memory.update(
+                        meta, meta.get("objects", []), "MoveSequence", step_success,
+                        None if step_success else "recorded partial replay", task_criteria,
+                    )
+                continue
+
             seq_steps = params.get("steps", [])
             all_ok = True
             for st in seq_steps:
@@ -3494,7 +3558,7 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                     resolved, warn = resolve_object_ids(a, sp, objects)
                     if warn:
                         if step_success or not skip_failed:
-                            raise RuntimeError(
+                            raise ReplayUnavailable(
                                 f"Replay divergence at {s.get('step_id')}: recorded "
                                 f"{action} could not resolve {a}: {warn}"
                             )
@@ -3515,14 +3579,14 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                             )
                             all_ok = False
                             break
-                        raise RuntimeError(
+                        raise ReplayUnavailable(
                             f"Replay divergence at {s.get('step_id')}: recorded successful "
                             f"MoveSequence step {a} failed: {r['error']}"
                         )
                 if not all_ok:
                     break
             if not step_success and all_ok:
-                raise RuntimeError(
+                raise ReplayUnavailable(
                     f"Replay divergence at {s.get('step_id')}: recorded failed "
                     "MoveSequence completed successfully"
                 )
@@ -3549,7 +3613,7 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
             resolved, warn = resolve_object_ids(action, params, objects)
             if warn:
                 if step_success or not skip_failed:
-                    raise RuntimeError(
+                    raise ReplayUnavailable(
                         f"Replay divergence at {s.get('step_id')}: recorded {action} "
                         f"could not resolve: {warn}"
                     )
@@ -3577,18 +3641,18 @@ def replay_steps(env: EnvController, steps: list[dict], skip_failed: bool = True
                     action, s.get("step_id"), r.get("error", "unknown"),
                 )
                 continue
-            raise RuntimeError(
+            raise ReplayUnavailable(
                 f"Replay divergence at {s.get('step_id')}: recorded successful "
                 f"{action}({s.get('action_params', {})}) failed: {r['error']}"
             )
         if not step_success:
-            raise RuntimeError(
+            raise ReplayUnavailable(
                 f"Replay divergence at {s.get('step_id')}: recorded failed {action} succeeded"
             )
 
 
 def execute_move_sequence_steps(env, steps: list[dict], metadata: dict = None):
-    """Execute a MoveSequence step list. Returns (success, frame, metadata, error).
+    """Execute a MoveSequence and return state plus its exact low-level trace.
 
     Used by fork execution (_run_fork) to expand and run counterfactual MoveSequences.
     """
@@ -3600,20 +3664,30 @@ def execute_move_sequence_steps(env, steps: list[dict], metadata: dict = None):
 
     final_frame = None
     final_metadata = metadata or {}
+    execution_trace = []
 
     for step in steps:
         action = step.get("action", "")
         if action in _META:
-            return False, final_frame, final_metadata, f"MoveSequence contains meta-action {action!r}"
+            return (
+                False, final_frame, final_metadata,
+                f"MoveSequence contains meta-action {action!r}", execution_trace,
+            )
         if action not in _VALID_ACTIONS:
-            return False, final_frame, final_metadata, f"MoveSequence contains invalid action {action!r}"
+            return (
+                False, final_frame, final_metadata,
+                f"MoveSequence contains invalid action {action!r}", execution_trace,
+            )
 
         step_params = dict(step.get("params", {}) or {})
         if action not in _MOVEMENT:
             current_objs = (final_metadata or {}).get("objects", [])
             resolved, warn = resolve_object_ids(action, step_params, current_objs)
             if warn:
-                return False, final_frame, final_metadata, f"{action} resolution failed: {warn}"
+                return (
+                    False, final_frame, final_metadata,
+                    f"{action} resolution failed: {warn}", execution_trace,
+                )
             act_name, act_params = adapt(action, resolved)
         else:
             act_name = action
@@ -3622,12 +3696,21 @@ def execute_move_sequence_steps(env, steps: list[dict], metadata: dict = None):
         repeat = step.get("repeat", 1)
         for _ in range(repeat):
             result = env.step(act_name, **act_params)
+            execution_trace.append({
+                "action": act_name,
+                "params": dict(act_params),
+                "success": bool(result.get("success")),
+                "error": result.get("error"),
+            })
             final_frame = result.get("frame", final_frame)
             final_metadata = result.get("metadata", final_metadata)
             if not result.get("success"):
-                return False, final_frame, final_metadata, result.get("error", "step failed")
+                return (
+                    False, final_frame, final_metadata,
+                    result.get("error", "step failed"), execution_trace,
+                )
 
-    return True, final_frame, final_metadata, None
+    return True, final_frame, final_metadata, None, execution_trace
 
 
 def _require_alfred_scene(data: dict) -> dict:

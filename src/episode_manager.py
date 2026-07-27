@@ -97,13 +97,43 @@ class EpisodeManager:
 
         self._mutate(append_if_new)
 
-    def get_pending_fork_tasks(self) -> list[dict]:
+    def get_pending_fork_tasks(self, parent_branch_id: str | None = None) -> list[dict]:
         """Return fork jobs that a fresh scheduler must still account for."""
         return [
             dict(entry["task"])
             for entry in self.data.get("pending_forks", [])
-            if entry.get("state") in {"pending", "running"} and entry.get("task")
+            if (
+                entry.get("state") in {"pending", "running"}
+                and entry.get("task")
+                and (
+                    parent_branch_id is None
+                    or entry["task"].get("parent_branch_id") == parent_branch_id
+                )
+            )
         ]
+
+    def cancel_pending_descendants(self, parent_branch_id: str, reason: str):
+        """Cancel every queued descendant whose simulator lineage is invalid."""
+        def cancel_descendants(data):
+            invalid_parents = {parent_branch_id}
+            changed = True
+            while changed:
+                changed = False
+                for entry in data.get("pending_forks", []):
+                    task = entry.get("task") or {}
+                    branch_id = task.get("branch_id") or entry.get("branch_id")
+                    if (
+                        entry.get("state") not in {"pending", "running"}
+                        or task.get("parent_branch_id") not in invalid_parents
+                    ):
+                        continue
+                    entry["state"] = "cancelled"
+                    entry["termination_reason"] = reason
+                    if branch_id:
+                        invalid_parents.add(branch_id)
+                    changed = True
+
+        self._mutate(cancel_descendants)
 
     def mark_pending_fork_running(self, branch_id: str):
         def mark_running(data):

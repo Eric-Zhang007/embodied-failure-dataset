@@ -5,7 +5,6 @@
 import os
 import glob
 import logging
-import queue
 import threading
 from dataclasses import dataclass
 from collections import deque
@@ -18,7 +17,7 @@ from src.executor import ExecutorAgent
 from src.branch_runner import (
     BranchRunner, BranchConfig, BranchResult,
     run_single_branch, replay_steps, _sid,
-    execute_move_sequence_steps,
+    execute_move_sequence_steps, ReplayUnavailable,
 )
 from src.fork_manager import ForkManager
 from src.env_controller import EnvController
@@ -131,6 +130,17 @@ class Scheduler:
                     episode.set_status("interrupted")
                     status = "interrupted"
                 for fork_task in episode.get_pending_fork_tasks():
+                    parent_reason = self._branch_termination_reason(
+                        episode.data, fork_task.get("parent_branch_id"),
+                    )
+                    if not parent_reason:
+                        continue
+                    if self._invalid_fork_parent_reason(parent_reason):
+                        episode.cancel_pending_descendants(
+                            fork_task.get("parent_branch_id"),
+                            f"invalid parent outcome: {parent_reason}",
+                        )
+                        continue
                     self.queue.append({
                         "traj_path": f,
                         "episode_id": episode_id,
@@ -180,10 +190,8 @@ class Scheduler:
         }
         self._lock = threading.Lock()
         self._semaphore = threading.Semaphore(max_workers)
-        _fork_queue = queue.Queue()
         admitted_branch_keys = {self._branch_key(task) for task in self.queue}
         for index, task in enumerate(self.queue, start=1):
-            task["_fork_queue"] = _fork_queue
             task.setdefault("_display_index", index)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -214,7 +222,12 @@ class Scheduler:
                             fork_source_step_ids=[],
                         )
 
-                    if result.termination_reason.startswith("skipped"):
+                    if (
+                        result.termination_reason.startswith("skipped")
+                        or result.termination_reason in {
+                            "replay_unavailable", "fork_incomplete_before_restart",
+                        }
+                    ):
                         with self._lock:
                             self.stats["skipped"] += 1
                     elif result.termination_reason.startswith("worker_crash"):
@@ -237,7 +250,11 @@ class Scheduler:
                                     self.config.output_dir, f"{task['episode_id']}.json"
                                 )
                                 if os.path.exists(out_file):
-                                    EpisodeManager.load(out_file).set_status("failed")
+                                    manager = EpisodeManager.load(out_file)
+                                    manager.set_status("failed")
+                                    manager.cancel_pending_descendants(
+                                        "main", "parent worker crashed",
+                                    )
                             print(f"\nCRASH {task['episode_id']}: {result.termination_reason}")
                     else:
                         with self._lock:
@@ -246,18 +263,11 @@ class Scheduler:
                             if result.termination_reason == "task_complete":
                                 self.stats["task_complete"] += 1
 
-                        for fork_task in result.fork_tasks:
+                        for fork_task in self._fork_tasks_after_parent(task, result):
                             entry = self._fork_entry(task, fork_task)
                             if self._admit_fork_entry(entry, admitted_branch_keys):
                                 total += 1
                                 pending.append(entry)
-
-                    # Drain fork_queue for forks submitted mid-run via callback
-                    while not _fork_queue.empty():
-                        entry = _fork_queue.get_nowait()
-                        if self._admit_fork_entry(entry, admitted_branch_keys):
-                            total += 1
-                            pending.append(entry)
                     self._report(total)
 
         self._print_summary()
@@ -291,10 +301,8 @@ class Scheduler:
         }
         self._lock = threading.Lock()
         self._semaphore = threading.Semaphore(len(lane_order))
-        fork_queue = queue.Queue()
         admitted_branch_keys = {self._branch_key(task) for task in self.queue}
         for index, task in enumerate(self.queue, start=1):
-            task["_fork_queue"] = fork_queue
             task.setdefault("_display_index", index)
 
         print(f"Running {len(lane_order)} task lanes: {', '.join(lane_order)}")
@@ -333,7 +341,12 @@ class Scheduler:
                             fork_source_step_ids=[],
                         )
 
-                    if result.termination_reason.startswith("skipped"):
+                    if (
+                        result.termination_reason.startswith("skipped")
+                        or result.termination_reason in {
+                            "replay_unavailable", "fork_incomplete_before_restart",
+                        }
+                    ):
                         with self._lock:
                             self.stats["skipped"] += 1
                     elif result.termination_reason.startswith("worker_crash"):
@@ -355,7 +368,11 @@ class Scheduler:
                                     self.config.output_dir, f"{task['episode_id']}.json"
                                 )
                                 if os.path.exists(out_file):
-                                    EpisodeManager.load(out_file).set_status("failed")
+                                    manager = EpisodeManager.load(out_file)
+                                    manager.set_status("failed")
+                                    manager.cancel_pending_descendants(
+                                        "main", "parent worker crashed",
+                                    )
                             print(f"\nCRASH {task['episode_id']} ({task_type}): {result.termination_reason}")
                     else:
                         with self._lock:
@@ -363,20 +380,11 @@ class Scheduler:
                             self.stats["completed"] += 1
                             if result.termination_reason == "task_complete":
                                 self.stats["task_complete"] += 1
-                        for fork_task in reversed(result.fork_tasks):
+                        for fork_task in reversed(self._fork_tasks_after_parent(task, result)):
                             entry = self._fork_entry(task, fork_task)
                             entry["_lane_type"] = task_type
                             if self._admit_fork_entry(entry, admitted_branch_keys):
                                 lanes[task_type].appendleft(entry)
-                                total += 1
-
-                    while not fork_queue.empty():
-                        entry = fork_queue.get_nowait()
-                        entry_task_type = entry.get("_lane_type") or entry["meta"].get("alfred_task_type")
-                        if entry_task_type in lanes:
-                            entry["_lane_type"] = entry_task_type
-                            if self._admit_fork_entry(entry, admitted_branch_keys):
-                                lanes[entry_task_type].appendleft(entry)
                                 total += 1
 
                     submit_lane(task_type)
@@ -418,13 +426,6 @@ class Scheduler:
         if existing:
             existing.set_status("running", os.getpid())
 
-        _fork_queue = task.get("_fork_queue")
-        if _fork_queue is not None:
-            def _on_fork(fork_task):
-                _fork_queue.put(self._fork_entry(task, fork_task))
-        else:
-            _on_fork = None
-
         try:
             if existing and existing.get_steps_for_branch("main"):
                 result = BranchRunner.resume(
@@ -437,7 +438,7 @@ class Scheduler:
                     enable_fork=self.config.enable_fork,
                     enable_phase2=not self.config.no_traps,
                     memory_mode=self.config.memory_mode,
-                    fork_callback=_on_fork,
+                    fork_callback=None,
                 )
             else:
                 result = run_single_branch(
@@ -450,7 +451,7 @@ class Scheduler:
                     executor_agent=executor_agent,
                     memory_mode=self.config.memory_mode,
                     episode_status="running",
-                    fork_callback=_on_fork,
+                    fork_callback=None,
                 )
 
             if os.path.exists(out_file):
@@ -492,6 +493,11 @@ class Scheduler:
         meta = task["meta"]
         ep_id = task["episode_id"]
         fc = config.fork_config or {}
+        lane_type = (
+            task.get("_lane_type")
+            or meta.get("alfred_task_type")
+            or "unknown"
+        )
 
         out_file = os.path.join(self.config.output_dir, f"{ep_id}.json")
         if not os.path.exists(out_file):
@@ -521,6 +527,9 @@ class Scheduler:
                     fork_source_step_id=fc.get("origin_step_id", "?"),
                     counterfactual_verified=False,
                 )
+                ep.cancel_pending_descendants(
+                    config.branch_id, "parent fork was incomplete before restart",
+                )
                 return BranchResult(
                     branch_id=config.branch_id,
                     termination_reason="fork_incomplete_before_restart",
@@ -539,7 +548,10 @@ class Scheduler:
                 fork_tasks=[],
                 fork_source_step_ids=[],
             )
-        print(f"\n[fork] Starting {config.branch_id} (parent={config.parent_branch_id}) on {ep_id}")
+        print(
+            f"\n[fork] Starting {config.branch_id} "
+            f"(parent={config.parent_branch_id}) on {ep_id} lane={lane_type}"
+        )
 
         # A nested fork inherits its whole lineage, not only its direct parent
         # branch. Keep the IDs' recorded order: branch-local step indexes reset
@@ -585,7 +597,7 @@ class Scheduler:
 
             if alt_name == "MoveSequence":
                 steps = alt_params.get("steps", [])
-                success, frame, metadata, error = execute_move_sequence_steps(
+                success, frame, metadata, error, execution_trace = execute_move_sequence_steps(
                     env, steps, env.get_state_snapshot()["metadata"],
                 )
                 alt_result = {
@@ -593,6 +605,7 @@ class Scheduler:
                     "error": error,
                     "frame": frame,
                     "metadata": metadata or env.get_state_snapshot()["metadata"],
+                    "execution_trace": execution_trace,
                 }
                 exec_name = alt_name
                 exec_params = alt_params
@@ -641,6 +654,11 @@ class Scheduler:
                     counterfactual_verified=False,
                     counterfactual_root_feasible=False,
                 )
+                print(
+                    f"[fork] Finished {config.branch_id} "
+                    f"(parent={config.parent_branch_id}) on {ep_id} lane={lane_type}: "
+                    "fork_failed (1 steps)"
+                )
                 return BranchResult(
                     branch_id=config.branch_id, termination_reason="fork_failed",
                     total_steps=1, fork_tasks=[], fork_source_step_ids=[],
@@ -684,27 +702,56 @@ class Scheduler:
             ep.add_step(fork_root)
 
             # 4. 委托 BranchRunner 从 step_index=1 继续
-            _fork_queue = task.get("_fork_queue")
-            if _fork_queue is not None:
-                def _on_fork(fork_task):
-                    _fork_queue.put(self._fork_entry(task, fork_task))
-            else:
-                _on_fork = None
             branch_runner = BranchRunner(
                 eb_agent, oracle_agent, self.config.output_dir,
                 enable_fork=self.config.enable_fork,
                 enable_phase2=not self.config.no_traps,
                 executor_agent=executor_agent,
-                _fork_callback=_on_fork,
+                _fork_callback=None,
             )
             result = branch_runner.run(
                 config=config, env=env, ep=ep,
                 start_step_index=1,
             )
-            print(f"[fork] Finished {config.branch_id}: {result.termination_reason} ({result.total_steps} steps)")
+            print(
+                f"[fork] Finished {config.branch_id} "
+                f"(parent={config.parent_branch_id}) on {ep_id} lane={lane_type}: "
+                f"{result.termination_reason} ({result.total_steps} steps)"
+            )
             return result
         except KeyboardInterrupt:
             raise
+        except ReplayUnavailable as exc:
+            ep.update_final_outcome(
+                {
+                    "branch_id": config.branch_id,
+                    "termination_reason": "replay_unavailable",
+                    "total_steps": len(ep.get_steps_for_branch(config.branch_id)),
+                    "replay_error": str(exc),
+                },
+                is_main=False,
+                fork_source_step_id=fc.get("origin_step_id", "?"),
+                counterfactual_verified=False,
+            )
+            ep.cancel_pending_descendants(
+                config.branch_id, "parent replay unavailable",
+            )
+            print(
+                f"[fork] Finished {config.branch_id} "
+                f"(parent={config.parent_branch_id}) on {ep_id} lane={lane_type}: "
+                "replay_unavailable (0 steps)"
+            )
+            logging.warning(
+                "REPLAY_UNAVAILABLE episode=%s branch=%s: %s",
+                ep_id, config.branch_id, exc,
+            )
+            return BranchResult(
+                branch_id=config.branch_id,
+                termination_reason="replay_unavailable",
+                total_steps=0,
+                fork_tasks=[],
+                fork_source_step_ids=[],
+            )
         except Exception as exc:
             ep.update_final_outcome(
                 {
@@ -715,6 +762,14 @@ class Scheduler:
                 is_main=False,
                 fork_source_step_id=fc.get("origin_step_id", "?"),
                 counterfactual_verified=False,
+            )
+            ep.cancel_pending_descendants(
+                config.branch_id, "parent worker crashed",
+            )
+            print(
+                f"[fork] Finished {config.branch_id} "
+                f"(parent={config.parent_branch_id}) on {ep_id} lane={lane_type}: "
+                f"worker_crash ({len(ep.get_steps_for_branch(config.branch_id))} steps)"
             )
             raise
         finally:
@@ -727,9 +782,51 @@ class Scheduler:
             "meta": parent_task["meta"],
             "base_step_count": parent_task["base_step_count"],
             "branch_config": BranchConfig(**fork_task),
-            "_fork_queue": parent_task.get("_fork_queue"),
         }
         return entry
+
+    def _fork_tasks_after_parent(
+        self, task: dict, result: BranchResult,
+    ) -> list[dict]:
+        """Release descendants only after their parent returned normally."""
+        if self._invalid_fork_parent_reason(result.termination_reason):
+            return []
+        fork_tasks = list(result.fork_tasks)
+        out_file = os.path.join(
+            self.config.output_dir, f"{task['episode_id']}.json",
+        )
+        if os.path.exists(out_file):
+            episode = EpisodeManager.load(out_file)
+            fork_tasks.extend(
+                episode.get_pending_fork_tasks(parent_branch_id=result.branch_id)
+            )
+        unique_tasks = []
+        seen_branch_ids = set()
+        for fork_task in fork_tasks:
+            branch_id = fork_task.get("branch_id")
+            if not branch_id or branch_id in seen_branch_ids:
+                continue
+            seen_branch_ids.add(branch_id)
+            unique_tasks.append(fork_task)
+        return unique_tasks
+
+    @staticmethod
+    def _branch_termination_reason(data: dict, branch_id: str | None) -> str:
+        if not branch_id:
+            return ""
+        outcome = data.get("final_outcome") or {}
+        if branch_id == "main":
+            return str((outcome.get("main_branch") or {}).get("termination_reason") or "")
+        for branch in outcome.get("forks", []):
+            if branch.get("branch_id") == branch_id:
+                return str(branch.get("termination_reason") or "")
+        return ""
+
+    @staticmethod
+    def _invalid_fork_parent_reason(reason: str) -> bool:
+        return reason.startswith((
+            "worker_crash", "replay_unavailable", "fork_incomplete_before_restart",
+        ))
 
     @staticmethod
     def _branch_key(task: dict) -> tuple[str, str]:
@@ -737,12 +834,7 @@ class Scheduler:
         return config.episode_id, config.branch_id
 
     def _admit_fork_entry(self, entry: dict, admitted_branch_keys: set[tuple[str, str]]) -> bool:
-        """Allow each persisted branch identity to execute exactly once per run.
-
-        BranchRunner reports a new fork twice: once immediately via its callback
-        and once in its final BranchResult.  Both paths are intentional, but they
-        must converge before a worker starts writing the branch trajectory.
-        """
+        """Allow each persisted branch identity to execute exactly once per run."""
         key = self._branch_key(entry)
         if key in admitted_branch_keys:
             self.stats["fork_duplicates"] += 1

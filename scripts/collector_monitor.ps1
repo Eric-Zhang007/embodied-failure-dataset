@@ -166,12 +166,24 @@ function Get-MonitorEpisodeRecords {
     foreach ($file in Get-ChildItem -LiteralPath $OutputDir -Filter 'trial_*.json' -File -ErrorAction SilentlyContinue) {
         try {
             $episode = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $branchSteps = @{}
+            foreach ($step in @($episode.steps)) {
+                $branchId = [string]$step.branch_id
+                if (-not $branchId) {
+                    continue
+                }
+                if (-not $branchSteps.ContainsKey($branchId)) {
+                    $branchSteps[$branchId] = 0
+                }
+                $branchSteps[$branchId]++
+            }
             $records += [pscustomobject]@{
                 EpisodeId = [string]$episode.episode_id
                 TaskType = [string]$episode.alfred_task_type
                 Status = [string]$episode.status
                 Pid = [int]$episode.pid
                 Steps = @($episode.steps).Count
+                BranchSteps = $branchSteps
                 Modified = $file.LastWriteTime
             }
         } catch {
@@ -182,17 +194,14 @@ function Get-MonitorEpisodeRecords {
 }
 
 function Get-ActiveForks {
-    param(
-        [string]$LogPath,
-        [hashtable]$TaskTypeByEpisode
-    )
+    param([string]$LogPath)
 
     if (-not (Test-Path -LiteralPath $LogPath)) {
         return @()
     }
 
     $active = @{}
-    $lines = Get-Content -LiteralPath $LogPath -Tail 3000 -ErrorAction SilentlyContinue
+    $lines = Get-Content -LiteralPath $LogPath -Tail 20000 -ErrorAction SilentlyContinue
     foreach ($line in $lines) {
         if ($line -match '^\[fork\] Starting (?<branch>\S+) \(parent=(?<parent>[^)]+)\) on (?<episode>\S+)(?: lane=(?<lane>\S+))?') {
             $key = "$($Matches.episode)|$($Matches.branch)"
@@ -250,10 +259,10 @@ function Get-CollectorSnapshot {
         }
     }
 
-    $taskTypeByEpisode = @{}
+    $branchStepsByEpisode = @{}
     foreach ($record in $records) {
         if ($record.EpisodeId -and $record.TaskType) {
-            $taskTypeByEpisode[$record.EpisodeId] = $record.TaskType
+            $branchStepsByEpisode[$record.EpisodeId] = $record.BranchSteps
         }
     }
     foreach ($record in $records | Where-Object {
@@ -268,14 +277,21 @@ function Get-CollectorSnapshot {
     }
 
     $logPath = Join-Path $OutputDir 'collector.log'
-    $forks = Get-ActiveForks -LogPath $logPath -TaskTypeByEpisode $taskTypeByEpisode
+    $forks = Get-ActiveForks -LogPath $logPath
     foreach ($fork in $forks) {
         if ($lanes.Contains($fork.TaskType) -and $lanes[$fork.TaskType].State -eq 'idle') {
+            $forkSteps = 0
+            if ($branchStepsByEpisode.ContainsKey($fork.EpisodeId)) {
+                $episodeBranchSteps = $branchStepsByEpisode[$fork.EpisodeId]
+                if ($episodeBranchSteps.ContainsKey($fork.Branch)) {
+                    $forkSteps = [int]$episodeBranchSteps[$fork.Branch]
+                }
+            }
             $lanes[$fork.TaskType] = [pscustomobject]@{
                 State = 'fork'
                 EpisodeId = $fork.EpisodeId
                 Branch = $fork.Branch
-                Steps = 0
+                Steps = $forkSteps
             }
         }
     }

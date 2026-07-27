@@ -21,7 +21,7 @@ class StepRecorder:
         if frame is not None:
             StepRecorder.save_frame(frame, image_path)
 
-        return {
+        step = {
             "step_id": step_id,
             "branch_id": branch_id,
             "parent_step_id": parent_step_id,
@@ -48,6 +48,17 @@ class StepRecorder:
             "fork_decision": None,
             "fork_metadata": None,
         }
+        if "execution_trace" in result:
+            step["execution_trace"] = [
+                {
+                    "action": trace_step.get("action"),
+                    "params": dict(trace_step.get("params") or {}),
+                    "success": bool(trace_step.get("success")),
+                    "error": trace_step.get("error"),
+                }
+                for trace_step in result.get("execution_trace") or []
+            ]
+        return step
 
     @staticmethod
     def save_frame(frame: np.ndarray, path: str):
