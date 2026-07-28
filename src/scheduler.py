@@ -135,6 +135,9 @@ class Scheduler:
                     episode.set_status("interrupted")
                     status = "interrupted"
                 for fork_task in episode.get_pending_fork_tasks():
+                    fork_task = self._prepare_fork_task(episode, fork_task)
+                    if fork_task is None:
+                        continue
                     parent_reason = self._branch_termination_reason(
                         episode.data, fork_task.get("parent_branch_id"),
                     )
@@ -145,9 +148,6 @@ class Scheduler:
                             fork_task.get("parent_branch_id"),
                             f"invalid parent outcome: {parent_reason}",
                         )
-                        continue
-                    fork_task = self._prepare_fork_task(episode, fork_task)
-                    if fork_task is None:
                         continue
                     self.queue.append({
                         "traj_path": f,

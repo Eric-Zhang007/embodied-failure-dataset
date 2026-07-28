@@ -205,6 +205,35 @@ def test_load_tasks_backfills_legacy_depth_before_queueing():
         assert persisted[0]["fork_depth"] == 1
 
 
+def test_load_tasks_rejects_depth_four_even_when_parent_is_unfinished():
+    with tempfile.TemporaryDirectory() as output_dir:
+        manager = EpisodeManager("episode-1", output_dir, _metadata())
+        parent = "main"
+        for depth in range(1, 5):
+            task = _legacy_task(f"opaque-{depth}", parent)
+            manager.add_pending_fork(task)
+            parent = task["branch_id"]
+
+        scheduler = _scheduler(output_dir)
+        scheduler.config.data_dir = "/fake-data"
+        scheduler.queue = deque()
+
+        with patch(
+            "src.scheduler.glob.glob",
+            side_effect=[["/fake/episode-1/traj_data.json"], [], []],
+        ), patch("src.scheduler.load_traj", return_value={}), patch(
+            "src.scheduler.extract_metadata", return_value=_metadata(),
+        ), patch("src.scheduler.extract_low_actions", return_value=[]):
+            scheduler.load_tasks()
+
+        entries = EpisodeManager.load(manager.file_path).data["pending_forks"]
+        assert [entry["state"] for entry in entries] == [
+            "pending", "pending", "pending", "rejected",
+        ]
+        assert entries[-1]["termination_reason"] == "fork_depth_limit"
+        assert entries[-1]["fork_depth"] == 4
+
+
 def test_prepare_rejects_depth_four_before_worker_admission():
     with tempfile.TemporaryDirectory() as output_dir:
         manager = EpisodeManager("episode-1", output_dir, _metadata())
