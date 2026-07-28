@@ -27,6 +27,10 @@ from src.step_recorder import StepRecorder
 from src.action_adapter import resolve_object_ids, adapt
 
 
+class InvalidForkLineage(ValueError):
+    """A persisted fork cannot be connected to main through parent links."""
+
+
 @dataclass
 class SchedulerConfig:
     data_dir: str = "data/json_2.1.0"
@@ -816,6 +820,95 @@ class Scheduler:
             "branch_config": BranchConfig(**fork_task),
         }
         return entry
+
+    @staticmethod
+    def _resolve_fork_depth(episode: EpisodeManager, fork_task: dict) -> int:
+        registry_tasks = {
+            entry.get("branch_id"): entry.get("task") or {}
+            for entry in episode.data.get("pending_forks", [])
+            if entry.get("branch_id")
+        }
+        registry_tasks[fork_task.get("branch_id")] = fork_task
+        depth_cache = {"main": 0}
+
+        def resolve(branch_id: str, active: set[str]) -> int:
+            if branch_id in depth_cache:
+                return depth_cache[branch_id]
+            if branch_id in active:
+                raise InvalidForkLineage(
+                    f"parent cycle detected at branch {branch_id!r}"
+                )
+            task = registry_tasks.get(branch_id)
+            if task is None:
+                raise InvalidForkLineage(f"missing parent branch {branch_id!r}")
+            parent_id = task.get("parent_branch_id")
+            if not isinstance(parent_id, str) or not parent_id:
+                raise InvalidForkLineage(
+                    f"branch {branch_id!r} does not terminate at main"
+                )
+            parent_depth = resolve(parent_id, active | {branch_id})
+            depth = parent_depth + 1
+            explicit_depth = task.get("fork_depth")
+            if explicit_depth is not None and (
+                not isinstance(explicit_depth, int)
+                or isinstance(explicit_depth, bool)
+                or explicit_depth != depth
+            ):
+                raise InvalidForkLineage(
+                    f"branch {branch_id!r} has fork_depth={explicit_depth!r}, "
+                    f"but parent links require {depth}"
+                )
+            depth_cache[branch_id] = depth
+            return depth
+
+        branch_id = fork_task.get("branch_id")
+        if not isinstance(branch_id, str) or not branch_id:
+            raise InvalidForkLineage("fork task has no branch_id")
+        return resolve(branch_id, set())
+
+    def _prepare_fork_task(
+        self, episode: EpisodeManager, fork_task: dict,
+    ) -> dict | None:
+        branch_id = fork_task.get("branch_id")
+        try:
+            depth = self._resolve_fork_depth(episode, fork_task)
+        except InvalidForkLineage as exc:
+            episode.reject_pending_fork(
+                branch_id,
+                termination_reason="invalid_fork_lineage",
+                fork_depth=None,
+                diagnostic=str(exc),
+            )
+            self.stats["fork_rejected"] = self.stats.get("fork_rejected", 0) + 1
+            logging.warning(
+                "FORK_REJECTED episode=%s branch=%s parent=%s depth=? reason=%s",
+                fork_task.get("episode_id"), branch_id,
+                fork_task.get("parent_branch_id"), exc,
+            )
+            return None
+
+        if depth > 3:
+            diagnostic = f"fork depth {depth} exceeds maximum 3"
+            episode.reject_pending_fork(
+                branch_id,
+                termination_reason="fork_depth_limit",
+                fork_depth=depth,
+                diagnostic=diagnostic,
+            )
+            self.stats["fork_rejected"] = self.stats.get("fork_rejected", 0) + 1
+            logging.warning(
+                "FORK_REJECTED episode=%s branch=%s parent=%s depth=%d "
+                "reason=fork_depth_limit",
+                fork_task.get("episode_id"), branch_id,
+                fork_task.get("parent_branch_id"), depth,
+            )
+            return None
+
+        prepared = dict(fork_task)
+        prepared["fork_depth"] = depth
+        if fork_task.get("fork_depth") != depth:
+            episode.set_pending_fork_depth(branch_id, depth)
+        return prepared
 
     def _fork_tasks_after_parent(
         self, task: dict, result: BranchResult,

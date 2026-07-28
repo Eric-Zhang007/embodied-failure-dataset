@@ -144,6 +144,40 @@ class EpisodeManager:
 
         self._mutate(mark_running)
 
+    def set_pending_fork_depth(self, branch_id: str, fork_depth: int):
+        def set_depth(data):
+            for entry in data.get("pending_forks", []):
+                if entry.get("branch_id") == branch_id:
+                    entry["fork_depth"] = fork_depth
+                    if entry.get("task") is not None:
+                        entry["task"]["fork_depth"] = fork_depth
+                    return
+            raise ValueError(f"Pending fork not found: {branch_id}")
+
+        self._mutate(set_depth)
+
+    def reject_pending_fork(
+        self,
+        branch_id: str,
+        *,
+        termination_reason: str,
+        fork_depth: int | None,
+        diagnostic: str,
+    ):
+        def reject(data):
+            for entry in data.get("pending_forks", []):
+                if entry.get("branch_id") == branch_id:
+                    entry["state"] = "rejected"
+                    entry["termination_reason"] = termination_reason
+                    entry["fork_depth"] = fork_depth
+                    entry["diagnostic"] = diagnostic
+                    if entry.get("task") is not None and fork_depth is not None:
+                        entry["task"]["fork_depth"] = fork_depth
+                    return
+            raise ValueError(f"Pending fork not found: {branch_id}")
+
+        self._mutate(reject)
+
     def trigger_runtime_trap(self, trap_id: str, step_id: str, error_message: str):
         def mark_triggered(data):
             for trap in data["runtime_traps"]:
