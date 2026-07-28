@@ -25,6 +25,7 @@ from src.episode_manager import EpisodeManager
 from src.alfred_parser import TASK_TYPE_MAP, load_traj, extract_metadata, extract_low_actions
 from src.step_recorder import StepRecorder
 from src.action_adapter import resolve_object_ids, adapt
+from src.fair_branch_queue import FairBranchQueue
 
 
 class InvalidForkLineage(ValueError):
@@ -145,6 +146,9 @@ class Scheduler:
                             f"invalid parent outcome: {parent_reason}",
                         )
                         continue
+                    fork_task = self._prepare_fork_task(episode, fork_task)
+                    if fork_task is None:
+                        continue
                     self.queue.append({
                         "traj_path": f,
                         "episode_id": episode_id,
@@ -172,7 +176,7 @@ class Scheduler:
                 ),
             })
 
-        print(f"Loaded {len(self.queue)} main branch tasks.")
+        print(f"Loaded {len(self.queue)} branch tasks.")
 
     # ------------------------------------------------------------------
     # 主循环
@@ -191,6 +195,7 @@ class Scheduler:
             "skipped": 0,
             "failed": 0,
             "fork_duplicates": 0,
+            "fork_rejected": 0,
         }
         self._lock = threading.Lock()
         self._semaphore = threading.Semaphore(max_workers)
@@ -199,7 +204,9 @@ class Scheduler:
             task.setdefault("_display_index", index)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            pending: deque[dict] = deque(self.queue)
+            pending = FairBranchQueue()
+            for task in self.queue:
+                pending.append(task)
             futures: dict = {}
 
             def submit_available() -> None:
@@ -240,7 +247,7 @@ class Scheduler:
                         if is_main and retries < self.config.max_worker_retries:
                             retry_task = dict(task)
                             retry_task["_worker_retries"] = retries + 1
-                            pending.appendleft(retry_task)
+                            pending.append_main_retry(retry_task)
                             print(
                                 f"\nRETRY {task['episode_id']}: "
                                 f"attempt {retries + 1}/{self.config.max_worker_retries} "
@@ -268,22 +275,20 @@ class Scheduler:
                                 self.stats["task_complete"] += 1
 
                         for fork_task in self._fork_tasks_after_parent(task, result):
-                            entry = self._fork_entry(task, fork_task)
+                            entry = self._prepare_fork_entry(task, fork_task)
+                            if entry is None:
+                                continue
                             if self._admit_fork_entry(entry, admitted_branch_keys):
                                 total += 1
                                 pending.append(entry)
-                    self._report(total)
+                    self._report(total, pending.counts())
 
         self._print_summary()
 
     def _run_task_lanes(self):
         """Keep one worker active for each raw ALFRED task type."""
         lane_order = list(TASK_TYPE_MAP)
-        lanes: dict[str, deque[dict]] = {task_type: deque() for task_type in lane_order}
-        for task in self.queue:
-            task_type = task["meta"].get("alfred_task_type")
-            if task_type in lanes:
-                lanes[task_type].append(task)
+        lanes = self._build_task_lane_queues(lane_order, self.queue)
 
         empty_lanes = [task_type for task_type, tasks in lanes.items() if not tasks]
         if empty_lanes:
@@ -302,6 +307,7 @@ class Scheduler:
             "skipped": 0,
             "failed": 0,
             "fork_duplicates": 0,
+            "fork_rejected": 0,
         }
         self._lock = threading.Lock()
         self._semaphore = threading.Semaphore(len(lane_order))
@@ -359,7 +365,7 @@ class Scheduler:
                         if is_main and retries < self.config.max_worker_retries:
                             retry_task = dict(task)
                             retry_task["_worker_retries"] = retries + 1
-                            lanes[task_type].appendleft(retry_task)
+                            lanes[task_type].append_main_retry(retry_task)
                             print(
                                 f"\nRETRY {task['episode_id']} ({task_type}): "
                                 f"attempt {retries + 1}/{self.config.max_worker_retries}"
@@ -384,15 +390,17 @@ class Scheduler:
                             self.stats["completed"] += 1
                             if result.termination_reason == "task_complete":
                                 self.stats["task_complete"] += 1
-                        for fork_task in reversed(self._fork_tasks_after_parent(task, result)):
-                            entry = self._fork_entry(task, fork_task)
+                        for fork_task in self._fork_tasks_after_parent(task, result):
+                            entry = self._prepare_fork_entry(task, fork_task)
+                            if entry is None:
+                                continue
                             entry["_lane_type"] = task_type
                             if self._admit_fork_entry(entry, admitted_branch_keys):
-                                lanes[task_type].appendleft(entry)
+                                lanes[task_type].append(entry)
                                 total += 1
 
                     submit_lane(task_type)
-                    self._report(total)
+                    self._report(total, self._aggregate_queue_counts(lanes.values()))
 
                 for lane in lane_order:
                     submit_lane(lane)
@@ -821,6 +829,91 @@ class Scheduler:
         }
         return entry
 
+    def _prepare_fork_entry(
+        self, parent_task: dict, fork_task: dict,
+    ) -> dict | None:
+        expected_depth = parent_task["branch_config"].fork_depth + 1
+        explicit_depth = fork_task.get("fork_depth")
+        out_file = os.path.join(
+            self.config.output_dir, f"{parent_task['episode_id']}.json",
+        )
+        invalid_explicit_depth = explicit_depth is not None and (
+            not isinstance(explicit_depth, int)
+            or isinstance(explicit_depth, bool)
+            or explicit_depth != expected_depth
+        )
+        if invalid_explicit_depth:
+            diagnostic = (
+                f"fork_depth={explicit_depth!r}, but parent requires depth "
+                f"{expected_depth}"
+            )
+            if os.path.exists(out_file):
+                EpisodeManager.load(out_file).reject_pending_fork(
+                    fork_task.get("branch_id"),
+                    termination_reason="invalid_fork_lineage",
+                    fork_depth=explicit_depth,
+                    diagnostic=diagnostic,
+                )
+            logging.warning(
+                "FORK_REJECTED episode=%s branch=%s parent=%s depth=%r "
+                "reason=invalid_fork_lineage expected_depth=%d",
+                fork_task.get("episode_id"), fork_task.get("branch_id"),
+                fork_task.get("parent_branch_id"), explicit_depth, expected_depth,
+            )
+            self.stats["fork_rejected"] = self.stats.get("fork_rejected", 0) + 1
+            return None
+        fork_task = dict(fork_task)
+        fork_task["fork_depth"] = expected_depth
+
+        if os.path.exists(out_file):
+            episode = EpisodeManager.load(out_file)
+            fork_task = self._prepare_fork_task(episode, fork_task)
+            if fork_task is None:
+                return None
+        elif expected_depth > FairBranchQueue.MAX_FORK_DEPTH:
+            logging.warning(
+                "FORK_REJECTED episode=%s branch=%s parent=%s depth=%d "
+                "reason=fork_depth_limit",
+                fork_task.get("episode_id"), fork_task.get("branch_id"),
+                fork_task.get("parent_branch_id"), expected_depth,
+            )
+            self.stats["fork_rejected"] = self.stats.get("fork_rejected", 0) + 1
+            return None
+        return self._fork_entry(parent_task, fork_task)
+
+    @staticmethod
+    def _build_task_lane_queues(
+        lane_order: list[str], tasks,
+    ) -> dict[str, FairBranchQueue]:
+        lanes = {task_type: FairBranchQueue() for task_type in lane_order}
+        for task in tasks:
+            task_type = task["meta"].get("alfred_task_type")
+            if task_type in lanes:
+                lanes[task_type].append(task)
+        return lanes
+
+    @staticmethod
+    def _aggregate_queue_counts(queues) -> dict[str, int]:
+        totals = {
+            "main": 0,
+            "fork_depth_1": 0,
+            "fork_depth_2": 0,
+            "fork_depth_3": 0,
+        }
+        for queue in queues:
+            for key, value in queue.counts().items():
+                totals[key] += value
+        return totals
+
+    @staticmethod
+    def _format_queue_counts(counts: dict[str, int]) -> str:
+        return (
+            f"queued main={counts.get('main', 0)} "
+            f"fork[d1={counts.get('fork_depth_1', 0)},"
+            f"d2={counts.get('fork_depth_2', 0)},"
+            f"d3={counts.get('fork_depth_3', 0)}]"
+        )
+
     @staticmethod
     def _resolve_fork_depth(episode: EpisodeManager, fork_task: dict) -> int:
         registry_tasks = {
@@ -879,7 +972,8 @@ class Scheduler:
                 fork_depth=None,
                 diagnostic=str(exc),
             )
-            self.stats["fork_rejected"] = self.stats.get("fork_rejected", 0) + 1
+            if hasattr(self, "stats"):
+                self.stats["fork_rejected"] = self.stats.get("fork_rejected", 0) + 1
             logging.warning(
                 "FORK_REJECTED episode=%s branch=%s parent=%s depth=? reason=%s",
                 fork_task.get("episode_id"), branch_id,
@@ -887,15 +981,19 @@ class Scheduler:
             )
             return None
 
-        if depth > 3:
-            diagnostic = f"fork depth {depth} exceeds maximum 3"
+        if depth > FairBranchQueue.MAX_FORK_DEPTH:
+            diagnostic = (
+                f"fork depth {depth} exceeds maximum "
+                f"{FairBranchQueue.MAX_FORK_DEPTH}"
+            )
             episode.reject_pending_fork(
                 branch_id,
                 termination_reason="fork_depth_limit",
                 fork_depth=depth,
                 diagnostic=diagnostic,
             )
-            self.stats["fork_rejected"] = self.stats.get("fork_rejected", 0) + 1
+            if hasattr(self, "stats"):
+                self.stats["fork_rejected"] = self.stats.get("fork_rejected", 0) + 1
             logging.warning(
                 "FORK_REJECTED episode=%s branch=%s parent=%s depth=%d "
                 "reason=fork_depth_limit",
@@ -971,7 +1069,7 @@ class Scheduler:
         admitted_branch_keys.add(key)
         return True
 
-    def _report(self, total: int):
+    def _report(self, total: int, queue_counts: dict[str, int] | None = None):
         done = self.stats["terminal"] + self.stats["failed"] + self.stats["skipped"]
         remaining = total - done
         non_success_terminal = self.stats["terminal"] - self.stats["task_complete"]
@@ -979,7 +1077,12 @@ class Scheduler:
             f"\r[{done}/{total}] {self.stats['task_complete']} task_complete, "
             f"{non_success_terminal} terminal_non_success, {remaining} remaining, "
             f"{self.stats['failed']} worker_failed, {self.stats['skipped']} skipped, "
-            f"{self.stats['fork_duplicates']} fork_duplicates",
+            f"{self.stats['fork_duplicates']} fork_duplicates, "
+            f"{self.stats.get('fork_rejected', 0)} fork_rejected"
+            + (
+                f", {self._format_queue_counts(queue_counts)}"
+                if queue_counts is not None else ""
+            ),
             end="",
             flush=True,
         )
@@ -990,5 +1093,6 @@ class Scheduler:
             f"\n\nDone. {self.stats['task_complete']} task_complete, "
             f"{non_success_terminal} terminal_non_success, "
             f"{self.stats['failed']} worker_failed, {self.stats['skipped']} skipped, "
-            f"{self.stats['fork_duplicates']} fork_duplicates."
+            f"{self.stats['fork_duplicates']} fork_duplicates, "
+            f"{self.stats.get('fork_rejected', 0)} fork_rejected."
         )

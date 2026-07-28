@@ -1,8 +1,10 @@
 import tempfile
+from collections import deque
+from unittest.mock import patch
 
 import pytest
 
-from src.branch_runner import BranchConfig, BranchRunner
+from src.branch_runner import BranchConfig, BranchResult, BranchRunner
 from src.episode_manager import EpisodeManager
 from src.scheduler import InvalidForkLineage, Scheduler, SchedulerConfig
 
@@ -172,6 +174,37 @@ def test_prepare_backfills_valid_legacy_depth():
         assert persisted["fork_depth"] == 1
 
 
+def test_load_tasks_backfills_legacy_depth_before_queueing():
+    with tempfile.TemporaryDirectory() as output_dir:
+        manager = EpisodeManager("episode-1", output_dir, _metadata())
+        task = _legacy_task("opaque-child", "main")
+        manager.add_pending_fork(task)
+        manager.update_final_outcome(
+            {
+                "branch_id": "main",
+                "termination_reason": "task_complete",
+                "total_steps": 1,
+            },
+            is_main=True,
+        )
+        manager.set_status("completed")
+        scheduler = _scheduler(output_dir)
+        scheduler.config.data_dir = "/fake-data"
+        scheduler.queue = deque()
+
+        with patch(
+            "src.scheduler.glob.glob",
+            side_effect=[["/fake/episode-1/traj_data.json"], [], []],
+        ), patch("src.scheduler.load_traj", return_value={}), patch(
+            "src.scheduler.extract_metadata", return_value=_metadata(),
+        ), patch("src.scheduler.extract_low_actions", return_value=[]):
+            scheduler.load_tasks()
+
+        assert scheduler.queue[0]["branch_config"].fork_depth == 1
+        persisted = EpisodeManager.load(manager.file_path).get_pending_fork_tasks()
+        assert persisted[0]["fork_depth"] == 1
+
+
 def test_prepare_rejects_depth_four_before_worker_admission():
     with tempfile.TemporaryDirectory() as output_dir:
         manager = EpisodeManager("episode-1", output_dir, _metadata())
@@ -206,3 +239,124 @@ def test_prepare_rejects_invalid_lineage_as_scheduler_outcome():
         assert entry["termination_reason"] == "invalid_fork_lineage"
         assert "missing parent" in entry["diagnostic"]
         assert scheduler.stats["fork_rejected"] == 1
+
+
+def _runtime_task(name: str, depth: int, task_type: str = "pick_and_place_simple"):
+    branch_id = "main" if depth == 0 else name
+    return {
+        "name": name,
+        "episode_id": name,
+        "meta": {"alfred_task_type": task_type},
+        "base_step_count": 1,
+        "branch_config": BranchConfig(
+            episode_id=name,
+            branch_id=branch_id,
+            parent_branch_id=None if depth == 0 else "main",
+            fork_depth=depth,
+        ),
+    }
+
+
+def test_global_scheduler_dispatches_main_then_two_forks():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SchedulerConfig(
+        output_dir="unused", api_key="test-key", max_parallel=1,
+    )
+    scheduler.queue = deque([
+        _runtime_task("main-1", 0),
+        _runtime_task("main-2", 0),
+        _runtime_task("fork-1", 1),
+        _runtime_task("fork-2", 1),
+        _runtime_task("fork-3", 2),
+        _runtime_task("fork-4", 3),
+    ])
+    scheduler.load_tasks = lambda: None
+    seen = []
+
+    def run_task(task, _n, _total):
+        seen.append(task["name"])
+        return BranchResult(
+            branch_id=task["branch_config"].branch_id,
+            termination_reason="task_complete",
+            total_steps=1,
+            fork_tasks=[],
+            fork_source_step_ids=[],
+        )
+
+    scheduler._run_task_worker = run_task
+
+    scheduler.run()
+
+    assert seen == [
+        "main-1", "fork-1", "fork-2",
+        "main-2", "fork-3", "fork-4",
+    ]
+
+
+def test_task_lane_queues_have_independent_weight_cursors():
+    first_type = "pick_and_place_simple"
+    second_type = "pick_two_obj_and_place"
+    tasks = [
+        _runtime_task("main-a", 0, first_type),
+        _runtime_task("fork-a", 1, first_type),
+        _runtime_task("main-b", 0, second_type),
+        _runtime_task("fork-b", 1, second_type),
+    ]
+
+    lanes = Scheduler._build_task_lane_queues(
+        [first_type, second_type], tasks,
+    )
+
+    assert lanes[first_type].popleft()["name"] == "main-a"
+    assert lanes[second_type].popleft()["name"] == "main-b"
+    assert lanes[first_type].popleft()["name"] == "fork-a"
+    assert lanes[second_type].popleft()["name"] == "fork-b"
+
+
+def test_queue_report_exposes_main_and_each_fork_depth():
+    counts = {
+        "main": 2,
+        "fork_depth_1": 3,
+        "fork_depth_2": 1,
+        "fork_depth_3": 0,
+    }
+
+    assert Scheduler._format_queue_counts(counts) == (
+        "queued main=2 fork[d1=3,d2=1,d3=0]"
+    )
+
+
+def test_live_child_inherits_parent_depth_without_parsing_its_name():
+    scheduler = _scheduler("unused")
+    parent = _runtime_task("opaque-parent", 2)
+    child = _legacy_task("unstructured-child-id", parent["branch_config"].branch_id)
+
+    entry = scheduler._prepare_fork_entry(parent, child)
+
+    assert entry["branch_config"].fork_depth == 3
+
+
+def test_live_depth_four_child_is_rejected_without_worker_admission():
+    scheduler = _scheduler("unused")
+    parent = _runtime_task("opaque-parent", 3)
+    child = _legacy_task("unstructured-child-id", parent["branch_config"].branch_id)
+
+    assert scheduler._prepare_fork_entry(parent, child) is None
+    assert scheduler.stats["fork_rejected"] == 1
+
+
+def test_live_explicit_depth_mismatch_is_durably_rejected():
+    with tempfile.TemporaryDirectory() as output_dir:
+        manager = EpisodeManager("episode-1", output_dir, _metadata())
+        child = _legacy_task("opaque-child", "main")
+        child["fork_depth"] = 2
+        manager.add_pending_fork(child)
+        parent = _runtime_task("episode-1", 0)
+        scheduler = _scheduler(output_dir)
+
+        assert scheduler._prepare_fork_entry(parent, child) is None
+
+        entry = EpisodeManager.load(manager.file_path).data["pending_forks"][0]
+        assert entry["state"] == "rejected"
+        assert entry["termination_reason"] == "invalid_fork_lineage"
+        assert "parent requires depth 1" in entry["diagnostic"]
