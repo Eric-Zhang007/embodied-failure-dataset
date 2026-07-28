@@ -247,6 +247,7 @@ class BranchConfig:
     shared_context_step_ids: list[str] = field(default_factory=list)
     diverges_at_step_id: Optional[str] = None
     fork_config: Optional[dict] = None
+    fork_depth: int = 0
 
 
 @dataclass
@@ -3189,6 +3190,7 @@ class BranchRunner:
             "episode_id": config.episode_id,
             "branch_id": fork_branch_id,
             "parent_branch_id": config.branch_id,
+            "fork_depth": config.fork_depth + 1,
             "shared_context_step_ids": shared_ids,
             "diverges_at_step_id": branches_from_id,
             "fork_config": {
