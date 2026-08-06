@@ -84,6 +84,7 @@ def extract_metadata(traj: dict) -> dict:
         "alfred_task_type": task_type_raw,
         "alfred_task_id": traj.get("task_id", ""),
         "pddl_params": traj.get("pddl_params", {}),
+        "goal_instances": extract_goal_instances(traj),
         "alfred_scene": extract_scene_state(traj),
         "initial_traps": [],
     }
@@ -126,6 +127,49 @@ def extract_low_actions(traj: dict) -> list[dict]:
         parsed["high_idx"] = entry["high_idx"]
         actions.append(parsed)
     return actions
+
+
+def extract_goal_instances(traj: dict) -> dict:
+    """Extract instance-level goal references from the gold plan.
+
+    ALFRED pddl_params are type-level (e.g. object_target="AlarmClock",
+    parent_target="Desk"). That is too coarse for completion checks: a task
+    like "move the alarm clock from one desk to another" already has the clock
+    on *a* desk at reset. The gold low_actions carry the concrete object and
+    receptacle ids needed for exact checks.
+    """
+    picks: list[str] = []
+    puts: list[dict] = []
+    toggles_on: list[str] = []
+    slices: list[str] = []
+    for action in extract_low_actions(traj):
+        name = action.get("action")
+        params = action.get("params") or {}
+        object_id = params.get("objectId")
+        receptacle_id = params.get("receptacleObjectId")
+        if name == "PickupObject" and object_id:
+            picks.append(object_id)
+        elif name == "PutObject" and object_id:
+            puts.append({"objectId": object_id, "receptacleObjectId": receptacle_id})
+        elif name == "ToggleObjectOn" and object_id:
+            toggles_on.append(object_id)
+        elif name == "SliceObject" and object_id:
+            slices.append(object_id)
+
+    goal = {
+        "pickup_object_ids": picks,
+        "sliced_object_ids": slices,
+        "toggle_on_object_ids": toggles_on,
+        "put_receptacle_ids": [
+            p["receptacleObjectId"] for p in puts if p.get("receptacleObjectId")
+        ],
+    }
+    if puts:
+        goal["final_put"] = puts[-1]
+    if len(puts) >= 2:
+        goal["movable_receptacle_id"] = puts[0].get("receptacleObjectId")
+        goal["movable_target_object_id"] = puts[0].get("objectId")
+    return goal
 
 
 # ------------------------------------------------------------------

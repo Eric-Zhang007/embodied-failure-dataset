@@ -4,7 +4,12 @@ def check_task_complete(metadata: dict, ep_data: dict, task_state: dict | None =
     checker = _CHECKERS.get(task_type)
     if checker is None:
         return False, f"Unknown task type: {task_type}"
-    return checker(metadata, ep_data.get("pddl_params", {}) or {}, _normalize_task_state(task_state))
+    return checker(
+        metadata,
+        ep_data.get("pddl_params", {}) or {},
+        _normalize_task_state(task_state),
+        _goal_instances(ep_data),
+    )
 
 
 def get_completion_criteria_text(task_type: str, pddl_params: dict) -> str:
@@ -38,16 +43,23 @@ def get_completion_criteria_text(task_type: str, pddl_params: dict) -> str:
 def check_unrecoverable(metadata: dict, ep_data: dict) -> str | None:
     pddl = ep_data.get("pddl_params", {}) or {}
     objects = list(metadata.get("objects", []))
+    goal = _goal_instances(ep_data)
+    final_put = _final_put(goal)
 
     target = pddl.get("object_target", "")
     if target:
         instances = [o for o in objects if o["objectType"] == target]
+        instances = _restrict_by_ids(
+            instances,
+            [final_put["objectId"]] if final_put else (goal.get("pickup_object_ids") or []),
+        )
         if instances and all(o.get("isBroken") for o in instances):
-            return f"All instances of target object '{target}' are broken"
+            return f"All target instances of '{target}' are broken"
 
     toggle = pddl.get("toggle_target", "")
     if toggle:
         instances = [o for o in objects if o["objectType"] == toggle]
+        instances = _restrict_by_ids(instances, goal.get("toggle_on_object_ids") or [])
         if instances and all(o.get("isBroken") for o in instances):
             return f"Toggle target '{toggle}' is broken"
 
@@ -115,6 +127,29 @@ def _normalize_task_state(task_state: dict | None) -> dict:
     }
 
 
+def _goal_instances(ep_data: dict) -> dict:
+    """Instance-level goal references from the gold plan (empty when unknown)."""
+    goal = ep_data.get("goal_instances")
+    return goal if isinstance(goal, dict) else {}
+
+
+def _restrict_by_ids(objects: list[dict], object_ids: list[str]) -> list[dict]:
+    """Keep only the given concrete instances (no-op when ids are missing)."""
+    ids = [i for i in (object_ids or []) if i]
+    if not ids:
+        return objects
+    id_set = set(ids)
+    return [o for o in objects if o.get("objectId") in id_set]
+
+
+def _final_put(goal: dict) -> dict | None:
+    """The last PutObject of the gold plan: exact target object and goal container."""
+    final_put = goal.get("final_put")
+    if isinstance(final_put, dict) and final_put.get("objectId") and final_put.get("receptacleObjectId"):
+        return final_put
+    return None
+
+
 def _targets(pddl: dict) -> dict:
     # NOTE: We intentionally do NOT append "Sliced" to the object name.
     # Criteria text and prompts use the original name (e.g. "Tomato"),
@@ -167,7 +202,7 @@ def _held_object_type(metadata: dict) -> str:
 # 各任务检查器 → (bool, reason)
 # ------------------------------------------------------------------
 
-def _pick_and_place_simple(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
+def _pick_and_place_simple(metadata: dict, pddl: dict, task_state: dict, goal: dict) -> tuple[bool, str]:
     targets = _targets(pddl)
     receptacles = _objects_with_name_and_prop(targets["parent"], "receptacle", metadata)
     pickupables = _target_pickupables(
@@ -176,6 +211,11 @@ def _pick_and_place_simple(metadata: dict, pddl: dict, task_state: dict) -> tupl
 
     if pddl.get("object_sliced") and not pickupables:
         return False, f"{targets['object']} must be sliced before placing"
+
+    final_put = _final_put(goal)
+    if final_put:
+        receptacles = _restrict_by_ids(receptacles, [final_put["receptacleObjectId"]])
+        pickupables = _restrict_by_ids(pickupables, [final_put["objectId"]])
 
     if not receptacles:
         return False, f"No {targets['parent']} is visible — move to find it"
@@ -189,7 +229,7 @@ def _pick_and_place_simple(metadata: dict, pddl: dict, task_state: dict) -> tupl
     return False, f"{targets['object']} must be inside {targets['parent']}"
 
 
-def _pick_two(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
+def _pick_two(metadata: dict, pddl: dict, task_state: dict, goal: dict) -> tuple[bool, str]:
     targets = _targets(pddl)
     receptacles = _objects_with_name_and_prop(targets["parent"], "receptacle", metadata)
     pickupables = _target_pickupables(
@@ -198,6 +238,13 @@ def _pick_two(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
 
     if pddl.get("object_sliced") and len(pickupables) < 2:
         return False, f"Two {targets['object']} must be sliced before placing"
+
+    put_ids = list(dict.fromkeys(goal.get("put_receptacle_ids") or []))
+    if put_ids:
+        receptacles = _restrict_by_ids(receptacles, put_ids)
+    pickup_ids = list(dict.fromkeys(goal.get("pickup_object_ids") or []))
+    if pickup_ids:
+        pickupables = _restrict_by_ids(pickupables, pickup_ids)
 
     if not receptacles:
         return False, f"No {targets['parent']} is visible — move to find it"
@@ -217,7 +264,7 @@ def _pick_two(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
     return False, f"Need {remaining} more {targets['object']} inside {targets['parent']}"
 
 
-def _look_at_obj_in_light(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
+def _look_at_obj_in_light(metadata: dict, pddl: dict, task_state: dict, goal: dict) -> tuple[bool, str]:
     targets = _targets(pddl)
     toggleables = _objects_with_name_and_prop(targets["toggle"], "toggleable", metadata)
     pickupables = _target_pickupables(
@@ -229,8 +276,17 @@ def _look_at_obj_in_light(metadata: dict, pddl: dict, task_state: dict) -> tuple
         return False, f"{targets['object']} must be sliced"
 
     pickup_ids = {p["objectId"] for p in pickupables}
+    goal_pickup_ids = set(goal.get("pickup_object_ids") or [])
+    if goal_pickup_ids:
+        pickup_ids &= goal_pickup_ids
     in_hand = inventory and inventory[0].get("objectId") in pickup_ids
-    lamp_on = any(o.get("isToggled") and o.get("visibleBounds2D") for o in toggleables)
+
+    lamp_ids = set(goal.get("toggle_on_object_ids") or [])
+    lamp_on = any(
+        o.get("isToggled") and o.get("visibleBounds2D")
+        and (not lamp_ids or o.get("objectId") in lamp_ids)
+        for o in toggleables
+    )
 
     missing = []
     if not in_hand:
@@ -248,19 +304,25 @@ def _look_at_obj_in_light(metadata: dict, pddl: dict, task_state: dict) -> tuple
     return True, ""
 
 
-def _pick_heat_then_place(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
-    return _state_then_place(metadata, pddl, task_state["heated_objects"], "heated")
+def _pick_heat_then_place(metadata: dict, pddl: dict, task_state: dict, goal: dict) -> tuple[bool, str]:
+    return _state_then_place(metadata, pddl, task_state["heated_objects"], "heated", goal)
 
 
-def _pick_cool_then_place(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
-    return _state_then_place(metadata, pddl, task_state["cooled_objects"], "cooled")
+def _pick_cool_then_place(metadata: dict, pddl: dict, task_state: dict, goal: dict) -> tuple[bool, str]:
+    return _state_then_place(metadata, pddl, task_state["cooled_objects"], "cooled", goal)
 
 
-def _pick_clean_then_place(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
-    return _state_then_place(metadata, pddl, task_state["cleaned_objects"], "cleaned")
+def _pick_clean_then_place(metadata: dict, pddl: dict, task_state: dict, goal: dict) -> tuple[bool, str]:
+    return _state_then_place(metadata, pddl, task_state["cleaned_objects"], "cleaned", goal)
 
 
-def _state_then_place(metadata: dict, pddl: dict, state_object_ids: set[str], state_name: str) -> tuple[bool, str]:
+def _state_then_place(
+    metadata: dict,
+    pddl: dict,
+    state_object_ids: set[str],
+    state_name: str,
+    goal: dict,
+) -> tuple[bool, str]:
     targets = _targets(pddl)
     receptacles = _objects_with_name_and_prop(targets["parent"], "receptacle", metadata)
     pickupables = _target_pickupables(
@@ -269,6 +331,11 @@ def _state_then_place(metadata: dict, pddl: dict, state_object_ids: set[str], st
 
     if pddl.get("object_sliced") and not pickupables:
         return False, f"{targets['object']} must be sliced before placing"
+
+    final_put = _final_put(goal)
+    if final_put:
+        receptacles = _restrict_by_ids(receptacles, [final_put["receptacleObjectId"]])
+        pickupables = _restrict_by_ids(pickupables, [final_put["objectId"]])
 
     objs_in_place = [
         p["objectId"] for p in pickupables
@@ -296,7 +363,12 @@ def _state_then_place(metadata: dict, pddl: dict, state_object_ids: set[str], st
     return True, ""
 
 
-def _pick_and_place_with_movable_recep(metadata: dict, pddl: dict, task_state: dict) -> tuple[bool, str]:
+def _pick_and_place_with_movable_recep(
+    metadata: dict,
+    pddl: dict,
+    task_state: dict,
+    goal: dict,
+) -> tuple[bool, str]:
     targets = _targets(pddl)
     receptacles = _objects_with_name_and_prop(targets["parent"], "receptacle", metadata)
     pickupables = _target_pickupables(
@@ -306,6 +378,16 @@ def _pick_and_place_with_movable_recep(metadata: dict, pddl: dict, task_state: d
 
     if pddl.get("object_sliced") and not pickupables:
         return False, f"{targets['object']} must be sliced before placing"
+
+    final_put = _final_put(goal)
+    if final_put:
+        receptacles = _restrict_by_ids(receptacles, [final_put["receptacleObjectId"]])
+    movable_id = goal.get("movable_receptacle_id")
+    if movable_id:
+        movables = _restrict_by_ids(movables, [movable_id])
+    movable_target_id = goal.get("movable_target_object_id")
+    if movable_target_id:
+        pickupables = _restrict_by_ids(pickupables, [movable_target_id])
 
     target_ids = {obj["objectId"] for obj in pickupables}
     complete_stack = any(

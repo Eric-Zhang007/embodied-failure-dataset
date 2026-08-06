@@ -65,6 +65,14 @@ class ResultFallbackTest(unittest.TestCase):
 
 
 class InitialStateFilterTest(unittest.TestCase):
+    def _meta(self, **extra):
+        meta = {
+            "alfred_task_type": "pick_and_place_simple",
+            "pddl_params": {"object_target": "AlarmClock", "parent_target": "Desk"},
+        }
+        meta.update(extra)
+        return meta
+
     def test_marks_a_goal_already_true_in_the_initial_scene(self):
         metadata = {
             "inventoryObjects": [],
@@ -78,12 +86,37 @@ class InitialStateFilterTest(unittest.TestCase):
                 ),
             ],
         }
-        meta = {
-            "alfred_task_type": "pick_and_place_simple",
-            "pddl_params": {"object_target": "AlarmClock", "parent_target": "Desk"},
-        }
+        meta = self._meta(goal_instances={
+            "final_put": {"objectId": "AlarmClock|1", "receptacleObjectId": "Desk|1"},
+        })
 
         self.assertTrue(_initial_state_satisfies_goal(metadata, meta))
+
+    def test_does_not_skip_when_only_a_different_receptacle_holds_target(self):
+        metadata = {
+            "inventoryObjects": [],
+            "objects": [
+                _obj("AlarmClock|1", "AlarmClock", pickupable=True),
+                _obj("Desk|source", "Desk", receptacle=True, receptacleObjectIds=["AlarmClock|1"]),
+                _obj("Desk|goal", "Desk", receptacle=True),
+            ],
+        }
+        meta = self._meta(goal_instances={
+            "final_put": {"objectId": "AlarmClock|1", "receptacleObjectId": "Desk|goal"},
+        })
+
+        self.assertFalse(_initial_state_satisfies_goal(metadata, meta))
+
+    def test_does_not_skip_without_instance_level_goal_info(self):
+        metadata = {
+            "inventoryObjects": [],
+            "objects": [
+                _obj("AlarmClock|1", "AlarmClock", pickupable=True),
+                _obj("Desk|1", "Desk", receptacle=True, receptacleObjectIds=["AlarmClock|1"]),
+            ],
+        }
+
+        self.assertFalse(_initial_state_satisfies_goal(metadata, self._meta()))
 
 
 class InvalidActionAgent:

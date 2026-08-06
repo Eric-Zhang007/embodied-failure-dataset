@@ -24,6 +24,7 @@ class EpisodeManager:
             "alfred_task_type": metadata.get("alfred_task_type"),
             "alfred_task_id": metadata.get("alfred_task_id"),
             "pddl_params": metadata.get("pddl_params", {}),
+            "goal_instances": metadata.get("goal_instances") or {},
             "alfred_scene": metadata.get("alfred_scene"),
             "initial_traps": metadata.get("initial_traps", []),
             "runtime_traps": [],

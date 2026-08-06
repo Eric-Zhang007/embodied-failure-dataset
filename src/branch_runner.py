@@ -111,9 +111,24 @@ def _sync_memory_after_injection(memory, injection_decision: dict | None) -> Non
 
 
 def _initial_state_satisfies_goal(metadata: dict, meta: dict) -> bool:
-    """Identify trajectories whose reset scene already satisfies their goal."""
+    """Identify trajectories whose reset scene already satisfies their goal.
+
+    The type-level completion check alone is not trustworthy: ALFRED
+    pddl_params only name object/receptacle types, so a task like "move the
+    alarm clock from one desk to another" looks satisfied at reset because the
+    clock is already on *a* desk. Only skip when the gold plan provides
+    instance-level goal references and the exact goal already holds.
+    """
     complete, _ = check_task_complete(metadata, meta)
-    return complete
+    if not complete:
+        return False
+    goal = meta.get("goal_instances") or {}
+    return bool(
+        goal.get("final_put")
+        or goal.get("pickup_object_ids")
+        or goal.get("toggle_on_object_ids")
+        or goal.get("put_receptacle_ids")
+    )
 
 
 def _failure_category(action: str, error_message: str | None) -> str:
