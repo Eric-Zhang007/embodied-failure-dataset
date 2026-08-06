@@ -84,23 +84,58 @@ class ContextBuilderTest(unittest.TestCase):
 
     def test_branch_history_includes_parent_shared_steps_before_fork_steps(self):
         episode_steps = [
-            make_step(0, branch="main"),
-            make_step(1, branch="main"),
-            make_step(2, branch="main"),
-            make_step(0, branch="fork_s1_main", action="RotateLeft"),
-            make_step(1, branch="fork_s1_main", action="MoveAhead"),
+            make_step(0, branch="main", step_id="main__s0"),
+            make_step(1, branch="main", step_id="main__s1"),
+            make_step(2, branch="main", step_id="main__s2"),
+            make_step(0, branch="fork_s1_main", step_id="fork_s1_main__s0", action="RotateLeft"),
+            make_step(1, branch="fork_s1_main", step_id="fork_s1_main__s1", action="MoveAhead"),
         ]
 
         history = build_branch_history(
             episode_steps,
             branch_id="fork_s1_main",
             parent_branch_id="main",
-            shared_step_ids=["s0", "s1"],
+            shared_step_ids=["main__s0", "main__s1"],
         )
 
         self.assertEqual(
-            [("main", "s0"), ("main", "s1"), ("fork_s1_main", "s0"), ("fork_s1_main", "s1")],
+            [
+                ("main", "main__s0"),
+                ("main", "main__s1"),
+                ("fork_s1_main", "fork_s1_main__s0"),
+                ("fork_s1_main", "fork_s1_main__s1"),
+            ],
             [(s["branch_id"], s["step_id"]) for s in history],
+        )
+
+    def test_nested_branch_history_keeps_the_complete_ordered_lineage(self):
+        episode_steps = [
+            make_step(0, branch="main", step_id="main__s0"),
+            make_step(1, branch="main", step_id="main__s1"),
+            make_step(0, branch="fork_s4_main", step_id="fork_s4_main__s0"),
+            make_step(1, branch="fork_s4_main", step_id="fork_s4_main__s1"),
+            make_step(
+                0,
+                branch="fork_s2_fork_s4_main",
+                step_id="fork_s2_fork_s4_main__s0",
+            ),
+        ]
+
+        history = build_branch_history(
+            episode_steps,
+            branch_id="fork_s2_fork_s4_main",
+            parent_branch_id="fork_s4_main",
+            shared_step_ids=["main__s0", "main__s1", "fork_s4_main__s0"],
+        )
+
+        self.assertEqual(
+            [
+                "main__s0",
+                "main__s1",
+                "fork_s4_main__s0",
+                "fork_s2_fork_s4_main__s0",
+            ],
+            [step["step_id"] for step in history],
         )
 
     def test_current_failed_step_is_rendered_for_diagnosis(self):

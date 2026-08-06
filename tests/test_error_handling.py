@@ -4,7 +4,15 @@ import unittest
 
 import numpy as np
 
-from src.branch_runner import BranchConfig, BranchRunner, replay_steps
+from src.branch_runner import (
+    BranchConfig,
+    BranchRunner,
+    _initial_state_satisfies_goal,
+    _normalize_recovery_verdict,
+    _requires_oracle_injection,
+    _value_or_fallback,
+    replay_steps,
+)
 import src.branch_runner as branch_runner_module
 from src.episode_manager import EpisodeManager
 from src.vlm_client import VLMClient
@@ -21,6 +29,61 @@ def _obj(object_id, object_type, **extra):
     }
     data.update(extra)
     return data
+
+
+class OracleInjectionGateTest(unittest.TestCase):
+    def test_skips_oracle_for_pure_navigation_sequences(self):
+        self.assertFalse(_requires_oracle_injection(
+            "MoveSequence",
+            {"steps": [{"action": "MoveAhead", "repeat": 4}, {"action": "RotateLeft"}]},
+        ))
+
+    def test_keeps_oracle_for_object_interactions(self):
+        self.assertTrue(_requires_oracle_injection(
+            "MoveSequence",
+            {"steps": [{"action": "MoveAhead", "repeat": 2}, {"action": "PickupObject", "params": {"objectType": "Mug"}}]},
+        ))
+        self.assertTrue(_requires_oracle_injection(
+            "OpenObject", {"objectType": "Cabinet"},
+        ))
+
+    def test_navigation_sequences_use_the_fast_validation_path(self):
+        actions = [
+            {"action": "MoveBack", "repeat": 8},
+            {"action": "RotateRight"},
+        ]
+        self.assertFalse(_requires_oracle_injection("MoveSequence", {"steps": actions}))
+
+
+class ResultFallbackTest(unittest.TestCase):
+    def test_keeps_a_numpy_frame_and_only_falls_back_for_none(self):
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        fallback = np.ones((2, 2, 3), dtype=np.uint8)
+
+        self.assertIs(frame, _value_or_fallback(frame, fallback))
+        self.assertIs(fallback, _value_or_fallback(None, fallback))
+
+
+class InitialStateFilterTest(unittest.TestCase):
+    def test_marks_a_goal_already_true_in_the_initial_scene(self):
+        metadata = {
+            "inventoryObjects": [],
+            "objects": [
+                _obj("AlarmClock|1", "AlarmClock", pickupable=True),
+                _obj(
+                    "Desk|1",
+                    "Desk",
+                    receptacle=True,
+                    receptacleObjectIds=["AlarmClock|1"],
+                ),
+            ],
+        }
+        meta = {
+            "alfred_task_type": "pick_and_place_simple",
+            "pddl_params": {"object_target": "AlarmClock", "parent_target": "Desk"},
+        }
+
+        self.assertTrue(_initial_state_satisfies_goal(metadata, meta))
 
 
 class InvalidActionAgent:
@@ -230,6 +293,78 @@ class NoopOracle:
         }
 
 
+class SelectingOracle(NoopOracle):
+    def __init__(self, candidate_id):
+        self.candidate_id = candidate_id
+        self.calls = []
+
+    def decide_injection(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            "inject": True,
+            "candidate_id": self.candidate_id,
+            "reasoning": "This is the right moment for the validated trap.",
+        }
+
+
+class CascadeSelectingOracle(NoopOracle):
+    def __init__(self, candidate_ids):
+        self.candidate_ids = list(candidate_ids)
+        self.calls = []
+
+    def decide_injection(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) > len(self.candidate_ids):
+            return {
+                "inject": False,
+                "candidate_id": None,
+                "reasoning": "No further intervention is useful.",
+            }
+        return {
+            "inject": True,
+            "candidate_id": self.candidate_ids[len(self.calls) - 1],
+            "reasoning": "The prior trap is resolved, so this different validated trap is useful.",
+        }
+
+    def evaluate_failure(self, **kwargs):
+        return {
+            "diagnosis_correct": True,
+            "ground_truth": "The injected environment state prevented the action.",
+            "counterfactual_grade": "AC",
+            "counterfactual_gold": None,
+            "recovery_verdict": "recoverable",
+            "should_fork": False,
+            "fork_reasoning": None,
+        }
+
+
+class OneShotRecoverableOracle(NoopOracle):
+    def __init__(self, candidate_id):
+        self.candidate_id = candidate_id
+        self.calls = 0
+
+    def decide_injection(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "inject": True,
+                "candidate_id": self.candidate_id,
+                "reasoning": "Use the verified temporary placement trap once.",
+            }
+        return {"inject": False, "candidate_id": None, "reasoning": "Do not repeat it."}
+
+    def evaluate_failure(self, **kwargs):
+        return {
+            "diagnosis_correct": True,
+            "ground_truth": "The held object was moved to a visible countertop.",
+            "counterfactual_grade": "AC",
+            "counterfactual_gold": None,
+            "recovery_verdict": "recoverable",
+            "should_fork": False,
+            "fork_reasoning": None,
+        }
+
+
 class CompletingAfterMoveEnv:
     def __init__(self):
         self.step_calls = []
@@ -358,37 +493,373 @@ class FailingAgent:
         raise AssertionError("BranchRunner should not start when initial trap setup fails")
 
 
-class FakeTrapPlanner:
-    def plan_traps(self, **kwargs):
-        return [{
-            "trap_id": "trap_0",
-            "failure_type": "test_failure",
-            "description": "bad trap",
-            "injection": {"method": "bad", "params": {}},
-            "severity": 0.5,
-        }]
+class PutIntoOpenReceptacleAgent:
+    dedup_stats = {}
 
-    def apply_traps(self, controller, traps):
-        return [{"success": False, "error": "trap setup failed"}]
+    def propose_action(self, **kwargs):
+        return {
+            "action": "PutObject",
+            "params": {"objectType": "Egg", "receptacleType": "Microwave"},
+            "reasoning": "put the held egg into the open microwave",
+        }
+
+    def diagnose_failure(self, **kwargs):
+        return {
+            "diagnosis": "The microwave was closed before placement.",
+            "recovery_reasoning": "Open the microwave and retry.",
+            "counterfactual": None,
+            "proposed_recovery_action": {"action": "OpenObject", "params": {"objectType": "Microwave"}},
+        }
 
 
-class FakeInitialTrapEnv:
-    def __init__(self, scene):
-        self.scene = scene
-        self.controller = object()
+class PutIntoOpenReceptacleSequenceAgent(PutIntoOpenReceptacleAgent):
+    def propose_action(self, **kwargs):
+        return {
+            "action": "MoveSequence",
+            "params": {
+                "steps": [{
+                    "action": "PutObject",
+                    "params": {"objectType": "Egg", "receptacleType": "Microwave"},
+                }],
+            },
+            "reasoning": "put the held egg into the open microwave",
+        }
 
-    def reset_to_alfred_scene(self, scene):
-        self.scene_state = scene
+
+class PickupFromOpenContainerAgent:
+    dedup_stats = {}
+
+    def propose_action(self, **kwargs):
+        return {
+            "action": "PickupObject",
+            "params": {"objectType": "Apple"},
+            "reasoning": "pick up the visible apple",
+        }
+
+    def diagnose_failure(self, **kwargs):
+        return {
+            "diagnosis": "The microwave was closed before pickup.",
+            "recovery_reasoning": "Open the microwave and retry.",
+            "counterfactual": None,
+            "proposed_recovery_action": {"action": "OpenObject", "params": {"objectType": "Microwave"}},
+        }
+
+
+class RecoveringPutAgent(PutIntoOpenReceptacleAgent):
+    def __init__(self):
+        self.calls = 0
+        self.trap_states = []
+
+    def propose_action(self, **kwargs):
+        self.calls += 1
+        return super().propose_action(**kwargs)
+
+    def diagnose_failure(self, **kwargs):
+        self.trap_states.append(kwargs.get("trap_state"))
+        return {
+            "diagnosis": "The microwave was closed before placement.",
+            "recovery_reasoning": "Open the microwave and retry.",
+            "counterfactual": None,
+            "proposed_recovery_action": {"action": "OpenObject", "params": {"objectType": "Microwave"}},
+        }
+
+
+class TemporaryPlacementRecoveryAgent(PutIntoOpenReceptacleAgent):
+    def diagnose_failure(self, **kwargs):
+        return {
+            "diagnosis": "The egg was placed on the visible CounterTop before the intended put.",
+            "recovery_reasoning": "Pick up the visible egg and retry the intended placement.",
+            "counterfactual": None,
+            "proposed_recovery_action": {
+                "action": "PickupObject", "params": {"objectType": "Egg"},
+            },
+        }
+
+
+class TemporaryThenCloseRecoveryAgent(PutIntoOpenReceptacleAgent):
+    def diagnose_failure(self, **kwargs):
+        error = kwargs.get("error_message", "")
+        if "isn't holding anything" in error:
+            return {
+                "diagnosis": "The egg was placed on the visible CounterTop.",
+                "recovery_reasoning": "Pick up the visible egg before retrying.",
+                "counterfactual": None,
+                "proposed_recovery_action": {
+                    "action": "PickupObject", "params": {"objectType": "Egg"},
+                },
+            }
+        return {
+            "diagnosis": "The microwave was closed before the retry.",
+            "recovery_reasoning": "Open the microwave and retry the placement.",
+            "counterfactual": None,
+            "proposed_recovery_action": {
+                "action": "OpenObject", "params": {"objectType": "Microwave"},
+            },
+        }
+
+
+class _ControllerEvent:
+    def __init__(self, metadata):
+        self.metadata = metadata
+
+
+class ActionAwarePutEnv:
+    class Controller:
+        def __init__(self, env):
+            self.env = env
+            self.actions = []
+
+        def step(self, action, **params):
+            self.actions.append((action, params))
+            if action == "CloseObject":
+                self.env.microwave_open = False
+            elif action == "OpenObject":
+                self.env.microwave_open = True
+            metadata = self.env._metadata()
+            metadata["lastActionSuccess"] = True
+            return _ControllerEvent(metadata)
+
+    def __init__(self):
+        self.frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        self.microwave_open = True
+        self.completed = False
+        self.controller = self.Controller(self)
+
+    def _metadata(self):
+        return {
+            "objects": [
+                _obj("Egg|1", "Egg", pickupable=True, visibleBounds2D=[0, 0, 4, 4]),
+                _obj(
+                    "Microwave|1", "Microwave", receptacle=True, openable=True,
+                    isOpen=self.microwave_open, visibleBounds2D=[0, 0, 4, 4],
+                    receptacleObjectIds=["Egg|1"] if self.completed else [],
+                ),
+            ],
+            "inventoryObjects": [{"objectId": "Egg|1", "objectType": "Egg"}],
+            "agent": {"position": {}, "rotation": {"y": 0}, "cameraHorizon": 0},
+        }
 
     def get_state_snapshot(self):
+        return {"frame": self.frame, "metadata": self._metadata(), "task_state": {}}
+
+    def step(self, action, **params):
+        if action == "OpenObject":
+            self.microwave_open = True
+        if action == "PutObject" and not self.microwave_open:
+            return {
+                "success": False,
+                "error": "Target openable Receptacle is CLOSED, can't place if target is not open!",
+                "frame": self.frame,
+                "metadata": self._metadata(),
+                "task_state": {},
+            }
+        if action == "PutObject":
+            self.completed = True
         return {
-            "frame": np.zeros((4, 4, 3), dtype=np.uint8),
-            "metadata": {"objects": [_obj("Apple|1", "Apple", pickupable=True)]},
+            "success": True,
+            "error": None,
+            "frame": self.frame,
+            "metadata": self._metadata(),
             "task_state": {},
         }
 
-    def close(self):
-        pass
+
+class ActionAwarePickupEnv(ActionAwarePutEnv):
+    def _metadata(self):
+        return {
+            "objects": [
+                _obj(
+                    "Apple|1", "Apple", pickupable=True, visibleBounds2D=[0, 0, 4, 4],
+                    parentReceptacles=["Microwave|1"],
+                ),
+                _obj(
+                    "Microwave|1", "Microwave", receptacle=True, openable=True,
+                    isOpen=self.microwave_open, visibleBounds2D=[0, 0, 4, 4],
+                ),
+            ],
+            "inventoryObjects": [],
+            "agent": {"position": {}, "rotation": {"y": 0}, "cameraHorizon": 0},
+        }
+
+    def step(self, action, **params):
+        if action == "PickupObject" and not self.microwave_open:
+            return {
+                "success": False,
+                "error": "Target object not found within the specified visibility.",
+                "frame": self.frame,
+                "metadata": self._metadata(),
+                "task_state": {},
+            }
+        if action == "PickupObject":
+            self.completed = True
+        return {
+            "success": True,
+            "error": None,
+            "frame": self.frame,
+            "metadata": self._metadata(),
+            "task_state": {},
+        }
+
+
+class ActionAwareTemporaryPlacementEnv:
+    class Controller:
+        def __init__(self, env):
+            self.env = env
+            self.actions = []
+
+        def step(self, action, **params):
+            self.actions.append((action, params))
+            success = True
+            error = None
+            if action == "CloseObject":
+                self.env.microwave_open = False
+            elif action == "OpenObject":
+                self.env.microwave_open = True
+            elif action == "PutObject":
+                if params.get("objectId") != "CounterTop|1" or not self.env.egg_held:
+                    success = False
+                    error = "Temporary placement target is unavailable"
+                else:
+                    self.env.egg_held = False
+                    self.env.egg_parent = "CounterTop|1"
+            metadata = self.env._metadata()
+            metadata["lastActionSuccess"] = success
+            if error:
+                metadata["errorMessage"] = error
+            return _ControllerEvent(metadata)
+
+    def __init__(self):
+        self.frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        self.egg_held = True
+        self.egg_parent = None
+        self.microwave_open = True
+        self.completed = False
+        self.controller = self.Controller(self)
+
+    def _metadata(self):
+        egg = _obj(
+            "Egg|1", "Egg", pickupable=True, isPickedUp=self.egg_held,
+            visibleBounds2D=[0, 0, 4, 4],
+        )
+        if self.egg_parent:
+            egg["parentReceptacles"] = [self.egg_parent]
+        return {
+            "objects": [
+                egg,
+                _obj(
+                    "Microwave|1", "Microwave", receptacle=True, openable=True,
+                    isOpen=self.microwave_open, visibleBounds2D=[0, 0, 4, 4],
+                    receptacleObjectIds=["Egg|1"] if self.completed else [],
+                ),
+                _obj(
+                    "CounterTop|1", "CounterTop", receptacle=True,
+                    visibleBounds2D=[0, 0, 4, 4],
+                    receptacleObjectIds=["Egg|1"] if self.egg_parent == "CounterTop|1" else [],
+                ),
+            ],
+            "inventoryObjects": ([{"objectId": "Egg|1", "objectType": "Egg"}]
+                                 if self.egg_held else []),
+            "agent": {"position": {}, "rotation": {"y": 0}, "cameraHorizon": 0},
+        }
+
+    def get_state_snapshot(self):
+        return {"frame": self.frame, "metadata": self._metadata(), "task_state": {}}
+
+    def step(self, action, **params):
+        if action == "OpenObject":
+            self.microwave_open = True
+        elif action == "CloseObject":
+            self.microwave_open = False
+        elif action == "PickupObject":
+            if self.egg_parent != "CounterTop|1":
+                return {
+                    "success": False,
+                    "error": "Target object not found within the specified visibility.",
+                    "frame": self.frame,
+                    "metadata": self._metadata(),
+                    "task_state": {},
+                }
+            self.egg_held = True
+            self.egg_parent = None
+        elif action == "PutObject":
+            if not self.egg_held:
+                return {
+                    "success": False,
+                    "error": "Can't place an object if Agent isn't holding anything",
+                    "frame": self.frame,
+                    "metadata": self._metadata(),
+                    "task_state": {},
+                }
+            if not self.microwave_open:
+                return {
+                    "success": False,
+                    "error": "Target openable Receptacle is CLOSED, can't place if target is not open!",
+                    "frame": self.frame,
+                    "metadata": self._metadata(),
+                    "task_state": {},
+                }
+            self.egg_held = False
+            self.egg_parent = "Microwave|1"
+            self.completed = True
+        return {
+            "success": True,
+            "error": None,
+            "frame": self.frame,
+            "metadata": self._metadata(),
+            "task_state": {},
+        }
+
+
+class ActionAwareCascadeEnv(ActionAwarePutEnv):
+    def __init__(self):
+        super().__init__()
+        self.microwave_open = True
+        self.microwave_toggled = False
+
+    def _metadata(self):
+        return {
+            "objects": [
+                _obj("Egg|1", "Egg", pickupable=True, visibleBounds2D=[0, 0, 4, 4]),
+                _obj(
+                    "Microwave|1", "Microwave", receptacle=True, openable=True,
+                    toggleable=True, isOpen=self.microwave_open,
+                    isToggled=self.microwave_toggled, visibleBounds2D=[0, 0, 4, 4],
+                ),
+            ],
+            "inventoryObjects": [{"objectId": "Egg|1", "objectType": "Egg"}],
+            "agent": {"position": {}, "rotation": {"y": 0}, "cameraHorizon": 0},
+        }
+
+    def step(self, action, **params):
+        if action == "OpenObject":
+            self.microwave_open = True
+        elif action == "CloseObject":
+            self.microwave_open = False
+        elif action == "PutObject" and not self.microwave_open:
+            return {
+                "success": False,
+                "error": "Target openable Receptacle is CLOSED, can't place if target is not open!",
+                "frame": self.frame,
+                "metadata": self._metadata(),
+                "task_state": {},
+            }
+        elif action == "ToggleObjectOn":
+            if self.microwave_open:
+                return {
+                    "success": False,
+                    "error": "Target must be closed to Toggle On!",
+                    "frame": self.frame,
+                    "metadata": self._metadata(),
+                    "task_state": {},
+                }
+            self.microwave_toggled = True
+        return {
+            "success": True,
+            "error": None,
+            "frame": self.frame,
+            "metadata": self._metadata(),
+            "task_state": {},
+        }
 
 
 class ErrorHandlingTest(unittest.TestCase):
@@ -475,6 +946,92 @@ class ErrorHandlingTest(unittest.TestCase):
         self.assertIn("was not executed", message)
         self.assertIn("non-empty JSON list", message)
 
+    def test_redundant_interaction_is_rejected_from_current_object_state(self):
+        closed_metadata = {
+            "objects": [{
+                "objectId": "ShowerCurtain|1",
+                "objectType": "ShowerCurtain",
+                "openable": True,
+                "isOpen": False,
+            }]
+        }
+
+        message = BranchRunner._redundant_interaction_error(
+            "CloseObject", {"objectId": "ShowerCurtain|1"}, closed_metadata
+        )
+
+        self.assertIsNotNone(message)
+        self.assertIn("already closed", message)
+        self.assertIsNone(
+            BranchRunner._redundant_interaction_error(
+                "OpenObject", {"objectId": "ShowerCurtain|1"}, closed_metadata
+            )
+        )
+
+    def test_non_openable_interaction_is_rejected_before_environment_step(self):
+        metadata = {
+            "objects": [{
+                "objectId": "Toaster|1", "objectType": "Toaster", "openable": False,
+            }],
+        }
+
+        message = BranchRunner._redundant_interaction_error(
+            "OpenObject", {"objectId": "Toaster|1"}, metadata,
+        )
+
+        self.assertIn("not openable", message)
+
+    def test_move_sequence_does_not_call_environment_for_non_openable_object(self):
+        class NeverStepEnv:
+            def step(self, *_args, **_kwargs):
+                raise AssertionError("OpenObject on a non-openable object reached Unity")
+
+        runner = BranchRunner(object(), NoopOracle(), ".")
+        result, _message = runner._execute_move_sequence(
+            {"steps": [{"action": "OpenObject", "params": {"objectType": "Toaster"}}]},
+            NeverStepEnv(),
+            {"objects": [{
+                "objectId": "Toaster|1", "objectType": "Toaster",
+                "openable": False, "visibleBounds2D": [0, 0, 1, 1],
+            }]},
+            "", "main", 1, "ep", "", None,
+        )
+
+        self.assertTrue(result["model_error"])
+
+    def test_move_sequence_records_each_attempted_micro_action(self):
+        class PartialEnv:
+            def __init__(self):
+                self.calls = 0
+
+            def step(self, action, **params):
+                self.calls += 1
+                return {
+                    "success": self.calls == 1,
+                    "error": None if self.calls == 1 else "blocked",
+                    "frame": None,
+                    "metadata": {
+                        "objects": [],
+                        "agent": {"position": {"x": 0.0, "z": 0.0}},
+                    },
+                }
+
+        runner = BranchRunner(object(), NoopOracle(), ".")
+        result, _message = runner._execute_move_sequence(
+            {"steps": [{"action": "MoveAhead", "repeat": 3}]},
+            PartialEnv(),
+            {"objects": [], "agent": {"position": {"x": 0.0, "z": 0.0}}},
+            "", "main", 1, "ep", "", None,
+        )
+
+        self.assertEqual(
+            [
+                {"action": "MoveAhead", "params": {}, "success": True, "error": None},
+                {"action": "MoveAhead", "params": {}, "success": False, "error": "blocked"},
+            ],
+            result["execution_trace"],
+        )
+
     def test_empty_executor_result_retries_without_phase3_or_environment_step(self):
         executor = EmptyPartialExecutor()
         runner = BranchRunner(
@@ -516,7 +1073,7 @@ class ErrorHandlingTest(unittest.TestCase):
 
         self.assertEqual("task_complete", result.termination_reason)
         self.assertEqual(2, executor.calls)
-        self.assertEqual(1, planner.review_calls)
+        self.assertEqual(0, planner.review_calls)
         self.assertEqual(1, sum(action == "MoveAhead" for action, _ in env.step_calls))
         completed = planner.plan_calls[1]["intent_history"][-1]
         self.assertEqual("approach Table", completed["intent"])
@@ -607,49 +1164,243 @@ class ErrorHandlingTest(unittest.TestCase):
             )
         )
 
-    def test_initial_trap_setup_failure_is_logged_and_raises(self):
-        import src.alfred_parser as alfred_parser
-
-        original_env = branch_runner_module.EnvController
-        original_load = alfred_parser.load_traj
-        original_extract = alfred_parser.extract_metadata
-
-        def fake_load_traj(path):
-            return {
-                "task_type": "pick_and_place_simple",
-                "pddl_params": {"object_target": "Apple"},
-            }
-
-        def fake_extract_metadata(traj):
-            return {
-                "task_goal": "put apple on table",
-                "scene": "FloorPlan1",
-                "task_type": "pick_and_place_simple",
-                "pddl_params": {"object_target": "Apple"},
-                "alfred_scene": {"object_poses": [{"objectName": "Apple_1"}]},
-            }
+    # Legacy candidate-pool coverage is archived in deprecated/tests.
+    def legacy_phase2_closes_visible_open_receptacle_before_put(self):
+        env = ActionAwarePutEnv()
+        runner = BranchRunner(
+            PutIntoOpenReceptacleAgent(),
+            SelectingOracle("close_open_receptacle_before_put:Microwave|1"), ".",
+            enable_phase2=True, enable_fork=False,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
-            branch_runner_module.EnvController = FakeInitialTrapEnv
-            alfred_parser.load_traj = fake_load_traj
-            alfred_parser.extract_metadata = fake_extract_metadata
-            try:
-                with self.assertRaises(RuntimeError):
-                    branch_runner_module.run_single_branch(
-                        traj_path=f"{tmp}/task/traj_data.json",
-                        eb_agent=FailingAgent(),
-                        oracle_agent=NoopOracle(),
-                        output_dir=tmp,
-                        trap_planner=FakeTrapPlanner(),
-                    )
-                with open(f"{tmp}/task/failures_main.jsonl", encoding="utf-8") as f:
-                    log = f.read()
-                self.assertIn("initial_trap_setup_failed", log)
-                self.assertIn("trap setup failed", log)
-            finally:
-                branch_runner_module.EnvController = original_env
-                alfred_parser.load_traj = original_load
-                alfred_parser.extract_metadata = original_extract
+            runner.output_dir = tmp
+            ep = self._episode(tmp)
+            ep.data["pddl_params"] = {"object_target": "Egg", "parent_target": "Microwave"}
+            runner.run(
+                BranchConfig("ep", "main", None), env, ep, start_step_index=1,
+            )
+
+        self.assertIn(
+            ("CloseObject", {"objectId": "Microwave|1", "forceAction": True}),
+            env.controller.actions,
+        )
+        self.assertFalse(env.microwave_open)
+        trap = ep.data["runtime_traps"][0]
+        self.assertEqual("close_open_receptacle_before_put", trap["failure_type"])
+        self.assertEqual("triggered", trap["status"])
+        self.assertEqual("main__s1", trap["triggered_at_step_id"])
+        put_step = ep.data["steps"][-1]
+        self.assertTrue(put_step["oracle_injection_decision"]["decided_to_inject"])
+        self.assertEqual(trap["trap_id"], put_step["triggered_trap_id"])
+        self.assertIn("CLOSED", put_step["error_message"])
+
+    def legacy_phase2_executes_the_oracle_selected_valid_candidate(self):
+        env = ActionAwarePutEnv()
+        oracle = SelectingOracle("close_open_receptacle_before_put:Microwave|1")
+        runner = BranchRunner(
+            PutIntoOpenReceptacleAgent(), oracle, ".",
+            enable_phase2=True, enable_fork=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.output_dir = tmp
+            ep = self._episode(tmp)
+            ep.data["pddl_params"] = {"object_target": "Egg", "parent_target": "Microwave"}
+            runner.run(BranchConfig("ep", "main", None), env, ep, start_step_index=1)
+
+        self.assertEqual(1, len(oracle.calls))
+        self.assertEqual("close_open_receptacle_before_put:Microwave|1", oracle.calls[0]["candidates"][0]["candidate_id"])
+        self.assertTrue(ep.data["steps"][-1]["oracle_injection_decision"]["decided_to_inject"])
+        self.assertEqual("agentic_selector", ep.data["runtime_traps"][0]["created_by"])
+
+    def legacy_phase2_rejects_unknown_oracle_candidate_without_mutating_environment(self):
+        env = ActionAwarePutEnv()
+        oracle = SelectingOracle("made_up_candidate")
+        runner = BranchRunner(
+            PutIntoOpenReceptacleAgent(), oracle, ".",
+            enable_phase2=True, enable_fork=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.output_dir = tmp
+            ep = self._episode(tmp)
+            ep.data["pddl_params"] = {"object_target": "Egg", "parent_target": "Microwave"}
+            runner.run(BranchConfig("ep", "main", None), env, ep, start_step_index=1)
+
+        self.assertTrue(env.microwave_open)
+        self.assertEqual([], ep.data["runtime_traps"])
+        put_step = next(step for step in ep.data["steps"] if step["action"] == "PutObject")
+        decision = put_step["oracle_injection_decision"]
+        self.assertFalse(decision["decided_to_inject"])
+        self.assertEqual("unknown_candidate", decision["reason"])
+
+    def legacy_phase2_does_not_consult_oracle_while_a_trap_is_unresolved(self):
+        env = ActionAwarePutEnv()
+        oracle = SelectingOracle("close_open_receptacle_before_put:Microwave|1")
+        runner = BranchRunner(
+            PutIntoOpenReceptacleAgent(), oracle, ".",
+            enable_phase2=True, enable_fork=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.output_dir = tmp
+            ep = self._episode(tmp)
+            ep.add_runtime_trap({
+                "trap_id": "trap_main_prior",
+                "branch_id": "main",
+                "candidate_id": "close_open_container_before_pickup:Cabinet|1",
+                "failure_type": "close_open_container_before_pickup",
+                "difficulty": {"level": "low", "recovery_steps": 1},
+                "status": "active",
+                "injection": {"method": "close_container", "params": {"object_id": "Cabinet|1"}},
+            })
+            ep.data["pddl_params"] = {"object_target": "Egg", "parent_target": "Microwave"}
+            result = runner.run(BranchConfig("ep", "main", None), env, ep, start_step_index=1)
+
+        self.assertEqual("task_complete", result.termination_reason)
+        self.assertEqual([], oracle.calls)
+        self.assertEqual([], env.controller.actions)
+
+    def test_legacy_recovered_verdict_becomes_executable_recovery(self):
+        self.assertEqual("recoverable", _normalize_recovery_verdict("recovered"))
+        self.assertEqual("recoverable", _normalize_recovery_verdict("recoverable"))
+        self.assertEqual("unrecoverable", _normalize_recovery_verdict("unrecoverable"))
+
+    def legacy_turn_on_lamp_recovers_only_after_turning_it_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ep = self._episode(tmp)
+            ep.add_runtime_trap({
+                "trap_id": "trap_main_1",
+                "branch_id": "main",
+                "candidate_id": "turn_on_lamp_before_toggle_on:FloorLamp|1",
+                "failure_type": "turn_on_lamp_before_toggle_on",
+                "status": "triggered",
+                "injection": {
+                    "method": "turn_on_lamp",
+                    "params": {"object_id": "FloorLamp|1"},
+                },
+                "recovery_action": {
+                    "action": "ToggleObjectOff",
+                    "params": {"objectType": "FloorLamp"},
+                },
+            })
+
+            wrong_action = ep.recover_runtime_trap(
+                "main", "ToggleObjectOn", {"objectId": "FloorLamp|1"}, "main__s2",
+            )
+            recovered = ep.recover_runtime_trap(
+                "main", "ToggleObjectOff", {"objectId": "FloorLamp|1"}, "main__s3",
+            )
+
+        self.assertEqual([], wrong_action)
+        self.assertEqual(["trap_main_1"], recovered)
+        trap = ep.data["runtime_traps"][0]
+        self.assertEqual("recovered", trap["status"])
+        self.assertEqual("main__s3", trap["recovered_at_step_id"])
+
+    def legacy_temporary_countertop_placement_recovers_by_picking_up_and_retrying(self):
+        env = ActionAwareTemporaryPlacementEnv()
+        oracle = OneShotRecoverableOracle(
+            "temporarily_place_held_object_before_put:Egg|1:CounterTop|1"
+        )
+        runner = BranchRunner(
+            TemporaryPlacementRecoveryAgent(), oracle, ".",
+            enable_phase2=True, enable_fork=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.output_dir = tmp
+            ep = self._episode(tmp)
+            ep.data["pddl_params"] = {"object_target": "Egg", "parent_target": "Microwave"}
+            result = runner.run(BranchConfig("ep", "main", None), env, ep, start_step_index=1)
+
+        self.assertEqual("task_complete", result.termination_reason)
+        trap = ep.data["runtime_traps"][0]
+        self.assertEqual("temporarily_place_held_object_before_put", trap["failure_type"])
+        self.assertEqual(
+            {"level": "medium", "recovery_steps": 2},
+            trap["difficulty"],
+        )
+        self.assertEqual("recovered", trap["status"])
+        self.assertEqual("PickupObject", trap["recovered_by_action"]["action"])
+        self.assertEqual("CounterTop|1", trap["injection"]["params"]["receptacle_id"])
+        actions = [step["action"] for step in ep.data["steps"]]
+        self.assertEqual(["PutObject", "PickupObject", "PutObject", "Done"], actions)
+
+    def legacy_explicit_put_cascade_keeps_second_trap_active_until_first_recovers(self):
+        env = ActionAwareTemporaryPlacementEnv()
+        oracle = CascadeSelectingOracle([
+            "empty_hand_then_closed_receptacle:Egg|1:Microwave|1:CounterTop|1"
+        ])
+        runner = BranchRunner(
+            TemporaryThenCloseRecoveryAgent(), oracle, ".",
+            enable_phase2=True, enable_fork=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.output_dir = tmp
+            ep = self._episode(tmp)
+            ep.data["pddl_params"] = {"object_target": "Egg", "parent_target": "Microwave"}
+            result = runner.run(BranchConfig("ep", "main", None), env, ep, start_step_index=1)
+
+        self.assertEqual("task_complete", result.termination_reason)
+        self.assertEqual(2, len(oracle.calls))
+        trap = ep.data["runtime_traps"][0]
+        self.assertEqual("empty_hand_then_closed_receptacle", trap["failure_type"])
+        self.assertEqual({"level": "high", "recovery_steps": 2}, trap["difficulty"])
+        self.assertEqual("recovered", trap["status"])
+        self.assertEqual(2, len(trap["trigger_events"]))
+        self.assertEqual(2, len(trap["recovery_events"]))
+        self.assertEqual("PickupObject", trap["recovery_events"][0]["action"])
+        self.assertEqual("OpenObject", trap["recovery_events"][1]["action"])
+        actions = [step["action"] for step in ep.data["steps"]]
+        self.assertEqual(
+            ["PutObject", "PickupObject", "PutObject", "OpenObject", "PutObject", "Done"],
+            actions,
+        )
+
+    def legacy_phase2_closes_receptacle_before_first_put_in_move_sequence(self):
+        env = ActionAwarePutEnv()
+        runner = BranchRunner(
+            PutIntoOpenReceptacleSequenceAgent(),
+            SelectingOracle("close_open_receptacle_before_put:Microwave|1"), ".",
+            enable_phase2=True, enable_fork=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.output_dir = tmp
+            ep = self._episode(tmp)
+            ep.data["pddl_params"] = {"object_target": "Egg", "parent_target": "Microwave"}
+            runner.run(
+                BranchConfig("ep", "main", None), env, ep, start_step_index=1,
+            )
+
+        trap = ep.data["runtime_traps"][0]
+        self.assertEqual("triggered", trap["status"])
+        self.assertEqual("main__s1", trap["triggered_at_step_id"])
+        self.assertIn("CLOSED", ep.data["steps"][-1]["error_message"])
+
+    def legacy_phase2_closes_open_parent_container_before_pickup(self):
+        env = ActionAwarePickupEnv()
+        runner = BranchRunner(
+            PickupFromOpenContainerAgent(),
+            SelectingOracle("close_open_container_before_pickup:Microwave|1"), ".",
+            enable_phase2=True, enable_fork=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.output_dir = tmp
+            ep = self._episode(tmp)
+            ep.data["pddl_params"] = {"object_target": "Apple", "parent_target": "Microwave"}
+            runner.run(
+                BranchConfig("ep", "main", None), env, ep, start_step_index=1,
+            )
+
+        trap = ep.data["runtime_traps"][0]
+        self.assertEqual("close_open_container_before_pickup", trap["failure_type"])
+        self.assertEqual("triggered", trap["status"])
+        self.assertIn("specified visibility", ep.data["steps"][-1]["error_message"])
 
 
 class _FakeEp:

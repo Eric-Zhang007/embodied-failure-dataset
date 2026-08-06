@@ -1,9 +1,12 @@
 import json
+import os
 import unittest
+from unittest.mock import MagicMock, patch
 
 import numpy as np
+import requests
 
-from src.vlm_client import VLMClient
+from src.vlm_client import VLMClient, _openai_request_policy
 
 
 def _valid_200(content_text="Hello World"):
@@ -20,6 +23,30 @@ def _200_with_reasoning(content_text="Hello", reasoning_text="I think..."):
 
 
 class VLMClientTest(unittest.TestCase):
+    def test_root_base_url_uses_the_openai_v1_chat_endpoint(self):
+        response = MagicMock(status_code=200, text=_valid_200("ok"))
+        client = VLMClient(
+            "openai",
+            "test-model",
+            base_url="https://api.example.invalid",
+            api_key="test",
+        )
+
+        with patch("requests.post", return_value=response) as post:
+            client.chat_text("system", "user")
+
+        self.assertEqual(
+            "https://api.example.invalid/v1/chat/completions",
+            post.call_args.args[0],
+        )
+
+    def test_request_policy_accepts_collection_overrides(self):
+        with patch.dict(os.environ, {
+            "EFD_API_TIMEOUT_S": "20",
+            "EFD_API_MAX_ATTEMPTS": "2",
+        }, clear=False):
+            self.assertEqual((20.0, 2), _openai_request_policy())
+
     def test_multi_image_request_labels_each_image_before_image_part(self):
         client = VLMClient("openai", "fake")
         captured = {}
@@ -45,6 +72,110 @@ class VLMClientTest(unittest.TestCase):
         self.assertEqual("image_url", content[2]["type"])
         self.assertEqual("VIEW 2: left", content[3]["text"])
         self.assertEqual("image_url", content[4]["type"])
+
+    def test_forbidden_response_waits_for_endpoint_recovery(self):
+        forbidden = MagicMock(status_code=403, text='{"error":"insufficient balance"}')
+        forbidden.raise_for_status.side_effect = requests.HTTPError("403 Forbidden")
+        recovered = MagicMock(status_code=200, text=_valid_200("recovered"))
+        client = VLMClient("openai", "test-model", base_url="https://example.invalid/v1", api_key="test")
+
+        with patch.dict(os.environ, {
+            "EFD_API_MAX_ATTEMPTS": "1",
+            "EFD_API_OUTAGE_BACKOFF_S": "15",
+        }, clear=False), patch("requests.post", side_effect=[forbidden, recovered]) as post, patch(
+            "src.vlm_client.time.sleep"
+        ) as sleep, patch.object(VLMClient, "_dump_failure") as dump:
+            content = client.chat_text("system", "user")
+
+        self.assertEqual("recovered", content)
+        self.assertEqual(2, post.call_count)
+        sleep.assert_called_once_with(15.0)
+        dump.assert_not_called()
+
+    def test_disabled_outage_recovery_raises_after_short_retries(self):
+        forbidden = MagicMock(status_code=403, text='{"error":"insufficient balance"}')
+        forbidden.raise_for_status.side_effect = requests.HTTPError("403 Forbidden")
+        client = VLMClient(
+            "openai",
+            "test-model",
+            base_url="https://example.invalid/v1",
+            api_key="test",
+            recover_api_outages=False,
+        )
+
+        with patch.dict(os.environ, {"EFD_API_MAX_ATTEMPTS": "1"}, clear=False), patch(
+            "requests.post", return_value=forbidden
+        ) as post, patch("src.vlm_client.time.sleep") as sleep:
+            with self.assertRaises(requests.HTTPError):
+                client.chat_text("system", "user")
+
+        self.assertEqual(1, post.call_count)
+        sleep.assert_not_called()
+
+    def test_timeout_waits_for_endpoint_recovery(self):
+        recovered = MagicMock(status_code=200, text=_valid_200("recovered"))
+        client = VLMClient("openai", "test-model", base_url="https://example.invalid/v1", api_key="test")
+
+        with patch.dict(os.environ, {
+            "EFD_API_MAX_ATTEMPTS": "1",
+            "EFD_API_OUTAGE_BACKOFF_S": "12",
+        }, clear=False), patch("requests.post", side_effect=[requests.Timeout(), recovered]) as post, patch("src.vlm_client.time.sleep") as sleep:
+            content = client.chat_text("system", "user")
+
+        self.assertEqual("recovered", content)
+        self.assertEqual(2, post.call_count)
+        sleep.assert_called_once_with(12.0)
+
+    def test_connection_error_waits_for_endpoint_recovery(self):
+        recovered = MagicMock(status_code=200, text=_valid_200("recovered"))
+        client = VLMClient("openai", "test-model", base_url="https://example.invalid/v1", api_key="test")
+
+        with patch.dict(os.environ, {
+            "EFD_API_MAX_ATTEMPTS": "1",
+            "EFD_API_OUTAGE_BACKOFF_S": "11",
+        }, clear=False), patch(
+            "requests.post", side_effect=[requests.ConnectionError("network unavailable"), recovered]
+        ) as post, patch("src.vlm_client.time.sleep") as sleep:
+            content = client.chat_text("system", "user")
+
+        self.assertEqual("recovered", content)
+        self.assertEqual(2, post.call_count)
+        sleep.assert_called_once_with(11.0)
+
+    def test_rate_limit_waits_for_endpoint_recovery_after_short_retries(self):
+        rate_limited = MagicMock(status_code=429, text='{"error":"rate limited"}')
+        recovered = MagicMock(status_code=200, text=_valid_200("recovered"))
+        client = VLMClient("openai", "test-model", base_url="https://example.invalid/v1", api_key="test")
+
+        with patch.dict(os.environ, {
+            "EFD_API_MAX_ATTEMPTS": "1",
+            "EFD_API_OUTAGE_BACKOFF_S": "14",
+        }, clear=False), patch("requests.post", side_effect=[rate_limited, recovered]) as post, patch(
+            "src.vlm_client.time.sleep"
+        ) as sleep:
+            content = client.chat_text("system", "user")
+
+        self.assertEqual("recovered", content)
+        self.assertEqual(2, post.call_count)
+        sleep.assert_called_once_with(14.0)
+
+    def test_server_error_waits_for_endpoint_recovery_after_short_retries(self):
+        unavailable = MagicMock(status_code=503, text='{"error":"service unavailable"}')
+        unavailable.raise_for_status.side_effect = requests.HTTPError("503 Service Unavailable")
+        recovered = MagicMock(status_code=200, text=_valid_200("recovered"))
+        client = VLMClient("openai", "test-model", base_url="https://example.invalid/v1", api_key="test")
+
+        with patch.dict(os.environ, {
+            "EFD_API_MAX_ATTEMPTS": "1",
+            "EFD_API_OUTAGE_BACKOFF_S": "13",
+        }, clear=False), patch("requests.post", side_effect=[unavailable, recovered]) as post, patch(
+            "src.vlm_client.time.sleep"
+        ) as sleep:
+            content = client.chat_text("system", "user")
+
+        self.assertEqual("recovered", content)
+        self.assertEqual(2, post.call_count)
+        sleep.assert_called_once_with(13.0)
 
 
 class ExtractContentTest(unittest.TestCase):

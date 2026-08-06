@@ -103,6 +103,45 @@ class AlfredTaskConditionsTest(unittest.TestCase):
         ok, _ = check_task_complete({"objects": base_objects, "inventoryObjects": []}, ep_data)
         self.assertTrue(ok)
 
+    def test_movable_receptacle_requires_the_same_bowl_to_hold_the_object_and_reach_parent(self):
+        ep_data = {
+            "task_type": "pick_and_place_with_movable_recep",
+            "pddl_params": {
+                "object_target": "Apple",
+                "mrecep_target": "Bowl",
+                "parent_target": "Table",
+            },
+        }
+        objects = [
+            make_obj("Apple|1", "Apple", pickupable=True),
+            make_obj("Bowl|1", "Bowl", pickupable=True, receptacle=True, receptacle_ids=["Apple|1"]),
+            make_obj("Bowl|2", "Bowl", pickupable=True, receptacle=True),
+            make_obj("Table|1", "Table", receptacle=True, receptacle_ids=["Bowl|2"]),
+        ]
+
+        ok, _ = check_task_complete({"objects": objects, "inventoryObjects": []}, ep_data)
+
+        self.assertFalse(ok)
+
+    def test_sliced_goal_requires_the_placed_instance_to_be_sliced(self):
+        ep_data = {
+            "task_type": "pick_and_place_simple",
+            "pddl_params": {
+                "object_target": "Tomato",
+                "parent_target": "Bowl",
+                "object_sliced": True,
+            },
+        }
+        objects = [
+            make_obj("Tomato|raw", "Tomato", pickupable=True),
+            make_obj("TomatoSliced|other", "TomatoSliced", pickupable=True),
+            make_obj("Bowl|1", "Bowl", receptacle=True, receptacle_ids=["Tomato|raw"]),
+        ]
+
+        ok, _ = check_task_complete({"objects": objects, "inventoryObjects": []}, ep_data)
+
+        self.assertFalse(ok)
+
     def test_criteria_text_uses_same_task_type_resolution_as_checker(self):
         pddl = {
             "object_target": "Apple",

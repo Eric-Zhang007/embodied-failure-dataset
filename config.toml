@@ -1,9 +1,9 @@
-# Embodied Failure Dataset — API Configuration
+# Embodied Failure Dataset - API Configuration
 # GPT-5.5 via OpenAI-compatible endpoint
 
 [api]
-base_url = "https://cdn.9527code.com/v1"
-api_key = "sk-1Umt0PPJiwyy5kFe19mFhkzCfuMcEIpOIgqx5J2thwjAHz6c"
+base_url = "https://api.fullcupai.com"
+api_key = "sk-3fa0af37077ce55d023e3901301c200609ced88fbc3710a2c6ff0809e9afdd62"
 
 [models]
 planner = "gpt-5.5"

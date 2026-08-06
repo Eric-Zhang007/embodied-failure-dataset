@@ -120,7 +120,8 @@ def _make_agents(args):
 
 def _run_fork_e2e(args, parent_task_type, episode_id, fork_task: dict, n: int, total: int):
     """Run a fork branch spawned from a completed main branch."""
-    from src.branch_runner import ForkManager, replay_steps
+    from src.branch_runner import replay_steps
+    from src.fork_manager import ForkManager
     from src.step_recorder import StepRecorder
     from src.alfred_scene import _require_alfred_scene
 
@@ -272,6 +273,8 @@ def main():
                         choices=["low", "medium", "high", "xhigh", "max"])
     parser.add_argument("--task", default="", help="Single ALFRED task_type")
     parser.add_argument("--all", action="store_true", help="Run all 7 task types in parallel")
+    parser.add_argument("--trajectory-index", type=int, default=0,
+                        help="Deterministic zero-based trajectory index within each task type")
     parser.add_argument("--data-dir", default="data/json_2.1.0")
     parser.add_argument("--output", default="")
     parser.add_argument("--no-traps", action="store_true")
@@ -306,7 +309,7 @@ def main():
         for task in ALL_TASKS:
             task_files = [f for f in all_files if load_traj(f).get("task_type") == task]
             if task_files:
-                traj = random.choice(task_files) if args.random else task_files[0]
+                traj = random.choice(task_files) if args.random else task_files[args.trajectory_index % len(task_files)]
                 tasks_to_run.append((task, traj))
             else:
                 print(f"SKIP {task}: no trajectories found")
@@ -319,7 +322,7 @@ def main():
         if not task_files:
             print(f"No trajectories found for task_type={args.task}")
             sys.exit(1)
-        traj = random.choice(task_files) if args.random else task_files[0]
+        traj = random.choice(task_files) if args.random else task_files[args.trajectory_index % len(task_files)]
         tasks_to_run.append((args.task, traj))
     else:
         print("Specify --task <type> or --all")
@@ -353,6 +356,16 @@ def main():
         print(f"Termination: {result.termination_reason}")
         print(f"Total steps: {result.total_steps}")
         print(f"Fork tasks: {len(result.fork_tasks)}")
+        if args.enable_fork:
+            for fork_index, fork_task in enumerate(result.fork_tasks, 1):
+                _, _, fork_result = _run_fork_e2e(
+                    args, task_type, ep_id, fork_task, fork_index, len(result.fork_tasks)
+                )
+                print(
+                    f"Fork {fork_index}/{len(result.fork_tasks)}: "
+                    f"{fork_result.branch_id} -> {fork_result.termination_reason} "
+                    f"({fork_result.total_steps} steps)"
+                )
     else:
         # Parallel execution with Semaphore + dynamic fork submission
         max_workers = min(args.parallel, total)

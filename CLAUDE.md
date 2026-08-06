@@ -61,7 +61,7 @@ EB Agent 拆分为 Planner（高层意图）和 Executor（具体动作序列）
 
 ### Phase 2 — Oracle 注入决策（`oracle_agent.py`）
 
-`cascade_level <= 1` 时允许注入；`cascade_level >= 2` 时跳过。注入通过 `env_injector.py` 中的 `inject()` 修改环境。inject 失败自动重试最多 2 次。
+Oracle 直接决定是否注入、使用哪个已知方法及其参数；`env_injector.py` 只执行方法并拒绝未知或会破坏任务关键对象的修改。正常动作期间有未解决 trap 时不再注入；前一处 trap 已触发后，Oracle 可在其恢复动作执行前布置一处不同的后续 trap。这是级联，不能在首次失败前预建。trap state 保存实际方法、参数、预期触发、恢复动作和环境确认的触发/恢复事件。
 
 ### Phase 3 — 失败诊断（Planner）
 
@@ -88,8 +88,8 @@ EB Agent 拆分为 Planner（高层意图）和 Executor（具体动作序列）
 | `src/scheduler.py` | 并行调度器：per-worker agent 隔离，ThreadPoolExecutor，Fork 串行 |
 | `src/task_conditions.py` | 7 种 ALFRED 任务完成检查 + dead_loop/unrecoverable 检测 |
 | `src/action_adapter.py` | objectType→objectId 解析 + PickupObject 不可见对象拦截 |
-| `src/env_injector.py` | 6 种注入方法（含 hide_object、swap_object） |
-| `src/trap_planner.py` | 陷阱选择，支持 exclude_types、breakable 过滤、Blinds blocklist |
+| `src/env_injector.py` | Oracle 原始 method/params 的 AI2-THOR 注入分派器 |
+| `deprecated/trap_planner.py` | 已归档的随机初始 trap 逻辑，不参与运行时 |
 | `src/alfred_scene.py` | ALFRED 场景恢复，gridSize=0.125，renderObjectImage=True，visibilityDistance=100 |
 | `src/episode_manager.py` | Episode JSON 增量读写 |
 | `src/context_builder.py` | EB/Oracle 历史 JSONL 格式化，按权限过滤字段 |
@@ -100,7 +100,7 @@ EB Agent 拆分为 Planner（高层意图）和 Executor（具体动作序列）
 ## 数据流
 
 ```
-ALFRED JSON → alfred_parser → TeleportFull → TrapPlanner
+ALFRED JSON → alfred_parser → TeleportFull
 → Phase 1-4 循环 (branch_runner)
   ├── Planner plan_intent → Executor execute_intent → Planner review
   │     ├── approved → MoveSequence 执行
@@ -132,9 +132,7 @@ Phase 1 字段归属：eb_reasoning 填 Executor 的输出
 1. **部分 teleport 位置差**：ALFRED 的 TeleportFull 可能把 agent 放在墙角/家具边缘，导致所有移动被 Floor 阻挡
 2. **Fork 机制未端到端测试**：代码在但 e2e 和 pipeline 默认 `enable_fork=False`
 3. **heat/cool/clean 任务未充分测试**
-4. **Phase 2 guard**：`cascade_level <= 1` 可能偏严格
-5. **Stage 0 未做**：failure_type_library.json 手工 8 种类型
-6. **PickupObject objectId 解析**：不可见对象（如容器内的 Apple）可能被 Priority 3 fallback 错误解析，导致 AI2-THOR 报 "target not found"。已移除 PickupObject 的 Priority 4 fallback，但 Priority 3（pickupable 但不 visibleBounds2D）仍可能误解析。
+4. **PickupObject objectId 解析**：不可见对象（如容器内的 Apple）可能被 Priority 3 fallback 错误解析，导致 AI2-THOR 报 "target not found"。已移除 PickupObject 的 Priority 4 fallback，但 Priority 3（pickupable 但不 visibleBounds2D）仍可能误解析。
 
 ## AI2-THOR 5.0.0 注意
 
