@@ -18,6 +18,12 @@ from src.step_recorder import StepRecorder
 from src.episode_manager import EpisodeManager
 from src.action_adapter import adapt, resolve_object_ids, _OBJECT_ACTIONS
 from src.task_conditions import check_task_complete, check_unrecoverable, detect_dead_loop, get_completion_criteria_text
+from src.task_spec import (
+    evaluate_episode_progress,
+    evaluate_task_progress,
+    task_spec_criteria_text,
+    task_spec_from_dict,
+)
 from src.context_builder import build_branch_history
 from src.egocentric_memory import EgocentricMemory, SearchTrail
 from src.semantic_memory import SemanticMemory
@@ -119,6 +125,10 @@ def _initial_state_satisfies_goal(metadata: dict, meta: dict) -> bool:
     clock is already on *a* desk. Only skip when the gold plan provides
     instance-level goal references and the exact goal already holds.
     """
+    spec = task_spec_from_dict(meta.get("task_spec"))
+    if spec is not None:
+        progress = evaluate_task_progress(spec, metadata, {})
+        return progress.all_complete
     complete, _ = check_task_complete(metadata, meta)
     if not complete:
         return False
@@ -129,6 +139,25 @@ def _initial_state_satisfies_goal(metadata: dict, meta: dict) -> bool:
         or goal.get("toggle_on_object_ids")
         or goal.get("put_receptacle_ids")
     )
+
+
+def _task_budget_exceeded(ep: EpisodeManager, step_index: int) -> tuple[bool, str]:
+    """Step-based budget enforcement for composed (long-horizon) tasks.
+
+    No special retry machinery: if the current stage does not complete within
+    its step budget, the branch terminates with a stage/step budget reason.
+    """
+    spec = task_spec_from_dict(ep.data.get("task_spec"))
+    if spec is None:
+        return False, ""
+    budget = spec.budget or {}
+    per_stage = budget.get("max_steps_per_stage")
+    if per_stage is not None and (step_index - int(ep.data.get("stage_start_step") or 0)) >= int(per_stage):
+        return True, "stage_budget_exceeded"
+    total = budget.get("max_steps_total")
+    if total is not None and step_index >= int(total):
+        return True, "step_budget_exceeded"
+    return False, ""
 
 
 def _failure_category(action: str, error_message: str | None) -> str:
@@ -497,6 +526,37 @@ class BranchRunner:
     # 公开接口
     # ------------------------------------------------------------------
 
+    def _criteria_text(self, ep: EpisodeManager) -> str:
+        spec = task_spec_from_dict(ep.data.get("task_spec"))
+        if spec is not None:
+            return task_spec_criteria_text(spec)
+        return get_completion_criteria_text(
+            ep.data.get("alfred_task_type") or ep.data.get("task_type", ""),
+            ep.data.get("pddl_params", {}),
+        )
+
+    def _task_progress_and_advance(
+        self,
+        ep: EpisodeManager,
+        metadata: dict,
+        task_state: dict,
+        step_index: int,
+    ):
+        """Evaluate episode progress and persist stage advancement for
+        composed (long-horizon) tasks."""
+        progress = evaluate_episode_progress(ep.data, metadata, task_state)
+        if ep.data.get("task_spec"):
+            current = int(ep.data.get("stage_index") or 0)
+            if progress.all_complete:
+                target = len(progress.stage_statuses)
+                statuses = [True] * len(progress.stage_statuses)
+            else:
+                target = progress.stage_index
+                statuses = [status.satisfied for status in progress.stage_statuses]
+            if target > current:
+                ep.update_stage(target, statuses, start_step=step_index)
+        return progress
+
     def run(
         self,
         config: BranchConfig,
@@ -689,10 +749,7 @@ class BranchRunner:
                 StepRecorder.save_frame(frame, vp)
                 vps.append({"label": label, "image_path": vp})
             look_step["lookaround_views"] = vps
-            tc0 = get_completion_criteria_text(
-                ep.data.get("alfred_task_type") or ep.data.get("task_type", ""),
-                ep.data.get("pddl_params", {}),
-            )
+            tc0 = self._criteria_text(ep)
             defer_semantic_snapshot()
             memory.update(metadata0, metadata0.get("objects", []), "LookAround", True, None, tc0, "initial scan")
             # Also feed metadata from left/behind/right directions into memory
@@ -737,13 +794,10 @@ class BranchRunner:
             task_state = state.get("task_state", {})
 
             inventory_objects = metadata.get("inventoryObjects") or []
-            task_criteria = get_completion_criteria_text(
-                ep.data.get("alfred_task_type") or ep.data.get("task_type", ""),
-                ep.data.get("pddl_params", {}),
-            )
+            task_criteria = self._criteria_text(ep)
 
-            task_complete, _ = check_task_complete(metadata, ep.data, task_state)
-            if task_complete:
+            task_progress = self._task_progress_and_advance(ep, metadata, task_state, step_index)
+            if task_progress.all_complete:
                 self._write_success_step(
                     ep, config.branch_id, step_index,
                     _last_branch_step_id(ep, config.branch_id),
@@ -752,6 +806,11 @@ class BranchRunner:
                     eb_reasoning="Task goal achieved (auto-detected).",
                 )
                 return self._make_result(config, "task_complete", step_index + 1,
+                                         fork_tasks, fork_source_ids, ep)
+
+            budget_exceeded, budget_reason = _task_budget_exceeded(ep, step_index)
+            if budget_exceeded:
+                return self._make_result(config, budget_reason, step_index + 1,
                                          fork_tasks, fork_source_ids, ep)
 
             agent_pose = metadata.get("agent", {})
@@ -902,7 +961,9 @@ class BranchRunner:
 
                 # ── Special intent: Done → task_conditions hard check ──
                 if intent == "Done":
-                    task_complete_done, done_reason = check_task_complete(metadata, ep.data, task_state)
+                    task_progress = self._task_progress_and_advance(ep, metadata, task_state, step_index)
+                    task_complete_done = task_progress.all_complete
+                    done_reason = task_progress.reason
                     if task_complete_done:
                         done_step = self._build_step_entry(
                             ep.episode_id, config.branch_id, step_index, parent_id,
@@ -1312,7 +1373,9 @@ class BranchRunner:
 
             # Done 检测：仅在成功步之后检查，避免初始空手状态误判
             if proposed_action == "Done":
-                task_complete_done, done_reason = check_task_complete(metadata, ep.data, task_state)
+                task_progress = self._task_progress_and_advance(ep, metadata, task_state, step_index)
+                task_complete_done = task_progress.all_complete
+                done_reason = task_progress.reason
                 if task_complete_done:
                     self._write_success_step(
                         ep, config.branch_id, step_index,
@@ -1463,9 +1526,9 @@ class BranchRunner:
                     continue
 
                 if proposed_action == "Done":
-                    task_complete_done, done_reason = check_task_complete(
-                        metadata, ep.data, task_state
-                    )
+                    task_progress = self._task_progress_and_advance(ep, metadata, task_state, step_index)
+                    task_complete_done = task_progress.all_complete
+                    done_reason = task_progress.reason
                     if task_complete_done:
                         self._write_success_step(
                             ep, config.branch_id, step_index, parent_id,
@@ -3228,6 +3291,10 @@ class BranchRunner:
         }
         is_main = result.branch_id == "main"
         if is_main:
+            stages = ep.data.get("stage_progress") or []
+            if ep.data.get("task_spec") and stages:
+                branch_entry["stages_completed"] = sum(1 for status in stages if status)
+                branch_entry["total_stages"] = len(stages)
             ep.update_final_outcome(
                 branch_entry, dedup_stats=dict(self.eb_agent.dedup_stats),
                 is_main=True,

@@ -18,6 +18,12 @@ class EpisodeManager:
 
         self.data = {
             "episode_id": episode_id,
+            "schema_version": "1.0",
+            "run_manifest": metadata.get("run_manifest") or {},
+            "task_spec": metadata.get("task_spec") or None,
+            "stage_index": 0,
+            "stage_progress": [],
+            "stage_start_step": 0,
             "task_goal": metadata["task_goal"],
             "scene": metadata["scene"],
             "task_type": metadata["task_type"],
@@ -322,6 +328,16 @@ class EpisodeManager:
             data["pid"] = pid
 
         self._mutate(update_status)
+
+    def update_stage(self, stage_index: int, stage_statuses: list, start_step: int | None = None):
+        """Persist long-horizon stage progress atomically."""
+        def mutation(data):
+            data["stage_index"] = int(stage_index)
+            data["stage_progress"] = [bool(status) for status in stage_statuses]
+            if start_step is not None:
+                data["stage_start_step"] = int(start_step)
+
+        self._mutate(mutation)
 
     def get_steps_for_branch(self, branch_id: str) -> list[dict]:
         return [s for s in self.data["steps"] if s["branch_id"] == branch_id]

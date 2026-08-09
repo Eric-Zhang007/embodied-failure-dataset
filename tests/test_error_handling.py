@@ -10,6 +10,7 @@ from src.branch_runner import (
     _initial_state_satisfies_goal,
     _normalize_recovery_verdict,
     _requires_oracle_injection,
+    _task_budget_exceeded,
     _value_or_fallback,
     replay_steps,
 )
@@ -117,6 +118,99 @@ class InitialStateFilterTest(unittest.TestCase):
         }
 
         self.assertFalse(_initial_state_satisfies_goal(metadata, self._meta()))
+
+    def test_skips_composed_task_only_when_all_stages_satisfied(self):
+        metadata = {
+            "inventoryObjects": [],
+            "objects": [
+                _obj("AlarmClock|1", "AlarmClock", pickupable=True),
+                _obj("Desk|goal", "Desk", receptacle=True, receptacleObjectIds=["AlarmClock|1"]),
+                _obj("Mug|1", "Mug", pickupable=True),
+            ],
+        }
+        meta = self._meta(task_spec={
+            "task_id": "long_1",
+            "backend": "ai2thor",
+            "scene": "FloorPlan1",
+            "goals": [
+                {"kind": "place", "target_object_id": "AlarmClock|1", "receptacle_id": "Desk|goal"},
+                {"kind": "hold", "target_object_id": "Mug|1"},
+            ],
+        })
+
+        # Stage 1 satisfied, stage 2 not: the task must NOT be skipped.
+        self.assertFalse(_initial_state_satisfies_goal(metadata, meta))
+
+    def test_skips_composed_task_when_every_stage_satisfied(self):
+        metadata = {
+            "inventoryObjects": [{"objectId": "Mug|1"}],
+            "objects": [
+                _obj("AlarmClock|1", "AlarmClock", pickupable=True),
+                _obj("Desk|goal", "Desk", receptacle=True, receptacleObjectIds=["AlarmClock|1"]),
+                _obj("Mug|1", "Mug", pickupable=True),
+            ],
+        }
+        meta = self._meta(task_spec={
+            "task_id": "long_1",
+            "backend": "ai2thor",
+            "scene": "FloorPlan1",
+            "goals": [
+                {"kind": "place", "target_object_id": "AlarmClock|1", "receptacle_id": "Desk|goal"},
+                {"kind": "hold", "target_object_id": "Mug|1"},
+            ],
+        })
+
+        self.assertTrue(_initial_state_satisfies_goal(metadata, meta))
+
+
+class TaskBudgetTest(unittest.TestCase):
+    def _ep(self, budget):
+        import types
+
+        return types.SimpleNamespace(data={
+            "task_spec": {
+                "task_id": "long_1",
+                "backend": "ai2thor",
+                "scene": "FloorPlan1",
+                "goals": [{"kind": "hold", "target_object_id": "Mug|1"}],
+                "budget": budget,
+            },
+            "stage_index": 0,
+            "stage_start_step": 0,
+            "stage_progress": [],
+        })
+
+    def test_no_budget_never_terminates(self):
+        exceeded, reason = _task_budget_exceeded(self._ep(None), 500)
+        self.assertFalse(exceeded)
+        self.assertEqual(reason, "")
+
+    def test_stage_budget_exceeded_by_steps(self):
+        ep = self._ep({"max_steps_per_stage": 10})
+        exceeded, reason = _task_budget_exceeded(ep, 9)
+        self.assertFalse(exceeded)
+        exceeded, reason = _task_budget_exceeded(ep, 10)
+        self.assertTrue(exceeded)
+        self.assertEqual(reason, "stage_budget_exceeded")
+
+    def test_total_budget_exceeded_by_steps(self):
+        ep = self._ep({"max_steps_total": 25})
+        exceeded, reason = _task_budget_exceeded(ep, 24)
+        self.assertFalse(exceeded)
+        exceeded, reason = _task_budget_exceeded(ep, 25)
+        self.assertTrue(exceeded)
+        self.assertEqual(reason, "step_budget_exceeded")
+
+    def test_stage_start_step_resets_stage_budget(self):
+        ep = self._ep({"max_steps_per_stage": 10})
+        ep.data["stage_index"] = 1
+        ep.data["stage_start_step"] = 20
+
+        exceeded, reason = _task_budget_exceeded(ep, 25)
+        self.assertFalse(exceeded)
+        exceeded, reason = _task_budget_exceeded(ep, 30)
+        self.assertTrue(exceeded)
+        self.assertEqual(reason, "stage_budget_exceeded")
 
 
 class InvalidActionAgent:
